@@ -29,7 +29,7 @@ Ruff (lint + format) is configured in `pyproject.toml`; CI fails on any Ruff fin
 - **SonarQube Cloud**: runs after the tests and scans with the downloaded `coverage.xml`. Settings are in `sonar-project.properties` (sources `.`, `tests/**` excluded and treated as tests, `sonar.python.version` 3.10–3.14). Needs the `SONAR_TOKEN` repo secret. Coverage is configured in `[tool.coverage.run]` in `pyproject.toml` (branch coverage, `tests/` omitted, `relative_files = true` so Sonar can map the paths in `coverage.xml` to its sources).
 - Third-party actions are pinned to commit SHAs with a `# vX.Y.Z` comment. GitHub's own `actions/*` use major-version tags.
 - **`requirements-dev.lock`**: hash-locked, cross-platform lock of `requirements-dev.txt` (and thus `requirements.txt`) for Python ≥3.10. Only CI installs it; end users still get the `>=` bounds. After changing either requirements file (or to bump versions), regenerate it with `uv pip compile requirements-dev.txt --universal --python-version 3.10 --generate-hashes --no-header -o requirements-dev.lock`. Without `--python-version 3.10` the Python 3.10-only entries (`pillow` 12.x, `exceptiongroup`) are dropped and the 3.10 job breaks.
-- Changing the supported Python range means updating the CI matrix, `sonar.python.version`, Ruff `target-version` and the lock's `--python-version` together.
+- Changing the supported Python range means updating the CI matrix, `sonar.python.version`, Ruff `target-version`, the lock's `--python-version` and the static Python badge in `README.md` together.
 
 ## Backends
 - `--backend ollama` (default): `ollama` Python client, default host `http://localhost:11434`, default model `qwen3-vl:8b`.

@@ -1,5 +1,12 @@
 # img tagger
 
+[![CI](https://github.com/juusolatva/img_tagger/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/juusolatva/img_tagger/actions/workflows/ci.yml)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=juusolatva_img_tagger&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=juusolatva_img_tagger)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=juusolatva_img_tagger&metric=coverage)](https://sonarcloud.io/summary/new_code?id=juusolatva_img_tagger)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/github/license/juusolatva/img_tagger)](LICENSE)
+
 A python script that tags all the **JPEG**, **WebP**, **PNG** and **GIF** files in the directory (and possibly subdirectories) by sending them to a local vision-language model (either **ollama** or **LM Studio** running on the same computer or the local network). The tags the model sends back are added as metadata to the images. The accuracy of the tags depends on the model.
 
 ## Features
