@@ -9,9 +9,13 @@ SIX = ["photo", "sunset", "beach", "ocean", "sky", "clouds"]
 
 # --- normalize_tags -------------------------------------------------------
 
+
 class TestNormalizeTags:
     def test_strips_lowercases_and_keeps_order(self):
-        assert normalize_tags(["  Photo ", "SUNSET", "Beach", "ocean", "Sky", "clouds"]) == SIX
+        assert (
+            normalize_tags(["  Photo ", "SUNSET", "Beach", "ocean", "Sky", "clouds"])
+            == SIX
+        )
 
     def test_deduplicates_case_insensitively_preserving_first_occurrence(self):
         tags = ["Photo", "photo", "sunset", "SUNSET", "beach", "ocean", "sky", "clouds"]
@@ -40,37 +44,88 @@ class TestNormalizeTags:
 
 # --- parse_text_tags ------------------------------------------------------
 
+
 class TestParseTextTags:
     def test_splits_on_commas_and_newlines(self):
-        assert parse_text_tags("photo, sunset\nbeach,ocean") == ["photo", "sunset", "beach", "ocean"]
+        assert parse_text_tags("photo, sunset\nbeach,ocean") == [
+            "photo",
+            "sunset",
+            "beach",
+            "ocean",
+        ]
 
     def test_strips_quotes_and_lowercases(self):
         assert parse_text_tags("\"Photo\", 'Sunset'") == ["photo", "sunset"]
 
     def test_skips_stop_words_but_keeps_short_tags(self):
-        assert parse_text_tags("the, and, photo, ok, sunset, are, 3d") == ["photo", "ok", "sunset", "3d"]
+        assert parse_text_tags("the, and, photo, ok, sunset, are, 3d") == [
+            "photo",
+            "ok",
+            "sunset",
+            "3d",
+        ]
 
 
 # --- parse_model_output: supported output styles --------------------------
+
 
 class TestParseModelOutput:
     @pytest.mark.parametrize(
         "raw",
         [
-            pytest.param("photo, sunset, beach, ocean, sky, clouds", id="comma-separated"),
-            pytest.param("Photo, Sunset, Beach, Ocean, Sky, Clouds", id="comma-separated-mixed-case"),
-            pytest.param("photo,sunset,beach,ocean,sky,clouds\n", id="comma-no-spaces-trailing-newline"),
-            pytest.param("'photo', \"sunset\", beach, ocean, sky, clouds", id="comma-quoted"),
-            pytest.param('["photo", "sunset", "beach", "ocean", "sky", "clouds"]', id="json-array"),
-            pytest.param('Sure! ["Photo","Sunset","beach","ocean","sky","clouds"] Hope it helps.', id="json-embedded"),
-            pytest.param('```json\n["photo","sunset","beach","ocean","sky","clouds"]\n```', id="json-markdown-fence"),
-            pytest.param("- photo\n- sunset\n- beach\n- ocean\n- sky\n- clouds", id="dash-bullets"),
-            pytest.param("• photo\n• sunset\n• beach\n• ocean\n• sky\n• clouds", id="dot-bullets"),
-            pytest.param("1. photo\n2. sunset\n3. beach\n4. ocean\n5. sky\n6. clouds", id="numbered"),
-            pytest.param("Here are the tags: photo, sunset, beach, ocean, sky, clouds", id="intro-tags"),
-            pytest.param("Keywords - photo, sunset, beach, ocean, sky, clouds", id="intro-keywords"),
-            pytest.param("Here are the relevant tags for this image: photo, sunset, beach, ocean, sky, clouds", id="intro-tags-for-this-image"),
-            pytest.param("Tags:\nphoto\nsunset\nbeach\nocean\nsky\nclouds", id="intro-then-newline-list"),
+            pytest.param(
+                "photo, sunset, beach, ocean, sky, clouds", id="comma-separated"
+            ),
+            pytest.param(
+                "Photo, Sunset, Beach, Ocean, Sky, Clouds",
+                id="comma-separated-mixed-case",
+            ),
+            pytest.param(
+                "photo,sunset,beach,ocean,sky,clouds\n",
+                id="comma-no-spaces-trailing-newline",
+            ),
+            pytest.param(
+                "'photo', \"sunset\", beach, ocean, sky, clouds", id="comma-quoted"
+            ),
+            pytest.param(
+                '["photo", "sunset", "beach", "ocean", "sky", "clouds"]',
+                id="json-array",
+            ),
+            pytest.param(
+                'Sure! ["Photo","Sunset","beach","ocean","sky","clouds"] Hope it helps.',
+                id="json-embedded",
+            ),
+            pytest.param(
+                '```json\n["photo","sunset","beach","ocean","sky","clouds"]\n```',
+                id="json-markdown-fence",
+            ),
+            pytest.param(
+                "- photo\n- sunset\n- beach\n- ocean\n- sky\n- clouds",
+                id="dash-bullets",
+            ),
+            pytest.param(
+                "• photo\n• sunset\n• beach\n• ocean\n• sky\n• clouds", id="dot-bullets"
+            ),
+            pytest.param(
+                "1. photo\n2. sunset\n3. beach\n4. ocean\n5. sky\n6. clouds",
+                id="numbered",
+            ),
+            pytest.param(
+                "Here are the tags: photo, sunset, beach, ocean, sky, clouds",
+                id="intro-tags",
+            ),
+            pytest.param(
+                "Keywords - photo, sunset, beach, ocean, sky, clouds",
+                id="intro-keywords",
+            ),
+            pytest.param(
+                "Here are the relevant tags for this image: photo, sunset, beach, ocean, sky, clouds",
+                id="intro-tags-for-this-image",
+            ),
+            pytest.param(
+                "Tags:\nphoto\nsunset\nbeach\nocean\nsky\nclouds",
+                id="intro-then-newline-list",
+            ),
         ],
     )
     def test_extracts_six_tags(self, raw):
@@ -78,21 +133,39 @@ class TestParseModelOutput:
 
     def test_json_with_non_string_items_keeps_numbers_and_drops_others(self):
         raw = '["photo", 2024, "sunset", null, {"x": 1}, "beach", "ocean", "sky"]'
-        assert parse_model_output(raw) == ["photo", "2024", "sunset", "beach", "ocean", "sky"]
+        assert parse_model_output(raw) == [
+            "photo",
+            "2024",
+            "sunset",
+            "beach",
+            "ocean",
+            "sky",
+        ]
 
     def test_json_too_short_falls_through_to_failure(self):
         assert parse_model_output('["photo", "sunset"]') is None
 
     def test_bullets_with_comma_separated_items_are_split(self):
         raw = "- photo, sunset\n- beach\n- ocean\n- sky\n- clouds\n- sand"
-        assert parse_model_output(raw) == ["photo", "sunset", "beach", "ocean", "sky", "clouds", "sand"]
+        assert parse_model_output(raw) == [
+            "photo",
+            "sunset",
+            "beach",
+            "ocean",
+            "sky",
+            "clouds",
+            "sand",
+        ]
 
     def test_output_capped_at_twelve(self):
         raw = ", ".join(f"tag{i}" for i in range(30))
         assert parse_model_output(raw) == [f"tag{i}" for i in range(12)]
 
     def test_duplicates_removed(self):
-        assert parse_model_output("photo, Photo, PHOTO, sunset, beach, ocean, sky, clouds") == SIX
+        assert (
+            parse_model_output("photo, Photo, PHOTO, sunset, beach, ocean, sky, clouds")
+            == SIX
+        )
 
     @pytest.mark.parametrize(
         "raw",
@@ -111,7 +184,9 @@ class TestParseModelOutput:
         "raw",
         [
             pytest.param("1" * 5000, id="digits-over-int-limit"),
-            pytest.param("Sure: [" + "1" * 5000 + "] ok", id="bracketed-digits-over-int-limit"),
+            pytest.param(
+                "Sure: [" + "1" * 5000 + "] ok", id="bracketed-digits-over-int-limit"
+            ),
             pytest.param("[" * 100_000 + "]", id="deeply-nested-brackets"),
         ],
     )
@@ -124,6 +199,7 @@ class TestParseModelOutput:
 
 
 # --- Previously mis-parsed output styles -----------------------------------
+
 
 class TestParseModelOutputRegressions:
     def test_newline_separated_list(self):
@@ -139,7 +215,14 @@ class TestParseModelOutputRegressions:
 
     def test_comma_list_containing_word_tags(self):
         raw = "meme, text tags, funny, cat, reaction, wholesome"
-        assert parse_model_output(raw) == ["meme", "text tags", "funny", "cat", "reaction", "wholesome"]
+        assert parse_model_output(raw) == [
+            "meme",
+            "text tags",
+            "funny",
+            "cat",
+            "reaction",
+            "wholesome",
+        ]
 
     def test_short_tags_after_intro(self):
         raw = "Tags: photo, 3d, ui, beach, ocean, sky"
@@ -147,9 +230,23 @@ class TestParseModelOutputRegressions:
 
     def test_reasoning_block_is_ignored(self):
         raw = "<think>The image shows a cat.</think>\nmeme, cat, funny, reaction, wholesome, pet"
-        assert parse_model_output(raw) == ["meme", "cat", "funny", "reaction", "wholesome", "pet"]
+        assert parse_model_output(raw) == [
+            "meme",
+            "cat",
+            "funny",
+            "reaction",
+            "wholesome",
+            "pet",
+        ]
 
     def test_reasoning_with_only_closing_tag_is_ignored(self):
         # Some chat templates pre-fill "<think>", so only the closing tag reaches the output.
         raw = "Tags: maybe, dog, or, cat?\n</think>\nmeme, cat, funny, reaction, wholesome, pet"
-        assert parse_model_output(raw) == ["meme", "cat", "funny", "reaction", "wholesome", "pet"]
+        assert parse_model_output(raw) == [
+            "meme",
+            "cat",
+            "funny",
+            "reaction",
+            "wholesome",
+            "pet",
+        ]

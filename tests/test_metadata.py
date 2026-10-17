@@ -27,10 +27,16 @@ def pixels(path: Path) -> bytes:
 
 # --- get_image_format -----------------------------------------------------
 
+
 class TestGetImageFormat:
-    @pytest.mark.parametrize("ext, expected", [("jpg", "JPEG"), ("jpeg", "JPEG"), ("png", "PNG"), ("webp", "WEBP")])
+    @pytest.mark.parametrize(
+        "ext, expected",
+        [("jpg", "JPEG"), ("jpeg", "JPEG"), ("png", "PNG"), ("webp", "WEBP")],
+    )
     def test_static_formats(self, tmp_path, ext, expected):
-        assert img_tagger.get_image_format(make_image(tmp_path / f"a.{ext}")) == expected
+        assert (
+            img_tagger.get_image_format(make_image(tmp_path / f"a.{ext}")) == expected
+        )
 
     def test_gif(self, gif_image):
         assert img_tagger.get_image_format(gif_image) == "GIF"
@@ -51,6 +57,7 @@ class TestGetImageFormat:
 
 # --- write_metadata (JPEG / PNG / WebP) -----------------------------------
 
+
 class TestWriteMetadata:
     def test_writes_exif_and_xmp_schema(self, static_image):
         img_tagger.write_metadata(str(static_image), SAMPLE_TAGS)
@@ -59,7 +66,9 @@ class TestWriteMetadata:
         tags_str = ", ".join(SAMPLE_TAGS)
         assert exif["Exif.Photo.UserComment"] == f"{tags_str} {MARKER}"
         assert xmp["Xmp.dc.subject"] == SAMPLE_TAGS
-        assert xmp["Xmp.dc.description"] == {'lang="x-default"': f"Tags: {tags_str} | {MARKER}"}
+        assert xmp["Xmp.dc.description"] == {
+            'lang="x-default"': f"Tags: {tags_str} | {MARKER}"
+        }
 
     def test_marks_image_as_processed(self, static_image):
         assert not img_tagger.is_already_processed(static_image)
@@ -106,7 +115,9 @@ class TestWriteMetadata:
         img_tagger.write_metadata(str(static_image), SAMPLE_TAGS)
         assert seen_dirs == [static_image.parent]
 
-    def test_failure_leaves_original_untouched_and_cleans_up(self, static_image, monkeypatch):
+    def test_failure_leaves_original_untouched_and_cleans_up(
+        self, static_image, monkeypatch
+    ):
         original = static_image.read_bytes()
 
         class BrokenImage:
@@ -121,8 +132,12 @@ class TestWriteMetadata:
         assert static_image.read_bytes() == original
         assert leftover_temp_files(static_image.parent) == []
 
-    @pytest.mark.parametrize("error", ["Invalid IFD structure", "Image data is corrupt"])
-    def test_auto_heals_corrupt_metadata_via_pillow(self, static_image, monkeypatch, error):
+    @pytest.mark.parametrize(
+        "error", ["Invalid IFD structure", "Image data is corrupt"]
+    )
+    def test_auto_heals_corrupt_metadata_via_pillow(
+        self, static_image, monkeypatch, error
+    ):
         real_image = img_tagger.pyexiv2.Image
         attempts = []
 
@@ -136,9 +151,13 @@ class TestWriteMetadata:
         img_tagger.write_metadata(str(static_image), SAMPLE_TAGS)
         monkeypatch.setattr(img_tagger.pyexiv2, "Image", real_image)
 
-        assert len(attempts) == 2, "pyexiv2 should be retried once on the sanitized file"
+        assert len(attempts) == 2, (
+            "pyexiv2 should be retried once on the sanitized file"
+        )
         assert img_tagger.is_already_processed(static_image)
-        expected_format = {".jpg": "JPEG", ".png": "PNG", ".webp": "WEBP"}[static_image.suffix]
+        expected_format = {".jpg": "JPEG", ".png": "PNG", ".webp": "WEBP"}[
+            static_image.suffix
+        ]
         assert img_tagger.get_image_format(static_image) == expected_format
         assert leftover_temp_files(static_image.parent) == []
 
@@ -146,7 +165,11 @@ class TestWriteMetadata:
     def test_tagging_keeps_animation(self, tmp_path, ext):
         path = make_animated(tmp_path / f"anim.{ext}", durations=[40, 250, 90], loop=3)
         img_tagger.write_metadata(str(path), SAMPLE_TAGS)
-        assert animation_info(path) == {"n_frames": 3, "durations": [40, 250, 90], "loop": 3}
+        assert animation_info(path) == {
+            "n_frames": 3,
+            "durations": [40, 250, 90],
+            "loop": 3,
+        }
         assert img_tagger.is_already_processed(path)
 
     @pytest.mark.parametrize("ext", ["webp", "png"])
@@ -166,12 +189,17 @@ class TestWriteMetadata:
         monkeypatch.setattr(img_tagger.pyexiv2, "Image", real_image)
 
         assert len(attempts) == 2
-        assert animation_info(path) == {"n_frames": 3, "durations": [40, 250, 90], "loop": 3}
+        assert animation_info(path) == {
+            "n_frames": 3,
+            "durations": [40, 250, 90],
+            "loop": 3,
+        }
         assert img_tagger.is_already_processed(path)
         assert leftover_temp_files(tmp_path) == []
 
 
 # --- write_gif_tags -------------------------------------------------------
+
 
 class TestWriteGifTags:
     def test_writes_comment_with_marker(self, gif_image):
@@ -220,6 +248,7 @@ class TestWriteGifTags:
 
 # --- tag_image (format router) --------------------------------------------
 
+
 class TestTagImage:
     def test_routes_static_images_to_write_metadata(self, static_image):
         img_tagger.tag_image(str(static_image), SAMPLE_TAGS)
@@ -261,6 +290,7 @@ class TestTagImage:
 
 
 # --- is_already_processed -------------------------------------------------
+
 
 class TestIsAlreadyProcessed:
     def test_fresh_images_are_not_processed(self, static_image, gif_image):
@@ -331,6 +361,7 @@ class TestIsAlreadyProcessed:
 
 
 # --- robust_replace -------------------------------------------------------
+
 
 class TestRobustReplace:
     @pytest.fixture(autouse=True)

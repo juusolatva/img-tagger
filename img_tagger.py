@@ -11,25 +11,26 @@ images via the --clear option. Run it as a script; see -h for the options.
 import argparse
 import base64
 import contextlib
+import json
+import logging
 import os
 import platform
 import re
 import select
+import shutil
 import sys
+import tempfile
 import threading
 import time
-import logging
-import json
-import shutil
-import tempfile
-import pyexiv2
-from tqdm import tqdm
+from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Generator
-from typing import Any, List, Optional
-from PIL import Image, ImageSequence, PngImagePlugin
+from typing import Any
+
+import pyexiv2
+from PIL import Image, ImageSequence
+from tqdm import tqdm
 
 try:
     import msvcrt
@@ -57,14 +58,14 @@ PROCESSED_MARKER = "[PROCESSED BY AI]"
 DEFAULT_MIME_TYPE = "image/jpeg"
 
 DEFAULT_PROMPT = (
-                "Analyze this image, which could be an internet meme, screenshot, artwork, or photograph. "
-                "Extract 6 to 12 highly relevant keywords and return ONLY a comma-separated list of tags."
-                "1. Always include the image type as the first tag (e.g., 'Meme', 'Screenshot', 'Artwork', 'Photo'). "
-                "2. If it is a meme, identify the meme template/format, the main subjects, the core vibe/emotion, and 1-3 key words from the text. "
-                "3. If it is a screenshot, summarize the main topic or software shown. "
-                "4. All tags must be strictly in English. Do not use any other languages or alphabets. "
-                "Return ONLY the comma-separated list of tags. No introductory text, bullet points, or quotes."
-                )
+    "Analyze this image, which could be an internet meme, screenshot, artwork, or photograph. "
+    "Extract 6 to 12 highly relevant keywords and return ONLY a comma-separated list of tags."
+    "1. Always include the image type as the first tag (e.g., 'Meme', 'Screenshot', 'Artwork', 'Photo'). "
+    "2. If it is a meme, identify the meme template/format, the main subjects, the core vibe/emotion, and 1-3 key words from the text. "
+    "3. If it is a screenshot, summarize the main topic or software shown. "
+    "4. All tags must be strictly in English. Do not use any other languages or alphabets. "
+    "Return ONLY the comma-separated list of tags. No introductory text, bullet points, or quotes."
+)
 
 
 def setup_logging(log_path: str | None) -> None:
@@ -86,8 +87,8 @@ def setup_logging(log_path: str | None) -> None:
     logging.basicConfig(
         filename=str(path_obj),
         level=logging.DEBUG,
-        format='%(asctime)s [%(levelname)s] %(threadName)s: %(message)s',
-        filemode='a'
+        format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
+        filemode="a",
     )
 
 
@@ -119,7 +120,10 @@ def _wait_for_quit_windows(stop_event: threading.Event) -> None:
     if msvcrt is None:
         return
     while not stop_event.is_set():
-        if msvcrt.kbhit() and msvcrt.getch().decode("utf-8", errors="ignore").lower() == "q":
+        if (
+            msvcrt.kbhit()
+            and msvcrt.getch().decode("utf-8", errors="ignore").lower() == "q"
+        ):
             stop_event.set()
             return
         time.sleep(0.05)  # Prevents a 100% CPU hot-spin on Windows when idle
@@ -140,12 +144,12 @@ def _cbreak_stdin() -> Generator[None, None, None]:
         raise ImportError("termios/tty not available")
 
     fd = sys.stdin.fileno()
-    old_settings = getattr(termios, "tcgetattr")(fd)
+    old_settings = termios.tcgetattr(fd)
     try:
-        getattr(tty, "setcbreak")(fd)
+        tty.setcbreak(fd)
         yield
     finally:
-        getattr(termios, "tcsetattr")(fd, getattr(termios, "TCSADRAIN"), old_settings)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 def _wait_for_quit_posix(stop_event: threading.Event, idle_sleep: float = 0.0) -> None:
@@ -176,7 +180,7 @@ def _wait_for_quit_posix(stop_event: threading.Event, idle_sleep: float = 0.0) -
         time.sleep(idle_sleep)
 
 
-def get_image_format(img_path: Path) -> Optional[str]:
+def get_image_format(img_path: Path) -> str | None:
     """
     Attempts to identify the image format using Pillow.
 
@@ -230,7 +234,14 @@ def _sanitize_with_pillow(src, dst, fmt=None) -> None:
             frame.load()  # WebP only fills in the frame's duration once it's decoded
             durations.append(frame.info.get("duration", 100))
         img.seek(0)
-        img.save(dst, format=fmt, quality=95, save_all=True, duration=durations, loop=img.info.get("loop", 0))
+        img.save(
+            dst,
+            format=fmt,
+            quality=95,
+            save_all=True,
+            duration=durations,
+            loop=img.info.get("loop", 0),
+        )
 
 
 def write_metadata(image_path: str, tags_list: list[str]) -> None:
@@ -257,35 +268,39 @@ def write_metadata(image_path: str, tags_list: list[str]) -> None:
         with metadata_lock:
             try:
                 # Primary attempt using pyexiv2 (separated into EXIF and XMP)
-                with pyexiv2.Image(temp_path, encoding='utf-8') as img:
-                    img.modify_exif({
-                        'Exif.Photo.UserComment': f"{tags_str} {marker}"
-                    })
-                    img.modify_xmp({
-                    'Xmp.dc.subject': tags_list,
-                    'Xmp.dc.description': f"Tags: {tags_str} | {marker}"
-                })
+                with pyexiv2.Image(temp_path, encoding="utf-8") as img:
+                    img.modify_exif({"Exif.Photo.UserComment": f"{tags_str} {marker}"})
+                    img.modify_xmp(
+                        {
+                            "Xmp.dc.subject": tags_list,
+                            "Xmp.dc.description": f"Tags: {tags_str} | {marker}",
+                        }
+                    )
 
             except RuntimeError as e:
                 # Auto-healing fallback for corrupted EXIF data (IFD buffer errors)
                 if "IFD" in str(e).upper() or "corrupt" in str(e).lower():
-                    logging.warning(f"Corrupted metadata in {Path(image_path).name}, sanitizing via Pillow...")
+                    logging.warning(
+                        f"Corrupted metadata in {Path(image_path).name}, sanitizing via Pillow..."
+                    )
 
                     # Re-save with Pillow (more forgiving) to temp_path to strip broken EXIF
                     _sanitize_with_pillow(image_path, temp_path)
 
                     # Retry pyexiv2 on the newly cleaned temporary file
-                    with pyexiv2.Image(temp_path, encoding='utf-8') as img:
-                        img.modify_exif({
-                        'Exif.Photo.UserComment': f"{tags_str} {marker}"
-                        })
-                        img.modify_xmp({
-                        'Xmp.dc.subject': tags_list,
-                        'Xmp.dc.description': f"Tags: {tags_str} | {marker}"
-                        })
+                    with pyexiv2.Image(temp_path, encoding="utf-8") as img:
+                        img.modify_exif(
+                            {"Exif.Photo.UserComment": f"{tags_str} {marker}"}
+                        )
+                        img.modify_xmp(
+                            {
+                                "Xmp.dc.subject": tags_list,
+                                "Xmp.dc.description": f"Tags: {tags_str} | {marker}",
+                            }
+                        )
 
                 else:
-                    raise e # Re-raise if it's a different pyexiv2 error
+                    raise e  # Re-raise if it's a different pyexiv2 error
 
             robust_replace(Path(temp_path), Path(image_path))
 
@@ -336,7 +351,7 @@ def write_gif_tags(image_path: str, tags_list: list[str]) -> None:
             append_images=frame_generator(),
             duration=durations,
             loop=loop,
-            comment=f"{tags_str} {marker}"
+            comment=f"{tags_str} {marker}",
         )
 
         robust_replace(Path(temp_path), Path(image_path))
@@ -345,7 +360,7 @@ def write_gif_tags(image_path: str, tags_list: list[str]) -> None:
         temp_path.unlink(missing_ok=True)
 
 
-def tag_image(image_path: str, tags_list: list[str], fmt: Optional[str] = None) -> None:
+def tag_image(image_path: str, tags_list: list[str], fmt: str | None = None) -> None:
     """
     Embeds a list of tags into an image's metadata.
 
@@ -493,12 +508,7 @@ def clear_tags(image_path: Path | str) -> None:
         print(f"  Failed to clear {p.name}: {e}")
 
 
-
-def get_tags_ollama(client: Any,
-                    model: str,
-                    img_path: Path,
-                    prompt: str
-                    ) -> str:
+def get_tags_ollama(client: Any, model: str, img_path: Path, prompt: str) -> str:
     """
     Sends an image and prompt to an Ollama server for tag generation.
 
@@ -549,7 +559,7 @@ def get_tags_lm_studio(client: Any, model: str, img_path: Path, prompt: str) -> 
         "jpg": DEFAULT_MIME_TYPE,
         "png": "image/png",
         "webp": "image/webp",
-        "gif": "image/gif"
+        "gif": "image/gif",
     }
     mime_type = mime_map.get((fmt or "").lower(), DEFAULT_MIME_TYPE)
 
@@ -577,7 +587,7 @@ def get_tags_lm_studio(client: Any, model: str, img_path: Path, prompt: str) -> 
     return content
 
 
-def parse_model_output(raw_output: str) -> Optional[List[str]]:
+def parse_model_output(raw_output: str) -> list[str] | None:
     """Parse model output and extract tags robustly with normalization.
 
     Tries multiple patterns (JSON, bullet points, intro text, comma-separated)
@@ -609,40 +619,54 @@ def parse_model_output(raw_output: str) -> Optional[List[str]]:
         start = raw_output.find("[")
         end = raw_output.rfind("]")
         if start != -1 and end != -1 and end > start:
-            candidate = raw_output[start:end + 1]
+            candidate = raw_output[start : end + 1]
             try:
                 parsed = json.loads(candidate)
             except (ValueError, RecursionError):
                 parsed = None
 
     if isinstance(parsed, list):
-        json_tags = [str(x).strip().lower() for x in parsed if isinstance(x, (str, int, float))]
+        json_tags = [
+            str(x).strip().lower() for x in parsed if isinstance(x, (str, int, float))
+        ]
         normalized = normalize_tags(json_tags)
         if normalized:
             return normalized
     # Pattern 2: Bullet points at line start (minimum 6 items expected); hyphens inside tags are not bullets
-    bullets = re.findall(r'^[ \t]*[-•★●][ \t]*(\S.*)', raw_output, re.MULTILINE)
+    bullets = re.findall(r"^[ \t]*[-•★●][ \t]*(\S.*)", raw_output, re.MULTILINE)
     if len(bullets) >= 6:
-        return normalize_tags([t.strip().strip('"').lower() for b in bullets for t in b.split(",")])
+        return normalize_tags(
+            [t.strip().strip('"').lower() for b in bullets for t in b.split(",")]
+        )
 
     # Pattern 3: Numbered lists like "1. tag" (minimum 6 items expected)
-    numbered = re.findall(r'(?<!\d)\d+\.\s+(.+)', raw_output)
+    numbered = re.findall(r"(?<!\d)\d+\.\s+(.+)", raw_output)
     if len(numbered) >= 6:
-        return normalize_tags([t.strip().strip('"').lower() for n in numbered for t in n.split(",")])
+        return normalize_tags(
+            [t.strip().strip('"').lower() for n in numbered for t in n.split(",")]
+        )
 
     # Pattern 4: "Here are the tags:" style intro text extraction. Needs a colon later on the same line
     # ("tags for this image:") or a dash right after, so a list item like "text tags" doesn't count.
     text_after_intro = re.match(
-        r'.{0,40}?\b(?:tags|keywords)\b(?:[^:\n]{0,40}:|\s*-)\s*(.+)', raw_output, re.IGNORECASE | re.DOTALL
+        r".{0,40}?\b(?:tags|keywords)\b(?:[^:\n]{0,40}:|\s*-)\s*(.+)",
+        raw_output,
+        re.IGNORECASE | re.DOTALL,
     )
     if text_after_intro:
         return normalize_tags(parse_text_tags(text_after_intro.group(1)))
 
     # Fallback: comma- and/or newline-separated
-    return normalize_tags([tag.strip().strip('"\'').lower() for tag in re.split(r'[,\n]', raw_output) if tag.strip()])
+    return normalize_tags(
+        [
+            tag.strip().strip("\"'").lower()
+            for tag in re.split(r"[,\n]", raw_output)
+            if tag.strip()
+        ]
+    )
 
 
-def parse_text_tags(text: str) -> List[str]:
+def parse_text_tags(text: str) -> list[str]:
     """Parse tags from text that follows intro patterns.
 
     Args:
@@ -653,17 +677,19 @@ def parse_text_tags(text: str) -> List[str]:
     """
 
     # Split by commas or newlines
-    parts = re.split(r'[,\n]+', text)
+    parts = re.split(r"[,\n]+", text)
     tags = []
     for part in parts:
-        part = part.strip().strip('"\'').lower()
+        part = part.strip().strip("\"'").lower()
         # Skip common non-tag words (short real tags like '3d' or 'ui' are kept)
-        if part and part not in ['and', 'or', 'the', 'a', 'an', 'is', 'are', 'of']:
+        if part and part not in ["and", "or", "the", "a", "an", "is", "are", "of"]:
             tags.append(part)
     return tags
 
 
-def normalize_tags(tags: List[str], min_count: int = 6, max_count: int = 12) -> Optional[List[str]]:
+def normalize_tags(
+    tags: list[str], min_count: int = 6, max_count: int = 12
+) -> list[str] | None:
     """Normalize tags and enforce count constraints.
 
     Normalizes each tag (lowercase, strip whitespace), removes duplicates while
@@ -715,7 +741,7 @@ def _pyexiv2_has_marker(p: Path) -> bool:
     values = []
     with metadata_lock:
         # Explicitly pass encoding='utf-8' to handle non-ASCII path characters like 'ö'
-        with pyexiv2.Image(str(p), encoding='utf-8') as img:
+        with pyexiv2.Image(str(p), encoding="utf-8") as img:
             # Read EXIF and XMP independently so one failing doesn't kill both
             for read in (img.read_exif, img.read_xmp):
                 try:
@@ -734,7 +760,9 @@ def _pillow_has_marker(p: Path) -> bool:
     """
 
     with Image.open(p) as img:
-        return any(isinstance(v, str) and PROCESSED_MARKER in v for v in img.info.values())
+        return any(
+            isinstance(v, str) and PROCESSED_MARKER in v for v in img.info.values()
+        )
 
 
 def is_already_processed(img_path: Path) -> bool:
@@ -756,7 +784,9 @@ def is_already_processed(img_path: Path) -> bool:
             if _pyexiv2_has_marker(p):
                 return True
         except Exception as e:
-            logging.debug(f"pyexiv2 metadata read failed for {p.name} ({e}); trying Pillow fallback.")
+            logging.debug(
+                f"pyexiv2 metadata read failed for {p.name} ({e}); trying Pillow fallback."
+            )
 
         # 2. Fully isolated fallback check using Pillow
         try:
@@ -780,8 +810,8 @@ def process_single_image(
     backend: str,
     model: str,
     prompt: str,
-    stop_event: threading.Event
-    ) -> tuple[str, str, str, float]:
+    stop_event: threading.Event,
+) -> tuple[str, str, str, float]:
     """Handles the full pipeline for a single image: validation -> AI -> tagging.
 
     Args:
@@ -821,7 +851,9 @@ def process_single_image(
         parsed_tags = parse_model_output(raw_output)
 
         if not parsed_tags:
-            logging.warning(f"Failed to extract valid tags from model response for {img_path.name}")
+            logging.warning(
+                f"Failed to extract valid tags from model response for {img_path.name}"
+            )
             return (
                 "FAILED",
                 img_path.name,
@@ -891,7 +923,9 @@ def _load_prompt() -> str:
     prompt_file = Path(__file__).parent / "prompt.txt"
     if not prompt_file.exists():
         logging.warning(f"prompt.txt not found at {prompt_file}; using default")
-        print(f"Warning: Could not read prompt.txt from {prompt_file}. Falling back to default.")
+        print(
+            f"Warning: Could not read prompt.txt from {prompt_file}. Falling back to default."
+        )
         return DEFAULT_PROMPT
 
     try:
@@ -911,12 +945,16 @@ def _create_client(backend: str, host: str) -> Any:
 
     if backend == "ollama":
         if OllamaClient is None:
-            print("Error: 'ollama' library not found. Please install it using 'pip install ollama'.")
+            print(
+                "Error: 'ollama' library not found. Please install it using 'pip install ollama'."
+            )
             return None
         return OllamaClient(host=host)
 
     if OpenAI is None:
-        print("Error: 'openai' library not found. Please install it using 'pip install openai'.")
+        print(
+            "Error: 'openai' library not found. Please install it using 'pip install openai'."
+        )
         return None
     return OpenAI(base_url=f"{host}/v1", api_key="lm-studio")
 
@@ -928,8 +966,8 @@ def _run_tasks(
     model: str,
     prompt: str,
     max_workers: int,
-    stop_event: threading.Event
-    ) -> _RunStats:
+    stop_event: threading.Event,
+) -> _RunStats:
     """Tags image_files concurrently with a progress bar and returns the totals."""
 
     stats = _RunStats()
@@ -948,7 +986,11 @@ def _run_tasks(
         }
 
         stopped_notified = False
-        for future in tqdm(as_completed(future_to_image), total=len(image_files), desc="Processing images"):
+        for future in tqdm(
+            as_completed(future_to_image),
+            total=len(image_files),
+            desc="Processing images",
+        ):
             if stop_event.is_set() and not stopped_notified:
                 tqdm.write(
                     "  [!] Stop signal received (Q pressed). Finishing currently running tasks..."
@@ -1080,7 +1122,9 @@ def process_directory(
     try:
         print(f"Starting concurrent processing (max_workers={max_workers}).")
         print("Press 'q' at any time to stop and see the current report.\n")
-        stats = _run_tasks(image_files, client, backend, model, prompt, max_workers, stop_event)
+        stats = _run_tasks(
+            image_files, client, backend, model, prompt, max_workers, stop_event
+        )
     except Exception as e:
         print(f"An unexpected error occurred during processing: {e}")
         raise
@@ -1108,9 +1152,7 @@ if __name__ == "__main__":
         default="ollama",
         help="local model provider backend (ollama by default)",
     )
-    parser.add_argument(
-        "--host", help="backend endpoint URL (localhost by default)"
-    )
+    parser.add_argument("--host", help="backend endpoint URL (localhost by default)")
     parser.add_argument(
         "--model",
         default="qwen3-vl:8b",
@@ -1120,11 +1162,10 @@ if __name__ == "__main__":
         "--workers",
         type=int,
         default=1,
-        help="number of concurrent workers (max 4, default 1)"
+        help="number of concurrent workers (max 4, default 1)",
     )
     parser.add_argument(
-        "--log",
-        help="enable logging and create log file (e.g., --log logs/run.log)"
+        "--log", help="enable logging and create log file (e.g., --log logs/run.log)"
     )
     parser.add_argument(
         "--clear",

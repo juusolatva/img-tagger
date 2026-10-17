@@ -105,7 +105,11 @@ def test_auto_heals_corrupt_metadata_via_pillow(tmp_path, monkeypatch, capsys, e
 def test_clearing_keeps_animation(tmp_path, ext):
     path = tag(make_animated(tmp_path / f"anim.{ext}", durations=[40, 250, 90], loop=3))
     img_tagger.clear_tags(path)
-    assert animation_info(path) == {"n_frames": 3, "durations": [40, 250, 90], "loop": 3}
+    assert animation_info(path) == {
+        "n_frames": 3,
+        "durations": [40, 250, 90],
+        "loop": 3,
+    }
     assert not img_tagger.is_already_processed(path)
 
 
@@ -120,7 +124,11 @@ def test_auto_heal_keeps_animation(tmp_path, monkeypatch, capsys, ext):
     img_tagger.clear_tags(path)
 
     assert "Sanitized and cleared (Pillow)" in capsys.readouterr().out
-    assert animation_info(path) == {"n_frames": 3, "durations": [40, 250, 90], "loop": 3}
+    assert animation_info(path) == {
+        "n_frames": 3,
+        "durations": [40, 250, 90],
+        "loop": 3,
+    }
     assert leftover_temp_files(tmp_path) == []
 
 

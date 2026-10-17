@@ -22,6 +22,7 @@ STATIC_FORMATS = {"jpg": "JPEG", "jpeg": "JPEG", "png": "PNG", "webp": "WEBP"}
 
 # --- Command-line options -------------------------------------------------
 
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     group = parser.getgroup("img_tagger integration")
     group.addoption(
@@ -35,8 +36,14 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default="ollama",
         help="backend for integration tests (default: ollama)",
     )
-    group.addoption("--tagger-host", default=None, help="backend URL (default: localhost for the backend)")
-    group.addoption("--tagger-model", default="qwen3-vl:8b", help="model for integration tests")
+    group.addoption(
+        "--tagger-host",
+        default=None,
+        help="backend URL (default: localhost for the backend)",
+    )
+    group.addoption(
+        "--tagger-model", default="qwen3-vl:8b", help="model for integration tests"
+    )
     group.addoption(
         "--images-dir",
         default=str(Path(__file__).resolve().parent.parent / "test_images"),
@@ -44,7 +51,9 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
-def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
     if config.getoption("--run-integration"):
         return
     skip = pytest.mark.skip(reason="integration test: pass --run-integration to run")
@@ -55,7 +64,12 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 # --- Image factories ------------------------------------------------------
 
-def make_image(path: Path, color: tuple[int, int, int] = (200, 30, 30), size: tuple[int, int] = (32, 24)) -> Path:
+
+def make_image(
+    path: Path,
+    color: tuple[int, int, int] = (200, 30, 30),
+    size: tuple[int, int] = (32, 24),
+) -> Path:
     """Create a small solid-color static image; format is chosen from the extension."""
     fmt = STATIC_FORMATS[path.suffix.lower().lstrip(".")]
     Image.new("RGB", size, color).save(path, format=fmt)
@@ -74,9 +88,19 @@ def make_gif(
 ) -> Path:
     """Create an animated GIF whose frames all differ (so Pillow cannot merge them)."""
     durations = durations or GIF_DURATIONS
-    frames = [Image.new("RGB", (8, 8), GIF_COLORS[i % len(GIF_COLORS)]).convert("P") for i in range(len(durations))]
+    frames = [
+        Image.new("RGB", (8, 8), GIF_COLORS[i % len(GIF_COLORS)]).convert("P")
+        for i in range(len(durations))
+    ]
     kwargs = {"comment": comment} if comment is not None else {}
-    frames[0].save(path, save_all=True, append_images=frames[1:], duration=durations, loop=loop, **kwargs)
+    frames[0].save(
+        path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        loop=loop,
+        **kwargs,
+    )
     return path
 
 
@@ -86,12 +110,24 @@ def read_metadata(path: Path) -> tuple[dict, dict]:
         return img.read_exif(), img.read_xmp()
 
 
-def make_animated(path: Path, durations: list[int] | None = None, loop: int = 0) -> Path:
+def make_animated(
+    path: Path, durations: list[int] | None = None, loop: int = 0
+) -> Path:
     """Create an animated WebP or PNG (APNG) whose frames all differ; format is chosen from the extension."""
     durations = durations or GIF_DURATIONS
     fmt = {"webp": "WEBP", "png": "PNG"}[path.suffix.lower().lstrip(".")]
-    frames = [Image.new("RGB", (8, 8), GIF_COLORS[i % len(GIF_COLORS)]) for i in range(len(durations))]
-    frames[0].save(path, format=fmt, save_all=True, append_images=frames[1:], duration=durations, loop=loop)
+    frames = [
+        Image.new("RGB", (8, 8), GIF_COLORS[i % len(GIF_COLORS)])
+        for i in range(len(durations))
+    ]
+    frames[0].save(
+        path,
+        format=fmt,
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        loop=loop,
+    )
     return path
 
 
@@ -101,8 +137,14 @@ def animation_info(path: Path) -> dict:
         durations = []
         for frame in ImageSequence.Iterator(img):
             frame.load()  # WebP fills in the duration only after decoding the frame
-            durations.append(round(frame.info.get("duration", 0)))  # APNG reports floats
-        return {"n_frames": img.n_frames, "durations": durations, "loop": img.info.get("loop")}
+            durations.append(
+                round(frame.info.get("duration", 0))
+            )  # APNG reports floats
+        return {
+            "n_frames": img.n_frames,
+            "durations": durations,
+            "loop": img.info.get("loop"),
+        }
 
 
 def gif_info(path: Path) -> dict:
@@ -114,7 +156,9 @@ def gif_info(path: Path) -> dict:
             "n_frames": img.n_frames,
             "durations": durations,
             "loop": img.info.get("loop"),
-            "comment": comment.decode("utf-8") if isinstance(comment, bytes) else comment,
+            "comment": comment.decode("utf-8")
+            if isinstance(comment, bytes)
+            else comment,
         }
 
 
@@ -135,6 +179,7 @@ def gif_image(tmp_path: Path) -> Path:
 
 
 # --- Fake backend clients -------------------------------------------------
+
 
 class _Obj:
     """Tiny attribute bag used to mimic SDK response objects."""

@@ -27,7 +27,15 @@ class TestImgTaggerCli:
     def test_help(self):
         result = run("img_tagger.py", "--help")
         assert result.returncode == 0
-        for flag in ["--recursive", "--backend", "--host", "--model", "--workers", "--log", "--clear"]:
+        for flag in [
+            "--recursive",
+            "--backend",
+            "--host",
+            "--model",
+            "--workers",
+            "--log",
+            "--clear",
+        ]:
             assert flag in result.stdout
 
     def test_missing_directory(self, tmp_path):
