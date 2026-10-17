@@ -25,9 +25,7 @@ def run_single(path, client=None, backend="ollama", stop=False):
     event = threading.Event()
     if stop:
         event.set()
-    return img_tagger.process_single_image(
-        path, client, backend, "test-model", "prompt", event
-    )
+    return img_tagger.process_single_image(path, client, backend, "test-model", "prompt", event)
 
 
 # --- process_single_image -------------------------------------------------
@@ -81,9 +79,7 @@ class TestProcessSingleImage:
         assert status == "CANCELLED"
         assert client.calls == []
 
-    def test_unparseable_model_output_fails_and_leaves_image_untagged(
-        self, static_image
-    ):
+    def test_unparseable_model_output_fails_and_leaves_image_untagged(self, static_image):
         client = FakeOllamaClient()
         client.reply = "I cannot help with that."
 
@@ -128,13 +124,9 @@ class TestProcessDirectory:
         make_image(sub / "nested.jpg")
 
     def _run(self, root, recursive=False, backend="ollama", workers=1):
-        img_tagger.process_directory(
-            str(root), recursive, backend, "http://fake:1", "test-model", workers
-        )
+        img_tagger.process_directory(str(root), recursive, backend, "http://fake:1", "test-model", workers)
 
-    def test_tags_top_level_images_only_when_not_recursive(
-        self, tmp_path, fake_ollama, capsys
-    ):
+    def test_tags_top_level_images_only_when_not_recursive(self, tmp_path, fake_ollama, capsys):
         self._populate(tmp_path)
         self._run(tmp_path)
 
@@ -206,16 +198,10 @@ class TestProcessDirectory:
         make_image(tmp_path / "a.jpg")
         self._run(tmp_path)
 
-        expected = (
-            (img_tagger.Path(img_tagger.__file__).parent / "prompt.txt")
-            .read_text(encoding="utf-8")
-            .strip()
-        )
+        expected = (img_tagger.Path(img_tagger.__file__).parent / "prompt.txt").read_text(encoding="utf-8").strip()
         assert fake_ollama.instances[0].calls[0]["messages"][0]["content"] == expected
 
-    def test_falls_back_to_default_prompt(
-        self, tmp_path, fake_ollama, monkeypatch, capsys
-    ):
+    def test_falls_back_to_default_prompt(self, tmp_path, fake_ollama, monkeypatch, capsys):
         script_dir = tmp_path / "script"
         script_dir.mkdir()
         monkeypatch.setattr(img_tagger, "__file__", str(script_dir / "img_tagger.py"))
@@ -226,19 +212,12 @@ class TestProcessDirectory:
         self._run(images)
 
         assert "Falling back to default" in capsys.readouterr().out
-        assert (
-            fake_ollama.instances[0].calls[0]["messages"][0]["content"]
-            == img_tagger.DEFAULT_PROMPT
-        )
+        assert fake_ollama.instances[0].calls[0]["messages"][0]["content"] == img_tagger.DEFAULT_PROMPT
 
-    def test_custom_prompt_file_is_stripped(
-        self, tmp_path, fake_ollama, monkeypatch, capsys
-    ):
+    def test_custom_prompt_file_is_stripped(self, tmp_path, fake_ollama, monkeypatch, capsys):
         script_dir = tmp_path / "script"
         script_dir.mkdir()
-        (script_dir / "prompt.txt").write_text(
-            "\n  my custom prompt  \n", encoding="utf-8"
-        )
+        (script_dir / "prompt.txt").write_text("\n  my custom prompt  \n", encoding="utf-8")
         monkeypatch.setattr(img_tagger, "__file__", str(script_dir / "img_tagger.py"))
         images = tmp_path / "images"
         images.mkdir()
@@ -246,18 +225,11 @@ class TestProcessDirectory:
 
         self._run(images)
 
-        assert (
-            fake_ollama.instances[0].calls[0]["messages"][0]["content"]
-            == "my custom prompt"
-        )
+        assert fake_ollama.instances[0].calls[0]["messages"][0]["content"] == "my custom prompt"
 
-    def test_unreadable_prompt_file_exits(
-        self, tmp_path, fake_ollama, monkeypatch, capsys
-    ):
+    def test_unreadable_prompt_file_exits(self, tmp_path, fake_ollama, monkeypatch, capsys):
         script_dir = tmp_path / "script"
-        (script_dir / "prompt.txt").mkdir(
-            parents=True
-        )  # exists() but read_text() fails
+        (script_dir / "prompt.txt").mkdir(parents=True)  # exists() but read_text() fails
         monkeypatch.setattr(img_tagger, "__file__", str(script_dir / "img_tagger.py"))
         images = tmp_path / "images"
         images.mkdir()
@@ -289,13 +261,9 @@ class TestProcessDirectory:
         self._run(tmp_path, backend="lm-studio")
         assert "'openai' library not found" in capsys.readouterr().out
 
-    def test_quit_cancels_queued_images(
-        self, tmp_path, fake_ollama, monkeypatch, capsys
-    ):
+    def test_quit_cancels_queued_images(self, tmp_path, fake_ollama, monkeypatch, capsys):
         # Simulate 'Q' being pressed before any work starts: nothing should reach the model.
-        monkeypatch.setattr(
-            img_tagger, "listen_for_quit", lambda stop_event: stop_event.set()
-        )
+        monkeypatch.setattr(img_tagger, "listen_for_quit", lambda stop_event: stop_event.set())
         for i in range(5):
             make_image(tmp_path / f"img{i}.jpg")
 
@@ -320,9 +288,7 @@ class TestListenForQuit:
         writer = os.fdopen(write_fd, "w")
         monkeypatch.setattr(sys, "stdin", reader)
         event = threading.Event()
-        thread = threading.Thread(
-            target=img_tagger.listen_for_quit, args=(event,), daemon=True
-        )
+        thread = threading.Thread(target=img_tagger.listen_for_quit, args=(event,), daemon=True)
         thread.start()
         yield event, thread, writer
         # Stop the thread before monkeypatch restores the real stdin.
@@ -337,9 +303,7 @@ class TestListenForQuit:
         for key in keys:
             writer.write(key)
             writer.flush()
-            time.sleep(
-                0.15
-            )  # longer than the listener's select() timeout: one key per read
+            time.sleep(0.15)  # longer than the listener's select() timeout: one key per read
 
     @pytest.mark.parametrize("key", ["q", "Q"])
     def test_q_sets_stop_event(self, listener, key):
@@ -401,9 +365,7 @@ class TestListenForQuitCbreak:
         reader = os.fdopen(slave_fd, "r")
         monkeypatch.setattr(sys, "stdin", reader)
         event = threading.Event()
-        thread = threading.Thread(
-            target=img_tagger.listen_for_quit, args=(event,), daemon=True
-        )
+        thread = threading.Thread(target=img_tagger.listen_for_quit, args=(event,), daemon=True)
         thread.start()
         yield event, thread, master_fd, attrs, in_cbreak, original
         event.set()
@@ -474,9 +436,7 @@ class TestClearDirectory:
         assert not img_tagger.is_already_processed(top_gif)
         assert not img_tagger.is_already_processed(nested)
 
-    def test_process_directory_clear_does_not_call_backend(
-        self, tmp_path, fake_ollama, capsys
-    ):
+    def test_process_directory_clear_does_not_call_backend(self, tmp_path, fake_ollama, capsys):
         img = make_image(tmp_path / "a.jpg")
         img_tagger.tag_image(str(img), SAMPLE_TAGS)
         assert img_tagger.is_already_processed(img)

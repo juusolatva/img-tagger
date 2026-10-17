@@ -34,9 +34,7 @@ class TestGetImageFormat:
         [("jpg", "JPEG"), ("jpeg", "JPEG"), ("png", "PNG"), ("webp", "WEBP")],
     )
     def test_static_formats(self, tmp_path, ext, expected):
-        assert (
-            img_tagger.get_image_format(make_image(tmp_path / f"a.{ext}")) == expected
-        )
+        assert img_tagger.get_image_format(make_image(tmp_path / f"a.{ext}")) == expected
 
     def test_gif(self, gif_image):
         assert img_tagger.get_image_format(gif_image) == "GIF"
@@ -66,9 +64,7 @@ class TestWriteMetadata:
         tags_str = ", ".join(SAMPLE_TAGS)
         assert exif["Exif.Photo.UserComment"] == f"{tags_str} {MARKER}"
         assert xmp["Xmp.dc.subject"] == SAMPLE_TAGS
-        assert xmp["Xmp.dc.description"] == {
-            'lang="x-default"': f"Tags: {tags_str} | {MARKER}"
-        }
+        assert xmp["Xmp.dc.description"] == {'lang="x-default"': f"Tags: {tags_str} | {MARKER}"}
 
     def test_marks_image_as_processed(self, static_image):
         assert not img_tagger.is_already_processed(static_image)
@@ -115,9 +111,7 @@ class TestWriteMetadata:
         img_tagger.write_metadata(str(static_image), SAMPLE_TAGS)
         assert seen_dirs == [static_image.parent]
 
-    def test_failure_leaves_original_untouched_and_cleans_up(
-        self, static_image, monkeypatch
-    ):
+    def test_failure_leaves_original_untouched_and_cleans_up(self, static_image, monkeypatch):
         original = static_image.read_bytes()
 
         class BrokenImage:
@@ -132,12 +126,8 @@ class TestWriteMetadata:
         assert static_image.read_bytes() == original
         assert leftover_temp_files(static_image.parent) == []
 
-    @pytest.mark.parametrize(
-        "error", ["Invalid IFD structure", "Image data is corrupt"]
-    )
-    def test_auto_heals_corrupt_metadata_via_pillow(
-        self, static_image, monkeypatch, error
-    ):
+    @pytest.mark.parametrize("error", ["Invalid IFD structure", "Image data is corrupt"])
+    def test_auto_heals_corrupt_metadata_via_pillow(self, static_image, monkeypatch, error):
         real_image = img_tagger.pyexiv2.Image
         attempts = []
 
@@ -151,13 +141,9 @@ class TestWriteMetadata:
         img_tagger.write_metadata(str(static_image), SAMPLE_TAGS)
         monkeypatch.setattr(img_tagger.pyexiv2, "Image", real_image)
 
-        assert len(attempts) == 2, (
-            "pyexiv2 should be retried once on the sanitized file"
-        )
+        assert len(attempts) == 2, "pyexiv2 should be retried once on the sanitized file"
         assert img_tagger.is_already_processed(static_image)
-        expected_format = {".jpg": "JPEG", ".png": "PNG", ".webp": "WEBP"}[
-            static_image.suffix
-        ]
+        expected_format = {".jpg": "JPEG", ".png": "PNG", ".webp": "WEBP"}[static_image.suffix]
         assert img_tagger.get_image_format(static_image) == expected_format
         assert leftover_temp_files(static_image.parent) == []
 
