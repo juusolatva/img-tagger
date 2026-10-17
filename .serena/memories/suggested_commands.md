@@ -1,5 +1,7 @@
 # Suggested commands (Linux: use `python3`, `python` may be unaliased)
-- Install: `pip3 install -r requirements.txt`
+- Install: `pip3 install -r requirements.txt`; dev: `pip3 install -r requirements-dev.txt`
+- Tests: `python3 -m pytest` (`--cov` for coverage like CI)
+- Lint/format: `ruff check .`, `ruff format .` (CI: `ruff format --check`)
 - Tag (Ollama default): `python3 img_tagger.py <dir>`
 - Tag via LM Studio: `python3 img_tagger.py <dir> --backend lm-studio`
 - Options: `-r` recursive, `--model <m>`, `--workers 1..4`, `--host <url>`, `--log <file>` (only way to see DEBUG/INFO diagnostics).

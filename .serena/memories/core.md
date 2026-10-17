@@ -6,6 +6,7 @@ Authoritative detailed spec lives in `AGENTS.md` (CLAUDE.md just `@`-includes it
 - `img_tagger.py` — single-file CLI. Pipeline: `process_directory` (`_find_images` → `_load_prompt` → `_create_client` → quit listener + `_run_tasks` [ThreadPoolExecutor + tqdm, totals in `_RunStats`] → `_print_report`) → `process_single_image` (format check → `is_already_processed` → `get_tags_ollama`/`get_tags_lm_studio` → `parse_model_output` → `normalize_tags` → `tag_image`) → `write_metadata` (JPEG/WebP/PNG via pyexiv2) or `write_gif_tags` (Pillow comment).
   - `--clear` path: `process_directory(clear=True)` → `clear_directory` → `clear_tags` (`_clear_standard` pyexiv2 + Pillow auto-heal / `_clear_gif`). Reuses `robust_replace`/`_sanitize_with_pillow`; no prompt, client, quit listener or report. (Former standalone `clear_tags.py` was removed; no duplicated helpers remain.)
 - `prompt.txt` — overrides `DEFAULT_PROMPT`; unreadable file → `sys.exit(1)`.
+- `.github/workflows/ci.yml`, `pyproject.toml` (Ruff + coverage only), `sonar-project.properties`, `requirements-dev.lock` — CI/tooling; see `AGENTS.md` CI section.
 - `tests/` — offline pytest suite (fake backends, generated images); `test_integration.py` is opt-in and uses `test_images/`.
 - `test_images/` — gitignored local manual-test corpus (may not exist).
 
@@ -18,7 +19,7 @@ Authoritative detailed spec lives in `AGENTS.md` (CLAUDE.md just `@`-includes it
 - Optional imports (`msvcrt`, `termios`/`tty`, `ollama`, `openai`) fall back to `None`; code checks for `None` rather than importing lazily.
 
 ## Further memories
-- Dependencies, Python version, available tools: `mem:tech_stack`
+- Dependencies, Python version, lockfile, Ruff/coverage config, CI jobs: `mem:tech_stack`
 - Run/clear/log commands: `mem:suggested_commands`
 - Code style (docstrings, typing mix, logging): `mem:conventions`
-- What to verify before declaring done (pytest, no CI; dirty lint baseline; SonarQube): `mem:task_completion`
+- What to verify before declaring done (pytest, Ruff check/format, lock regen, SonarQube rules): `mem:task_completion`

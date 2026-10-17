@@ -5,13 +5,14 @@ This file provides guidance to agents when working with code in this repository.
 ## Project Overview
 - `img_tagger.py` — single-file CLI: tags JPEG/WebP/PNG/GIF files via a local vision-language model (Ollama or LM Studio), writing tags into image metadata. `--clear` strips tags/metadata back out instead (used to reset images for testing; no model backend needed).
 - `prompt.txt` — externalized LLM prompt; takes precedence over the `DEFAULT_PROMPT` fallback hardcoded in `img_tagger.py`.
-- Flat repo layout: no package structure, no `pyproject.toml`/`setup.py`, no CI. Tests live in `tests/` (pytest, configured by `pytest.ini`).
+- Flat repo layout: no package structure, not installable (`pyproject.toml` only holds Ruff and coverage config; no `setup.py`). Tests live in `tests/` (pytest, configured by `pytest.ini`). CI: GitHub Actions (see CI section).
 - Requires **Python 3.10+** (uses modern type annotations like `str | None` and `list[str]`).
 
 ## Build/Lint/Test Commands
-No lint tooling is configured in the repo. The maintainer runs SonarQube Cloud (project `juusolatva_img_tagger`) manually; keep functions under its cognitive-complexity limit of 15 by extracting `_private` helpers.
-- Dependencies: `pip install -r requirements.txt` (or `pip3 install -r requirements.txt`); test deps: `pip install -r requirements-dev.txt`
-- Run tests: `python3 -m pytest` (offline: images generated on the fly, model backends faked; ~15s)
+Ruff (lint + format) is configured in `pyproject.toml`; CI fails on any Ruff finding or unformatted file. SonarQube Cloud (project `juusolatva_img_tagger`) runs in CI; keep functions under its cognitive-complexity limit of 15 by extracting `_private` helpers.
+- Dependencies: `pip install -r requirements.txt` (or `pip3 install -r requirements.txt`); dev deps (pytest, pytest-cov, Ruff): `pip install -r requirements-dev.txt`
+- Lint/format: `ruff check .` and `ruff format .` (CI runs `ruff format --check`). Use the Ruff version pinned in `requirements-dev.txt`.
+- Run tests: `python3 -m pytest` (offline: images generated on the fly, model backends faked; ~15s). With coverage like CI: `python3 -m pytest --cov`
 - Integration tests (opt-in, need a live backend + images in git-ignored `test_images/`; copies images to a temp dir, prints tags for manual quality review): `python3 -m pytest -m integration --run-integration -s [--tagger-backend lm-studio] [--tagger-host URL] [--tagger-model M] [--images-dir DIR]`
 - Run tagger (Ollama, default): `python3 img_tagger.py <directory>`
 - Run tagger (LM Studio): `python3 img_tagger.py <directory> --backend lm-studio`
@@ -20,6 +21,15 @@ No lint tooling is configured in the repo. The maintainer runs SonarQube Cloud (
 - Help: `python3 img_tagger.py -h`
 - Logging: `python3 img_tagger.py <dir> --log output.log` (without `--log`, diagnostic `DEBUG` messages never surface — see Known Limitations)
 - Note: On Linux environments, use `python3` if `python` is not aliased.
+
+## CI
+`.github/workflows/ci.yml` (GitHub Actions) runs on pushes to `main`, pull requests and manual dispatch:
+- **Ruff**: `ruff check` and `ruff format --check --diff`. `ruff-action` reads the Ruff version from the `ruff==` pin in `requirements-dev.txt`.
+- **Tests**: `pytest --cov --cov-report=xml` on Python 3.10, 3.11, 3.12, 3.13 and 3.14 (`fail-fast: false`). Integration tests are skipped (no backend). Installs from `requirements-dev.lock` with `--require-hashes --only-binary :all:`, so every locked package needs a wheel for every matrix version. The 3.14 job uploads `coverage.xml` as an artifact.
+- **SonarQube Cloud**: runs after the tests and scans with the downloaded `coverage.xml`. Settings are in `sonar-project.properties` (sources `.`, `tests/**` excluded and treated as tests, `sonar.python.version` 3.10–3.14). Needs the `SONAR_TOKEN` repo secret. Coverage is configured in `[tool.coverage.run]` in `pyproject.toml` (branch coverage, `tests/` omitted, `relative_files = true` so Sonar can map the paths in `coverage.xml` to its sources).
+- Third-party actions are pinned to commit SHAs with a `# vX.Y.Z` comment. GitHub's own `actions/*` use major-version tags.
+- **`requirements-dev.lock`**: hash-locked, cross-platform lock of `requirements-dev.txt` (and thus `requirements.txt`) for Python ≥3.10. Only CI installs it; end users still get the `>=` bounds. After changing either requirements file (or to bump versions), regenerate it with `uv pip compile requirements-dev.txt --universal --python-version 3.10 --generate-hashes --no-header -o requirements-dev.lock`. Without `--python-version 3.10` the Python 3.10-only entries (`pillow` 12.x, `exceptiongroup`) are dropped and the 3.10 job breaks.
+- Changing the supported Python range means updating the CI matrix, `sonar.python.version`, Ruff `target-version` and the lock's `--python-version` together.
 
 ## Backends
 - `--backend ollama` (default): `ollama` Python client, default host `http://localhost:11434`, default model `qwen3-vl:8b`.
@@ -74,9 +84,10 @@ If `pyexiv2` raises a `RuntimeError` containing `"IFD"` or `"corrupt"`:
 *Caution*: Pillow re-saving can re-encode/compress lossy images (JPEG/WebP).
 
 ## Known Limitations & Maintenance Notes
-- **Tests**: `python3 -m pytest` covers parsing, metadata round-trips for every format, GIF frame/duration preservation, auto-healing (simulated), temp-file cleanup, fake-backend pipeline, quit listener and CLI. No CI. Tagging *quality* still needs a manual run with `--run-integration` against real images.
+- **Tests**: `python3 -m pytest` covers parsing, metadata round-trips for every format, GIF frame/duration preservation, auto-healing (simulated), temp-file cleanup, fake-backend pipeline, quit listener and CLI. CI runs them on Python 3.10–3.14 (Linux only). Tagging *quality* still needs a manual run with `--run-integration` against real images.
 - **Known bugs**: none currently pinned. When adding one, pin it as a strict `xfail` (fixing it makes it XPASS → remove the marker).
 - **Silent logging by default**: Without `--log`, `DEBUG` logs (including pyexiv2 read failures and fallback activations) do not display. Failures may look like silent no-ops.
 - **No request timeouts**: Ollama and LM Studio HTTP clients lack request timeouts; hung local model servers can block worker threads indefinitely.
-- **Unpinned version range (future work)**: "Python 3.10+" is a floor set by syntax, not a tested range, and `requirements.txt` has only `>=` lower bounds that were never tested as minimums. SonarQube Cloud warns that `sonar.python.version` is unset, so it assumes 3.10–3.14. Known and accepted for now. If a supported range is ever defined, set it in Sonar and in `requirements.txt` together.
+- **Untested dependency minimums (future work)**: CI tests Python 3.10–3.14, but only against the versions in `requirements-dev.lock`. The `>=` lower bounds in `requirements.txt` were never tested as minimums. Known and accepted for now.
+- **Linux-only CI**: nothing runs on Windows or macOS. The `msvcrt` quit listener is untested, and the POSIX quit-listener tests are skipped on Windows.
 - **SonarQube false positives** (dismissed in Sonar; don't "fix" them in code): path traversal on `--log` in `setup_logging()` (operator-chosen path, tool is for interactive use); "always false" `OpenAI is None` in `_create_client()` (optional-import fallback, covered by `test_missing_openai_library`); regex-backtracking warnings on `parse_model_output()` patterns (measured linear on 200k-char adversarial inputs).

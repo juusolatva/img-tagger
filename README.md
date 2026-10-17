@@ -18,7 +18,7 @@ A python script that tags all the **JPEG**, **WebP**, **PNG** and **GIF** files 
 Clone the repository and run *img_tagger.py* with Python.
 
 ### System prerequisites
-You must have [Python](https://www.python.org/downloads/) and either **[ollama](https://ollama.com/download)** or **[LM Studio](https://lmstudio.ai/download)** with a vision-capable model for processing the images.
+You must have [Python](https://www.python.org/downloads/) 3.10 or newer and either **[ollama](https://ollama.com/download)** or **[LM Studio](https://lmstudio.ai/download)** with a vision-capable model for processing the images.
 
 ### Installing dependencies
 *pip install -r requirements.txt*
@@ -71,6 +71,13 @@ Clear all tags and metadata from a folder recursively:
 *pip install -r requirements-dev.txt* and then *python -m pytest*. The default tests run offline (no model server needed).
 
 To check tagging quality against real images, put them in a *test_images/* folder and run *python -m pytest -m integration --run-integration -s* with ollama or LM Studio running. Use *--tagger-backend*, *--tagger-host*, *--tagger-model* and *--images-dir* to change the defaults. The images are copied to a temporary folder so the originals are not modified.
+
+### Continuous integration
+Every push to *main* and every pull request runs [GitHub Actions](.github/workflows/ci.yml): **Ruff** lint and format checks, the offline tests with coverage on Python 3.10 to 3.14, and a **SonarQube Cloud** scan. To run the same checks locally, use *ruff check .*, *ruff format --check .* and *python -m pytest --cov*.
+
+CI installs the exact package versions in *requirements-dev.lock*. If you change *requirements.txt* or *requirements-dev.txt*, regenerate the lock with [uv](https://docs.astral.sh/uv/):
+
+*uv pip compile requirements-dev.txt --universal --python-version 3.10 --generate-hashes --no-header -o requirements-dev.lock*
 
 ### Known issues
 - Animated **WebPs** keep their animation but the model might only see the first frame
