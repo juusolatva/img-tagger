@@ -12,10 +12,7 @@ SIX = ["photo", "sunset", "beach", "ocean", "sky", "clouds"]
 
 class TestNormalizeTags:
     def test_strips_lowercases_and_keeps_order(self):
-        assert (
-            normalize_tags(["  Photo ", "SUNSET", "Beach", "ocean", "Sky", "clouds"])
-            == SIX
-        )
+        assert normalize_tags(["  Photo ", "SUNSET", "Beach", "ocean", "Sky", "clouds"]) == SIX
 
     def test_deduplicates_case_insensitively_preserving_first_occurrence(self):
         tags = ["Photo", "photo", "sunset", "SUNSET", "beach", "ocean", "sky", "clouds"]
@@ -73,9 +70,7 @@ class TestParseModelOutput:
     @pytest.mark.parametrize(
         "raw",
         [
-            pytest.param(
-                "photo, sunset, beach, ocean, sky, clouds", id="comma-separated"
-            ),
+            pytest.param("photo, sunset, beach, ocean, sky, clouds", id="comma-separated"),
             pytest.param(
                 "Photo, Sunset, Beach, Ocean, Sky, Clouds",
                 id="comma-separated-mixed-case",
@@ -84,9 +79,7 @@ class TestParseModelOutput:
                 "photo,sunset,beach,ocean,sky,clouds\n",
                 id="comma-no-spaces-trailing-newline",
             ),
-            pytest.param(
-                "'photo', \"sunset\", beach, ocean, sky, clouds", id="comma-quoted"
-            ),
+            pytest.param("'photo', \"sunset\", beach, ocean, sky, clouds", id="comma-quoted"),
             pytest.param(
                 '["photo", "sunset", "beach", "ocean", "sky", "clouds"]',
                 id="json-array",
@@ -103,9 +96,7 @@ class TestParseModelOutput:
                 "- photo\n- sunset\n- beach\n- ocean\n- sky\n- clouds",
                 id="dash-bullets",
             ),
-            pytest.param(
-                "• photo\n• sunset\n• beach\n• ocean\n• sky\n• clouds", id="dot-bullets"
-            ),
+            pytest.param("• photo\n• sunset\n• beach\n• ocean\n• sky\n• clouds", id="dot-bullets"),
             pytest.param(
                 "1. photo\n2. sunset\n3. beach\n4. ocean\n5. sky\n6. clouds",
                 id="numbered",
@@ -162,10 +153,7 @@ class TestParseModelOutput:
         assert parse_model_output(raw) == [f"tag{i}" for i in range(12)]
 
     def test_duplicates_removed(self):
-        assert (
-            parse_model_output("photo, Photo, PHOTO, sunset, beach, ocean, sky, clouds")
-            == SIX
-        )
+        assert parse_model_output("photo, Photo, PHOTO, sunset, beach, ocean, sky, clouds") == SIX
 
     @pytest.mark.parametrize(
         "raw",
@@ -184,9 +172,7 @@ class TestParseModelOutput:
         "raw",
         [
             pytest.param("1" * 5000, id="digits-over-int-limit"),
-            pytest.param(
-                "Sure: [" + "1" * 5000 + "] ok", id="bracketed-digits-over-int-limit"
-            ),
+            pytest.param("Sure: [" + "1" * 5000 + "] ok", id="bracketed-digits-over-int-limit"),
             pytest.param("[" * 100_000 + "]", id="deeply-nested-brackets"),
         ],
     )

@@ -4,3 +4,5 @@
 test_images/
 __pycache__/
 .pytest_cache/
+.coverage
+coverage.xml

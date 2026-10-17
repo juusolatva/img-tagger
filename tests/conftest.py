@@ -41,9 +41,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=None,
         help="backend URL (default: localhost for the backend)",
     )
-    group.addoption(
-        "--tagger-model", default="qwen3-vl:8b", help="model for integration tests"
-    )
+    group.addoption("--tagger-model", default="qwen3-vl:8b", help="model for integration tests")
     group.addoption(
         "--images-dir",
         default=str(Path(__file__).resolve().parent.parent / "test_images"),
@@ -51,9 +49,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
-def pytest_collection_modifyitems(
-    config: pytest.Config, items: list[pytest.Item]
-) -> None:
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     if config.getoption("--run-integration"):
         return
     skip = pytest.mark.skip(reason="integration test: pass --run-integration to run")
@@ -88,10 +84,7 @@ def make_gif(
 ) -> Path:
     """Create an animated GIF whose frames all differ (so Pillow cannot merge them)."""
     durations = durations or GIF_DURATIONS
-    frames = [
-        Image.new("RGB", (8, 8), GIF_COLORS[i % len(GIF_COLORS)]).convert("P")
-        for i in range(len(durations))
-    ]
+    frames = [Image.new("RGB", (8, 8), GIF_COLORS[i % len(GIF_COLORS)]).convert("P") for i in range(len(durations))]
     kwargs = {"comment": comment} if comment is not None else {}
     frames[0].save(
         path,
@@ -110,16 +103,11 @@ def read_metadata(path: Path) -> tuple[dict, dict]:
         return img.read_exif(), img.read_xmp()
 
 
-def make_animated(
-    path: Path, durations: list[int] | None = None, loop: int = 0
-) -> Path:
+def make_animated(path: Path, durations: list[int] | None = None, loop: int = 0) -> Path:
     """Create an animated WebP or PNG (APNG) whose frames all differ; format is chosen from the extension."""
     durations = durations or GIF_DURATIONS
     fmt = {"webp": "WEBP", "png": "PNG"}[path.suffix.lower().lstrip(".")]
-    frames = [
-        Image.new("RGB", (8, 8), GIF_COLORS[i % len(GIF_COLORS)])
-        for i in range(len(durations))
-    ]
+    frames = [Image.new("RGB", (8, 8), GIF_COLORS[i % len(GIF_COLORS)]) for i in range(len(durations))]
     frames[0].save(
         path,
         format=fmt,
@@ -137,9 +125,7 @@ def animation_info(path: Path) -> dict:
         durations = []
         for frame in ImageSequence.Iterator(img):
             frame.load()  # WebP fills in the duration only after decoding the frame
-            durations.append(
-                round(frame.info.get("duration", 0))
-            )  # APNG reports floats
+            durations.append(round(frame.info.get("duration", 0)))  # APNG reports floats
         return {
             "n_frames": img.n_frames,
             "durations": durations,
@@ -156,9 +142,7 @@ def gif_info(path: Path) -> dict:
             "n_frames": img.n_frames,
             "durations": durations,
             "loop": img.info.get("loop"),
-            "comment": comment.decode("utf-8")
-            if isinstance(comment, bytes)
-            else comment,
+            "comment": comment.decode("utf-8") if isinstance(comment, bytes) else comment,
         }
 
 
