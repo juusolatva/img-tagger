@@ -735,8 +735,9 @@ def _pyexiv2_has_marker(p: Path) -> bool:
     """
 
     values = []
-    # Explicitly pass encoding='utf-8' to handle non-ASCII path characters like 'ö'
-    with metadata_lock, pyexiv2.Image(str(p), encoding="utf-8") as img:
+    # Hand pyexiv2 the bytes, not the path: on Windows it can't open non-ASCII paths like 'ö'
+    data = p.read_bytes()
+    with metadata_lock, pyexiv2.ImageData(data) as img:
         # Read EXIF and XMP independently so one failing doesn't kill both
         for kind, read in (("EXIF", img.read_exif), ("XMP", img.read_xmp)):
             try:

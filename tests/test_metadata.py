@@ -71,8 +71,10 @@ class TestWriteMetadata:
         img_tagger.write_metadata(str(static_image), SAMPLE_TAGS)
         assert img_tagger.is_already_processed(static_image)
 
-    def test_non_ascii_tags_and_filename(self, tmp_path):
-        path = make_image(tmp_path / "kesä_ö.jpg")
+    # 日本 is outside the Windows ANSI code page, so encoding="mbcs" alone wouldn't open it
+    @pytest.mark.parametrize("name", ["kesä_ö.jpg", "日本.jpg"])
+    def test_non_ascii_tags_and_filename(self, tmp_path, name):
+        path = make_image(tmp_path / name)
         tags = ["café", "kesä", "日本", "naïve", "über", "smörgåsbord"]
 
         img_tagger.write_metadata(str(path), tags)
@@ -320,7 +322,7 @@ class TestIsAlreadyProcessed:
         def broken(*args, **kwargs):
             raise RuntimeError("pyexiv2 exploded")
 
-        monkeypatch.setattr(img_tagger.pyexiv2, "Image", broken)
+        monkeypatch.setattr(img_tagger.pyexiv2, "ImageData", broken)
         assert img_tagger.is_already_processed(path)
         assert (
             "Warning: pyexiv2 could not read the metadata of text.png (pyexiv2 exploded); "

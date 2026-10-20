@@ -99,7 +99,7 @@ def make_gif(
 
 def read_metadata(path: Path) -> tuple[dict, dict]:
     """Return (exif, xmp) dicts as read by pyexiv2."""
-    with pyexiv2.Image(str(path), encoding="utf-8") as img:
+    with pyexiv2.ImageData(Path(path).read_bytes()) as img:
         return img.read_exif(), img.read_xmp()
 
 
