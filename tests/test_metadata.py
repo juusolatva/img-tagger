@@ -127,7 +127,7 @@ class TestWriteMetadata:
         assert leftover_temp_files(static_image.parent) == []
 
     @pytest.mark.parametrize("error", ["Invalid IFD structure", "Image data is corrupt"])
-    def test_auto_heals_corrupt_metadata_via_pillow(self, static_image, monkeypatch, error):
+    def test_auto_heals_corrupt_metadata_via_pillow(self, static_image, monkeypatch, capsys, error):
         real_image = img_tagger.pyexiv2.Image
         attempts = []
 
@@ -142,6 +142,7 @@ class TestWriteMetadata:
         monkeypatch.setattr(img_tagger.pyexiv2, "Image", real_image)
 
         assert len(attempts) == 2, "pyexiv2 should be retried once on the sanitized file"
+        assert f"Warning: Corrupted metadata in {static_image.name} ({error})" in capsys.readouterr().out
         assert img_tagger.is_already_processed(static_image)
         expected_format = {".jpg": "JPEG", ".png": "PNG", ".webp": "WEBP"}[static_image.suffix]
         assert img_tagger.get_image_format(static_image) == expected_format
@@ -308,7 +309,7 @@ class TestIsAlreadyProcessed:
         Image.new("RGB", (4, 4)).save(path, pnginfo=info)
         assert img_tagger.is_already_processed(path)
 
-    def test_pillow_fallback_used_when_pyexiv2_cannot_open(self, tmp_path, monkeypatch):
+    def test_pillow_fallback_used_when_pyexiv2_cannot_open(self, tmp_path, monkeypatch, capsys):
         from PIL import PngImagePlugin
 
         path = tmp_path / "text.png"
@@ -321,8 +322,12 @@ class TestIsAlreadyProcessed:
 
         monkeypatch.setattr(img_tagger.pyexiv2, "Image", broken)
         assert img_tagger.is_already_processed(path)
+        assert (
+            "Warning: pyexiv2 could not read the metadata of text.png (pyexiv2 exploded); "
+            "checking it with Pillow instead"
+        ) in capsys.readouterr().out
 
-    def test_xmp_still_checked_when_exif_read_fails(self, tmp_path, monkeypatch):
+    def test_xmp_still_checked_when_exif_read_fails(self, tmp_path, monkeypatch, capsys):
         import pyexiv2
 
         path = make_image(tmp_path / "x.jpg")
@@ -334,11 +339,16 @@ class TestIsAlreadyProcessed:
 
         monkeypatch.setattr(pyexiv2.Image, "read_exif", broken_read_exif)
         assert img_tagger.is_already_processed(path)
+        assert "Warning: Could not read the EXIF metadata of x.jpg (corrupt EXIF)" in capsys.readouterr().out
 
-    def test_unreadable_file_is_not_processed(self, tmp_path):
-        bogus = tmp_path / "bogus.jpg"
+    @pytest.mark.parametrize(("name", "what"), [("bogus.jpg", "metadata"), ("bogus.gif", "GIF comment")])
+    def test_unreadable_file_is_not_processed(self, tmp_path, capsys, name, what):
+        bogus = tmp_path / name
         bogus.write_bytes(b"garbage")
         assert not img_tagger.is_already_processed(bogus)
+        out = capsys.readouterr().out
+        assert f"Warning: Could not read the {what} of {name}" in out
+        assert "treating it as not yet tagged" in out
 
     def test_unknown_extension_is_not_processed(self, tmp_path):
         path = tmp_path / "file.bmp"

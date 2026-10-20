@@ -72,6 +72,34 @@ class TestImgTaggerCli:
         assert result.returncode == 0
         assert log.parent.is_dir()
 
+    # Port 9 (discard) refuses connections, so tagging fails fast without a model server.
+    DEAD_HOST = "http://127.0.0.1:9"
+
+    def test_failed_image_prints_no_traceback(self, tmp_path):
+        make_image(tmp_path / "a.png")
+        result = run("img_tagger.py", str(tmp_path), "--host", self.DEAD_HOST)
+        assert result.returncode == 0
+        assert "Failed images: 1" in result.stdout
+        assert "Traceback" not in result.stdout + result.stderr
+
+    def test_log_file_records_run(self, tmp_path):
+        images = tmp_path / "images"
+        images.mkdir()
+        make_image(images / "a.png")
+        log = tmp_path / "run.log"
+        result = run("img_tagger.py", str(images), "--host", self.DEAD_HOST, "--timeout", "30", "--log", str(log))
+
+        assert result.returncode == 0
+        assert "Traceback" not in result.stderr
+        text = log.read_text(encoding="utf-8")
+        assert "Tagging 1 images" in text
+        assert "workers=1, timeout=30s" in text
+        assert "[DEBUG]" in text and "Prompt: " in text
+        assert "[ERROR]" in text and "Error processing a.png after" in text
+        assert "Traceback" in text
+        assert "Finished in" in text and "0 tagged, 0 skipped, 1 failed" in text
+        assert "STREAM" not in text, "Pillow's DEBUG chatter should stay out of the log"
+
     @pytest.mark.parametrize("recursive", [False, True])
     def test_clears_directory(self, tmp_path, recursive):
         top_jpg = make_image(tmp_path / "a.jpg")

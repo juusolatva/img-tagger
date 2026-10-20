@@ -250,6 +250,7 @@ class TestProcessDirectory:
             self._run(images)
 
         assert exc.value.code == 1
+        assert "Error: Could not read prompt.txt" in capsys.readouterr().out
         assert fake_ollama.instances == []
         assert not img_tagger.is_already_processed(images / "a.jpg")
 

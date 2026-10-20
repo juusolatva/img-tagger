@@ -53,7 +53,10 @@ try:
 except ImportError:
     OpenAI = None
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("img_tagger")
+# Without --log, records stop here instead of reaching Python's last-resort stderr handler,
+# which would print bare warnings and tracebacks over the progress bar.
+logger.addHandler(logging.NullHandler())
 metadata_lock = threading.Lock()
 
 PROCESSED_MARKER = "[PROCESSED BY AI]"
@@ -77,8 +80,8 @@ def setup_logging(log_path: str | None) -> None:
     Configures the logging system to write to a specified file.
 
     Args:
-        log_path: The file path where logs should be written. If None,
-            logging remains at default settings (usually stdout).
+        log_path: The file path where logs should be written. If None, nothing
+            is logged; warnings still reach the console through _warn().
     """
 
     if log_path is None:
@@ -90,10 +93,21 @@ def setup_logging(log_path: str | None) -> None:
 
     logging.basicConfig(
         filename=str(path_obj),
-        level=logging.DEBUG,
-        format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
+        # INFO for other libraries keeps httpx's request lines but drops Pillow's per-chunk DEBUG noise
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(threadName)s %(name)s: %(message)s",
         filemode="a",
+        encoding="utf-8",
     )
+    logger.setLevel(logging.DEBUG)
+    logger.info(f"Logging started (Python {platform.python_version()} on {platform.system()})")
+
+
+def _warn(message: str) -> None:
+    """Logs a warning and shows it on the console too, so it is seen with or without --log."""
+
+    logger.warning(message)
+    tqdm.write(f"  Warning: {message}")
 
 
 def listen_for_quit(stop_event: threading.Event) -> None:
@@ -281,7 +295,10 @@ def write_metadata(image_path: str, tags_list: list[str]) -> None:
             except RuntimeError as e:
                 # Auto-healing fallback for corrupted EXIF data (IFD buffer errors)
                 if "IFD" in str(e).upper() or "corrupt" in str(e).lower():
-                    logger.warning(f"Corrupted metadata in {Path(image_path).name}, sanitizing via Pillow...")
+                    _warn(
+                        f"Corrupted metadata in {Path(image_path).name} ({e}); "
+                        "re-saving it with Pillow before tagging (JPEG/WebP are re-encoded)"
+                    )
 
                     # Re-save with Pillow (more forgiving) to temp_path to strip broken EXIF
                     _sanitize_with_pillow(image_path, temp_path)
@@ -426,7 +443,7 @@ def _clear_standard(image_path: Path, temp_path: Path) -> None:
         _sanitize_with_pillow(image_path, temp_path, format_map.get(ext, "JPEG"))
 
         robust_replace(temp_path, image_path)
-        logger.info(f"Sanitized and cleared (Pillow) for: {image_path.name}")
+        logger.warning(f"Corrupted metadata ({e}); sanitized and cleared (Pillow) for: {image_path.name}")
         print(f"  Sanitized and cleared (Pillow) for: {image_path.name}")
 
 
@@ -575,8 +592,7 @@ def get_tags_lm_studio(client: Any, model: str, img_path: Path, prompt: str) -> 
         ],
     )
     content = response.choices[0].message.content
-    # Removed logging of 'content' to prevent massive log files with base64 image data
-    logger.debug(f"Raw LM Studio response received for {img_path}")
+    logger.debug(f"Raw LM Studio response for {img_path}: {content}")
     return content
 
 
@@ -721,11 +737,11 @@ def _pyexiv2_has_marker(p: Path) -> bool:
     # Explicitly pass encoding='utf-8' to handle non-ASCII path characters like 'ö'
     with metadata_lock, pyexiv2.Image(str(p), encoding="utf-8") as img:
         # Read EXIF and XMP independently so one failing doesn't kill both
-        for read in (img.read_exif, img.read_xmp):
+        for kind, read in (("EXIF", img.read_exif), ("XMP", img.read_xmp)):
             try:
                 values.extend(read().values())
             except Exception as e:  # noqa: BLE001 - the other read may still find the marker
-                logger.debug(f"pyexiv2 {read.__name__} failed for {p.name}: {e}")
+                _warn(f"Could not read the {kind} metadata of {p.name} ({e})")
     return any(_contains_marker(v) for v in values)
 
 
@@ -760,20 +776,20 @@ def is_already_processed(img_path: Path) -> bool:
             if _pyexiv2_has_marker(p):
                 return True
         except Exception as e:  # noqa: BLE001 - unreadable metadata means "not processed"
-            logger.debug(f"pyexiv2 metadata read failed for {p.name} ({e}); trying Pillow fallback.")
+            _warn(f"pyexiv2 could not read the metadata of {p.name} ({e}); checking it with Pillow instead")
 
         # 2. Fully isolated fallback check using Pillow
         try:
             return _pillow_has_marker(p)
         except Exception as e:  # noqa: BLE001
-            logger.debug(f"Pillow fallback failed for {p.name}: {e}")
+            _warn(f"Could not read the metadata of {p.name} ({e}); treating it as not yet tagged")
 
     elif ext == "gif":
         try:
             with Image.open(p) as img:
                 return _contains_marker(img.info.get("comment"))
         except Exception as e:  # noqa: BLE001
-            logger.debug(f"Pillow failed to read GIF comments for {p.name}: {e}")
+            _warn(f"Could not read the GIF comment of {p.name} ({e}); treating it as not yet tagged")
 
     return False
 
@@ -812,6 +828,7 @@ def process_single_image(
         return "SKIPPED", img_path.name, "Skipped: Already Tagged", 0
 
     if stop_event.is_set():
+        logger.info(f"Cancelled before start: {img_path.name}")
         return "CANCELLED", img_path.name, "Cancelled by user", 0
 
     start = time.time()  # Start timing the actual processing
@@ -825,7 +842,9 @@ def process_single_image(
         parsed_tags = parse_model_output(raw_output)
 
         if not parsed_tags:
-            logger.warning(f"Failed to extract valid tags from model response for {img_path.name}")
+            logger.warning(
+                f"Failed to extract valid tags from model response for {img_path.name} after {time.time() - start:.1f}s"
+            )
             return (
                 "FAILED",
                 img_path.name,
@@ -834,7 +853,7 @@ def process_single_image(
             )
 
         tag_image(str(img_path), parsed_tags, fmt=fmt)
-        logger.info(f"Successfully tagged {img_path.name} with {parsed_tags}")
+        logger.info(f"Tagged {img_path.name} in {time.time() - start:.1f}s with {parsed_tags}")
         return (
             "SUCCESS",
             img_path.name,
@@ -843,7 +862,7 @@ def process_single_image(
         )
 
     except Exception as e:
-        logger.exception(f"Error processing {img_path.name}")
+        logger.exception(f"Error processing {img_path.name} after {time.time() - start:.1f}s")
         return "FAILED", img_path.name, str(e), time.time() - start
 
 
@@ -899,10 +918,13 @@ def _load_prompt() -> str:
         return DEFAULT_PROMPT
 
     try:
-        return prompt_file.read_text(encoding="utf-8").strip()
-    except Exception:
+        prompt = prompt_file.read_text(encoding="utf-8").strip()
+    except Exception as e:
         logger.exception("Failed to read prompt.txt")
+        print(f"Error: Could not read prompt.txt from {prompt_file}: {e}")
         sys.exit(1)
+    logger.info(f"Using prompt from {prompt_file}")
+    return prompt
 
 
 def _create_client(backend: str, host: str, timeout: float = DEFAULT_TIMEOUT) -> Any:
@@ -965,12 +987,14 @@ def _run_tasks(
         ):
             if stop_event.is_set() and not stopped_notified:
                 tqdm.write("  [!] Stop signal received (Q pressed). Finishing currently running tasks...")
+                logger.info("Stop requested (Q); finishing in-flight images, cancelling queued ones")
                 stopped_notified = True
 
             try:
                 stats.record(*future.result())
-            except Exception as e:  # noqa: BLE001 - one bad image must not abort the batch
+            except Exception as e:  # one bad image must not abort the batch
                 img_path = future_to_image[future]
+                logger.exception(f"Unexpected error for {img_path}")
                 tqdm.write(f"  [!] {img_path} -> Unexpected Error: {e}")
                 stats.failed += 1
 
@@ -1028,6 +1052,9 @@ def clear_directory(
         return
 
     print(f"Resetting tags for {len(image_files)} images...")
+    logger.info(
+        f"Clearing tags from {len(image_files)} images in {directory} (recursive={recursive}, workers={max_workers})"
+    )
     if max_workers > 1:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             list(executor.map(clear_tags, image_files))
@@ -1035,6 +1062,7 @@ def clear_directory(
         for img_path in image_files:
             clear_tags(img_path)
     print("Done.")
+    logger.info("Clearing finished")
 
 
 def process_directory(
@@ -1076,8 +1104,13 @@ def process_directory(
 
     print(f"Initialized backend: {backend} | Target: {host}")
     print(f"Found {len(image_files)} images to process. Starting...\n")
+    logger.info(
+        f"Tagging {len(image_files)} images in {directory} (recursive={recursive}) via {backend} at {host}: "
+        f"model={model}, workers={max_workers}, timeout={timeout:g}s"
+    )
 
     prompt = _load_prompt()
+    logger.debug(f"Prompt: {prompt}")
     client = _create_client(backend, host, timeout)
     if client is None:
         return
@@ -1100,7 +1133,11 @@ def process_directory(
         if quit_thread.is_alive():
             quit_thread.join(timeout=2)
 
-    _print_report(stats, time.time() - start_time)
+    total_seconds = time.time() - start_time
+    _print_report(stats, total_seconds)
+    logger.info(
+        f"Finished in {total_seconds:.1f}s: {stats.success} tagged, {stats.skipped} skipped, {stats.failed} failed"
+    )
 
 
 if __name__ == "__main__":
