@@ -33,6 +33,7 @@ class TestImgTaggerCli:
             "--host",
             "--model",
             "--workers",
+            "--timeout",
             "--log",
             "--clear",
         ]:
@@ -48,6 +49,12 @@ class TestImgTaggerCli:
         result = run("img_tagger.py", str(tmp_path), "--workers", workers)
         assert result.returncode == 1
         assert "Workers must be between 1 and 4" in result.stdout
+
+    @pytest.mark.parametrize("timeout", ["0", "-5", "nan"])
+    def test_rejects_non_positive_timeout(self, tmp_path, timeout):
+        result = run("img_tagger.py", str(tmp_path), "--timeout", timeout)
+        assert result.returncode == 1
+        assert "Timeout must be a positive number" in result.stdout
 
     def test_rejects_unknown_backend(self, tmp_path):
         result = run("img_tagger.py", str(tmp_path), "--backend", "bogus")

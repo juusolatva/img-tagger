@@ -58,6 +58,8 @@ metadata_lock = threading.Lock()
 
 PROCESSED_MARKER = "[PROCESSED BY AI]"
 DEFAULT_MIME_TYPE = "image/jpeg"
+# Seconds to wait for one model reply; covers model loading and slow (thinking/CPU) generation.
+DEFAULT_TIMEOUT = 600.0
 
 DEFAULT_PROMPT = (
     "Analyze this image, which could be an internet meme, screenshot, artwork, or photograph. "
@@ -903,9 +905,14 @@ def _load_prompt() -> str:
         sys.exit(1)
 
 
-def _create_client(backend: str, host: str) -> Any:
+def _create_client(backend: str, host: str, timeout: float = DEFAULT_TIMEOUT) -> Any:
     """
     Builds the model client for the chosen backend.
+
+    Args:
+        backend: The backend type ('ollama' or 'lm-studio').
+        host: The endpoint URL for the chosen backend.
+        timeout: Seconds to wait for a model reply before the request fails.
 
     Returns:
         The client, or None (after printing an error) if its library is not installed.
@@ -915,12 +922,13 @@ def _create_client(backend: str, host: str) -> Any:
         if OllamaClient is None:
             print("Error: 'ollama' library not found. Please install it using 'pip install ollama'.")
             return None
-        return OllamaClient(host=host)
+        return OllamaClient(host=host, timeout=timeout)
 
     if OpenAI is None:
         print("Error: 'openai' library not found. Please install it using 'pip install openai'.")
         return None
-    return OpenAI(base_url=f"{host}/v1", api_key="lm-studio")
+    # No retries: a timed-out request would be resent to a server still busy with it.
+    return OpenAI(base_url=f"{host}/v1", api_key="lm-studio", timeout=timeout, max_retries=0)
 
 
 def _run_tasks(
@@ -1037,6 +1045,7 @@ def process_directory(
     model: str = "qwen3-vl:8b",
     max_workers: int = 1,
     clear: bool = False,
+    timeout: float = DEFAULT_TIMEOUT,
 ) -> None:
     """
     Orchestrates the image tagging process (or clearing when clear=True) for a directory.
@@ -1053,6 +1062,7 @@ def process_directory(
         model: The specific model name/ID to use.
         max_workers: The maximum number of concurrent threads (limited to 4).
         clear: If True, clears metadata and comments instead of tagging.
+        timeout: Seconds to wait for each model reply before that image fails.
     """
 
     if clear:
@@ -1068,7 +1078,7 @@ def process_directory(
     print(f"Found {len(image_files)} images to process. Starting...\n")
 
     prompt = _load_prompt()
-    client = _create_client(backend, host)
+    client = _create_client(backend, host, timeout)
     if client is None:
         return
 
@@ -1120,6 +1130,12 @@ if __name__ == "__main__":
         default=1,
         help="number of concurrent workers (max 4, default 1)",
     )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        help=f"seconds to wait for each model reply before the image fails (default {DEFAULT_TIMEOUT:g})",
+    )
     parser.add_argument("--log", help="enable logging and create log file (e.g., --log logs/run.log)")
     parser.add_argument(
         "--clear",
@@ -1140,6 +1156,10 @@ if __name__ == "__main__":
         print(f"Error: Workers must be between 1 and 4, got {args.workers}")
         sys.exit(1)
 
+    if not args.timeout > 0:
+        print(f"Error: Timeout must be a positive number of seconds, got {args.timeout:g}")
+        sys.exit(1)
+
     if not args.host:
         args.host = "http://localhost:11434" if args.backend == "ollama" else "http://localhost:1234"
 
@@ -1151,4 +1171,5 @@ if __name__ == "__main__":
         args.model,
         args.workers,
         clear=args.clear,
+        timeout=args.timeout,
     )

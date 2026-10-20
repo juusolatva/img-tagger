@@ -46,6 +46,7 @@ Just give it the folder with your images:
 - *--host* - address of the model server if it's not running on the default local address
 - *--model* - the model to use (*qwen3-vl:8b* by default)
 - *--workers* - how many images to process at the same time, from 1 to 4 (1 by default)
+- *--timeout* - seconds to wait for the model's answer to one image before marking it failed (600 by default; raise it for slow hardware)
 - *--log* - save a log file for troubleshooting, e.g. *--log logs/run.log*
 - *--clear* - remove all metadata (EXIF/XMP/IPTC) and comments from images instead of tagging
 

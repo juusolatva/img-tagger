@@ -19,6 +19,7 @@ Ruff (lint + format) is configured in `pyproject.toml`; CI fails on any Ruff fin
 - Recursive, custom model/workers: `python3 img_tagger.py <directory> -r --model <model> --workers 4`
 - Clear all tags: `python3 img_tagger.py <directory> --clear [-r] [--workers N]`
 - Help: `python3 img_tagger.py -h`
+- Request timeout (seconds, default 600): `python3 img_tagger.py <directory> --timeout 1200`
 - Logging: `python3 img_tagger.py <dir> --log output.log` (without `--log`, diagnostic `DEBUG` messages never surface — see Known Limitations)
 - Note: On Linux environments, use `python3` if `python` is not aliased.
 
@@ -34,7 +35,7 @@ Ruff (lint + format) is configured in `pyproject.toml`; CI fails on any Ruff fin
 ## Backends
 - `--backend ollama` (default): `ollama` Python client, default host `http://localhost:11434`, default model `qwen3-vl:8b`.
 - `--backend lm-studio`: `openai` client against LM Studio's OpenAI-compatible API, default host `http://localhost:1234`, images sent as base64 data URLs. `api_key="lm-studio"` is a required placeholder string, not a real credential.
-- Neither client is constructed with a request timeout — a hung local model server can block a worker thread indefinitely.
+- **Request timeout**: `--timeout` (default `DEFAULT_TIMEOUT` = 600s, must be > 0) is passed to both clients by `_create_client()`. It must cover the whole non-streamed reply, including model loading. A timeout raises in the worker and marks that image `FAILED`. The LM Studio client uses `max_retries=0`: the openai default (2) would resend a timed-out request to a server still busy with it.
 
 ## Core Rules & Architecture
 - **Worker limit**: Max 4 concurrent workers (matches both backends' default concurrency limits). Default is 1. Enforced in CLI arg parsing (`1 <= workers <= 4`), not inside `process_directory()` itself.
@@ -48,7 +49,7 @@ Ruff (lint + format) is configured in `pyproject.toml`; CI fails on any Ruff fin
   4. Intro text: `tags`/`keywords` within the first ~40 chars, followed by a colon later on the same line (`Here are the tags for this image:`) or a dash right after (`Keywords -`). Parsed via `parse_text_tags()`, which drops common English stop words but keeps short tags like `3d`/`ui`.
   5. Comma- and/or newline-separated list fallback.
 - **Concurrency & Locks**: Images are processed in parallel via `ThreadPoolExecutor`. `pyexiv2` is not thread-safe: all `pyexiv2` reads (`is_already_processed()`), writes (`write_metadata()`) and clears (`_clear_standard()`) are serialized through `metadata_lock = threading.Lock()`. Model API calls and Pillow operations (GIF read/write, format verification) are intentionally outside the lock to preserve concurrency.
-- **Graceful quit**: Press `Q` during execution to trigger graceful shutdown. Monitored by a daemon thread (`listen_for_quit()`) using `msvcrt` on Windows or `termios`/`tty`/`select` on POSIX (with EOF detection for detached terminals). The POSIX loop reads the raw fd with `os.read()`, not `sys.stdin.read()`, so Python's buffer can't hide pending keys from `select()`. In-flight requests finish, but queued/unstarted tasks are marked `CANCELLED`.
+- **Graceful quit**: Press `Q` during execution to trigger graceful shutdown. Monitored by a daemon thread (`listen_for_quit()`) using `msvcrt` on Windows or `termios`/`tty`/`select` on POSIX (with EOF detection for detached terminals). The POSIX loop reads the raw fd with `os.read()`, not `sys.stdin.read()`, so Python's buffer can't hide pending keys from `select()`. In-flight requests finish (or hit `--timeout`), but queued/unstarted tasks are marked `CANCELLED`.
 
 ## Metadata Schema
 - **JPEG / WebP / PNG**:
@@ -87,7 +88,6 @@ If `pyexiv2` raises a `RuntimeError` containing `"IFD"` or `"corrupt"`:
 - **Tests**: `python3 -m pytest` covers parsing, metadata round-trips for every format, GIF frame/duration preservation, auto-healing (simulated), temp-file cleanup, fake-backend pipeline, quit listener and CLI. CI runs them on Python 3.10–3.14 (Linux only). Tagging *quality* still needs a manual run with `--run-integration` against real images.
 - **Known bugs**: none currently pinned. When adding one, pin it as a strict `xfail` (fixing it makes it XPASS → remove the marker).
 - **Silent logging by default**: Without `--log`, `DEBUG` logs (including pyexiv2 read failures and fallback activations) do not display. Failures may look like silent no-ops.
-- **No request timeouts**: Ollama and LM Studio HTTP clients lack request timeouts; hung local model servers can block worker threads indefinitely.
 - **Untested dependency minimums (future work)**: CI tests Python 3.10–3.14, but only against the versions in `requirements-dev.lock`. The `>=` lower bounds in `requirements.txt` were never tested as minimums. Known and accepted for now.
 - **Linux-only CI**: nothing runs on Windows or macOS. The `msvcrt` quit listener is untested, and the POSIX quit-listener tests are skipped on Windows.
 - **SonarQube false positives** (dismissed in Sonar; don't "fix" them in code): path traversal on `--log` in `setup_logging()` (operator-chosen path, tool is for interactive use); "always false" `OpenAI is None` in `_create_client()` (optional-import fallback, covered by `test_missing_openai_library`); regex-backtracking warnings on `parse_model_output()` patterns (measured linear on 200k-char adversarial inputs).

@@ -178,8 +178,9 @@ class FakeOllamaClient:
     instances: ClassVar[list["FakeOllamaClient"]] = []
     reply: str = ", ".join(SAMPLE_TAGS)
 
-    def __init__(self, host: str | None = None):
+    def __init__(self, host: str | None = None, timeout: float | None = None):
         self.host = host
+        self.timeout = timeout
         self.calls: list[dict] = []
         FakeOllamaClient.instances.append(self)
 
@@ -194,9 +195,17 @@ class FakeOpenAIClient:
     instances: ClassVar[list["FakeOpenAIClient"]] = []
     reply: str = ", ".join(SAMPLE_TAGS)
 
-    def __init__(self, base_url: str | None = None, api_key: str | None = None):
+    def __init__(
+        self,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        timeout: float | None = None,
+        max_retries: int = 2,
+    ):
         self.base_url = base_url
         self.api_key = api_key
+        self.timeout = timeout
+        self.max_retries = max_retries
         self.calls: list[dict] = []
         self.chat = _Obj(completions=_Obj(create=self._create))
         FakeOpenAIClient.instances.append(self)

@@ -123,8 +123,8 @@ class TestProcessDirectory:
         sub.mkdir()
         make_image(sub / "nested.jpg")
 
-    def _run(self, root, recursive=False, backend="ollama", workers=1):
-        img_tagger.process_directory(str(root), recursive, backend, "http://fake:1", "test-model", workers)
+    def _run(self, root, recursive=False, backend="ollama", workers=1, **kwargs):
+        img_tagger.process_directory(str(root), recursive, backend, "http://fake:1", "test-model", workers, **kwargs)
 
     def test_tags_top_level_images_only_when_not_recursive(self, tmp_path, fake_ollama, capsys):
         self._populate(tmp_path)
@@ -183,6 +183,7 @@ class TestProcessDirectory:
 
         client = fake_ollama.instances[0]
         assert client.host == "http://fake:1"
+        assert client.timeout == img_tagger.DEFAULT_TIMEOUT
         assert client.calls[0]["model"] == "test-model"
 
     def test_lm_studio_client_configuration(self, tmp_path, fake_openai, capsys):
@@ -192,7 +193,17 @@ class TestProcessDirectory:
         client = fake_openai.instances[0]
         assert client.base_url == "http://fake:1/v1"
         assert client.api_key == "lm-studio"
+        assert client.timeout == img_tagger.DEFAULT_TIMEOUT
+        assert client.max_retries == 0
         assert "Processed images: 1" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("backend", ["ollama", "lm-studio"])
+    def test_custom_timeout_reaches_client(self, tmp_path, fake_ollama, fake_openai, backend):
+        make_image(tmp_path / "a.jpg")
+        self._run(tmp_path, backend=backend, timeout=42)
+
+        fake = fake_ollama if backend == "ollama" else fake_openai
+        assert fake.instances[0].timeout == 42
 
     def test_uses_prompt_txt(self, tmp_path, fake_ollama, capsys):
         make_image(tmp_path / "a.jpg")
