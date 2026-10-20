@@ -94,10 +94,13 @@ class TestImgTaggerCli:
         text = log.read_text(encoding="utf-8")
         assert "Tagging 1 images" in text
         assert "workers=1, timeout=30s" in text
-        assert "[DEBUG]" in text and "Prompt: " in text
-        assert "[ERROR]" in text and "Error processing a.png after" in text
+        assert "[DEBUG]" in text
+        assert "Prompt: " in text
+        assert "[ERROR]" in text
+        assert "Error processing a.png after" in text
         assert "Traceback" in text
-        assert "Finished in" in text and "0 tagged, 0 skipped, 1 failed" in text
+        assert "Finished in" in text
+        assert "0 tagged, 0 skipped, 1 failed" in text
         assert "STREAM" not in text, "Pillow's DEBUG chatter should stay out of the log"
 
     @pytest.mark.parametrize("recursive", [False, True])

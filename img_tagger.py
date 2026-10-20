@@ -14,6 +14,7 @@ import base64
 import contextlib
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -1193,7 +1194,7 @@ if __name__ == "__main__":
         print(f"Error: Workers must be between 1 and 4, got {args.workers}")
         sys.exit(1)
 
-    if not args.timeout > 0:
+    if math.isnan(args.timeout) or args.timeout <= 0:
         print(f"Error: Timeout must be a positive number of seconds, got {args.timeout:g}")
         sys.exit(1)
 
