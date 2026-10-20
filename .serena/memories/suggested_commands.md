@@ -4,7 +4,7 @@
 - Lint/format: `ruff check .`, `ruff format .` (CI: `ruff format --check`)
 - Tag (Ollama default): `python3 img_tagger.py <dir>`
 - Tag via LM Studio: `python3 img_tagger.py <dir> --backend lm-studio`
-- Options: `-r` recursive, `--model <m>`, `--workers 1..4`, `--host <url>`, `--log <file>` (only way to see DEBUG/INFO diagnostics).
+- Options: `-r` recursive, `--model <m>`, `--workers 1..4`, `--host <url>`, `--timeout <s>` (default 600, must be > 0), `--log <file>` (only way to see DEBUG/INFO diagnostics; `_warn()` warnings show on the console regardless).
 - Reset tags for re-testing: `python3 img_tagger.py <dir> --clear [-r] [--workers N]` (no model server needed)
 - Help: `python3 img_tagger.py -h`
 - Inspect written metadata: `exiftool -UserComment -XMP:Subject -XMP:Description <img>` / `exiftool -Comment <gif>` (if exiftool installed).

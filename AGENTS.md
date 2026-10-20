@@ -35,7 +35,7 @@ Ruff (lint + format) is configured in `pyproject.toml`; CI fails on any Ruff fin
 ## Backends
 - `--backend ollama` (default): `ollama` Python client, default host `http://localhost:11434`, default model `qwen3-vl:8b`.
 - `--backend lm-studio`: `openai` client against LM Studio's OpenAI-compatible API, default host `http://localhost:1234`, images sent as base64 data URLs. `api_key="lm-studio"` is a required placeholder string, not a real credential.
-- **Request timeout**: `--timeout` (default `DEFAULT_TIMEOUT` = 600s, must be > 0) is passed to both clients by `_create_client()`. It must cover the whole non-streamed reply, including model loading. A timeout raises in the worker and marks that image `FAILED`. The LM Studio client uses `max_retries=0`: the openai default (2) would resend a timed-out request to a server still busy with it.
+- **Request timeout**: `--timeout` (default `DEFAULT_TIMEOUT` = 600s, must be > 0; `nan` is rejected explicitly with `math.isnan()` because `nan <= 0` is false) is passed to both clients by `_create_client()`. It must cover the whole non-streamed reply, including model loading. A timeout raises in the worker and marks that image `FAILED`. The LM Studio client uses `max_retries=0`: the openai default (2) would resend a timed-out request to a server still busy with it.
 
 ## Core Rules & Architecture
 - **Worker limit**: Max 4 concurrent workers (matches both backends' default concurrency limits). Default is 1. Enforced in CLI arg parsing (`1 <= workers <= 4`), not inside `process_directory()` itself.
