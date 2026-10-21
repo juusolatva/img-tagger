@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Python packages are left out: Dependabot can't regenerate requirements-dev.lock
+  # (needs uv's --universal --python-version 3.10), so bump them by hand (see AGENTS.md).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci

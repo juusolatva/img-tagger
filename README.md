@@ -605,7 +605,7 @@ Every push to `main` and every pull request runs [GitHub Actions](.github/workfl
 
 - **Ruff** lint and format checks, using the Ruff version pinned in `requirements-dev.txt`
 - the offline **tests** with coverage on Python 3.10 to 3.14 (on Linux)
-- a **SonarQube Cloud** scan, which uses the coverage report from the Python 3.14 job (needs the `SONAR_TOKEN` repository secret)
+- a **SonarQube Cloud** scan, which uses the coverage report from the Python 3.14 job (needs the `SONAR_TOKEN` repository secret, so it's skipped for pull requests from forks and Dependabot)
 
 To run the same checks locally, use `ruff check .`, `ruff format --check .` and `python -m pytest --cov`.
 
@@ -614,6 +614,10 @@ CI installs the exact package versions in `requirements-dev.lock` (with `--requi
 ```bash
 uv pip compile requirements-dev.txt --universal --python-version 3.10 --generate-hashes --no-header -o requirements-dev.lock
 ```
+
+This keeps the versions already in the lock where they still fit. To update the locked versions, add `--upgrade` (or `-P <package>` for a single package).
+
+[Dependabot](.github/dependabot.yml) opens a weekly pull request when the GitHub Actions used in CI have new versions. It doesn't update the Python packages, because it can't regenerate this lock.
 
 The minimum versions in `requirements.txt` have not been tested as minimums; CI only tests the locked versions.
 
