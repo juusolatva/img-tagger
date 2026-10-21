@@ -67,13 +67,11 @@ def backend_settings(pytestconfig: pytest.Config) -> dict:
 
 @pytest.fixture(scope="session")
 def client(backend_settings: dict):
-    if backend_settings["backend"] == "ollama":
-        if img_tagger.OllamaClient is None:
-            pytest.skip("ollama library not installed")
-        return img_tagger.OllamaClient(host=backend_settings["host"])
-    if img_tagger.OpenAI is None:
-        pytest.skip("openai library not installed")
-    return img_tagger.OpenAI(base_url=f"{backend_settings['host']}/v1", api_key="lm-studio")
+    # Same client as a real run: DEFAULT_TIMEOUT and, for LM Studio, no retries
+    client = img_tagger._create_client(backend_settings["backend"], backend_settings["host"])
+    if client is None:
+        pytest.skip(f"client library for {backend_settings['backend']} not installed")
+    return client
 
 
 @pytest.fixture(scope="session")

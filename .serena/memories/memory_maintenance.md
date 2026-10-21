@@ -30,4 +30,4 @@ Do not add: quick-read facts; generic language/framework knowledge; one-off task
 ## Maintenance Actions
 
 - Renaming memories: References are updated automatically if handled via Serena's memory rename tool.
-- Checking for stale memories (e.g. after deletion): Call `serena memories check` for a report.
+- Checking for stale memories (e.g. after deletion): Call `serena memories check` for a report (read-only; on Windows with piped stdout prefix `PYTHONIOENCODING=utf-8`, else it crashes printing '✓').

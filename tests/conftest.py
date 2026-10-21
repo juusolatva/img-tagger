@@ -79,19 +79,20 @@ GIF_DURATIONS = [50, 120, 200]
 def make_gif(
     path: Path,
     durations: list[int] | None = None,
-    loop: int = 0,
+    loop: int | None = 0,
     comment: str | None = None,
 ) -> Path:
-    """Create an animated GIF whose frames all differ (so Pillow cannot merge them)."""
+    """Create an animated GIF whose frames all differ (so Pillow cannot merge them); loop=None plays once."""
     durations = durations or GIF_DURATIONS
     frames = [Image.new("RGB", (8, 8), GIF_COLORS[i % len(GIF_COLORS)]).convert("P") for i in range(len(durations))]
     kwargs = {"comment": comment} if comment is not None else {}
+    if loop is not None:
+        kwargs["loop"] = loop
     frames[0].save(
         path,
         save_all=True,
         append_images=frames[1:],
         duration=durations,
-        loop=loop,
         **kwargs,
     )
     return path

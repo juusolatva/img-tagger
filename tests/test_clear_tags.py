@@ -1,5 +1,7 @@
 """Tests for img_tagger.clear_tags() (--clear): tags written by img_tagger must be removable again."""
 
+import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -51,6 +53,46 @@ def test_clears_gif_comment_and_preserves_animation(tmp_path):
     assert leftover_temp_files(tmp_path) == []
 
 
+def test_play_once_gif_stays_play_once(tmp_path):
+    path = tag(make_gif(tmp_path / "once.gif", loop=None))
+    img_tagger.clear_tags(path)
+    assert gif_info(path)["loop"] is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_gif_keeps_file_permissions(tmp_path):
+    path = tag(make_gif(tmp_path / "a.gif"))
+    path.chmod(0o644)
+    img_tagger.clear_tags(path)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+
+@pytest.mark.parametrize("ext", ["jpg", "png", "webp"])
+def test_non_ascii_directory(tmp_path, ext):
+    folder = tmp_path / "kesä_日本"
+    folder.mkdir()
+    path = tag(make_image(folder / f"a.{ext}"))
+
+    img_tagger.clear_tags(path)
+
+    assert not img_tagger.is_already_processed(path)
+    assert leftover_temp_files(folder) == []
+
+
+@pytest.mark.parametrize("fmt", ["PNG", "JPEG"])
+def test_uses_detected_format_over_extension(tmp_path, fmt):
+    # Cleared the way it was tagged (pyexiv2), not re-saved as a real GIF
+    path = tmp_path / "in_disguise.gif"
+    Image.new("RGB", (4, 4)).save(path, format=fmt)
+    tag(path)
+
+    img_tagger.clear_tags(path)
+
+    assert not img_tagger.is_already_processed(path)
+    with Image.open(path) as img:
+        assert img.format == fmt
+
+
 def test_clear_preserves_pixels(tmp_path):
     path = tag(make_image(tmp_path / "a.png"))
     with Image.open(path) as img:
@@ -92,7 +134,7 @@ def test_auto_heals_corrupt_metadata_via_pillow(tmp_path, monkeypatch, capsys, e
     def corrupt(*args, **kwargs):
         raise RuntimeError(error)
 
-    monkeypatch.setattr(img_tagger.pyexiv2, "Image", corrupt)
+    monkeypatch.setattr(img_tagger.pyexiv2, "ImageData", corrupt)
     img_tagger.clear_tags(path)
 
     assert "Sanitized and cleared (Pillow)" in capsys.readouterr().out
@@ -120,7 +162,7 @@ def test_auto_heal_keeps_animation(tmp_path, monkeypatch, capsys, ext):
     def corrupt(*args, **kwargs):
         raise RuntimeError("Image data is corrupt")
 
-    monkeypatch.setattr(img_tagger.pyexiv2, "Image", corrupt)
+    monkeypatch.setattr(img_tagger.pyexiv2, "ImageData", corrupt)
     img_tagger.clear_tags(path)
 
     assert "Sanitized and cleared (Pillow)" in capsys.readouterr().out
@@ -139,7 +181,7 @@ def test_unrelated_pyexiv2_error_leaves_file_untouched(tmp_path, monkeypatch, ca
     def broken(*args, **kwargs):
         raise RuntimeError("something else")
 
-    monkeypatch.setattr(img_tagger.pyexiv2, "Image", broken)
+    monkeypatch.setattr(img_tagger.pyexiv2, "ImageData", broken)
     img_tagger.clear_tags(path)
 
     assert "Failed to clear a.png" in capsys.readouterr().out

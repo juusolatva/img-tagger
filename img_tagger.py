@@ -12,6 +12,7 @@ images via the --clear option. Run it as a script; see -h for the options.
 import argparse
 import base64
 import contextlib
+import io
 import json
 import logging
 import math
@@ -24,7 +25,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,6 +63,9 @@ metadata_lock = threading.Lock()
 
 PROCESSED_MARKER = "[PROCESSED BY AI]"
 DEFAULT_MIME_TYPE = "image/jpeg"
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+# Pillow formats tag_image() can write (GIFs get a comment, the rest EXIF/XMP via pyexiv2)
+TAGGABLE_FORMATS = {"JPEG", "WEBP", "PNG", "GIF"}
 # Seconds to wait for one model reply; covers model loading and slow (thinking/CPU) generation.
 DEFAULT_TIMEOUT = 600.0
 
@@ -217,6 +221,15 @@ def get_image_format(img_path: Path) -> str | None:
         return None
 
 
+def _is_gif(img_path: Path, fmt: str | None) -> bool:
+    """
+    Tells whether a file is a GIF by its content (fmt from get_image_format()),
+    falling back to the extension when Pillow couldn't read it (fmt is None).
+    """
+
+    return fmt == "GIF" if fmt else img_path.suffix.lower() == ".gif"
+
+
 def robust_replace(src: Path, dst: Path) -> None:
     """Atomically replace dst with src, retrying on transient OSErrors like lingering file locks on Windows)."""
     for _ in range(10):
@@ -260,6 +273,24 @@ def _sanitize_with_pillow(src, dst, fmt=None) -> None:
         )
 
 
+def _modify_with_pyexiv2(path: Path, edit: Callable[[Any], None]) -> None:
+    """
+    Applies edit() to a file's metadata with pyexiv2 and saves the result in place.
+
+    pyexiv2 gets the file's bytes rather than its path: on Windows it can't open paths
+    with non-ASCII characters, in the file name or in any folder above it.
+
+    Args:
+        path: The file to modify (a temp copy in the image's directory).
+        edit: Called with the open pyexiv2.ImageData to modify its metadata.
+    """
+
+    with pyexiv2.ImageData(path.read_bytes()) as img:
+        edit(img)
+        data = img.get_bytes()
+    path.write_bytes(data)
+
+
 def write_metadata(image_path: str, tags_list: list[str]) -> None:
     """
     Writes tags to image metadata (JPEG, WebP, PNG) using pyexiv2.
@@ -276,22 +307,25 @@ def write_metadata(image_path: str, tags_list: list[str]) -> None:
     marker = PROCESSED_MARKER
     tags_str = ", ".join(tags_list)
 
-    fd, temp_path = tempfile.mkstemp(dir=Path(image_path).parent, suffix=".tmp")
+    def write_tags(img: Any) -> None:
+        img.modify_exif({"Exif.Photo.UserComment": f"{tags_str} {marker}"})
+        img.modify_xmp(
+            {
+                "Xmp.dc.subject": tags_list,
+                "Xmp.dc.description": f"Tags: {tags_str} | {marker}",
+            }
+        )
+
+    fd, temp_path_str = tempfile.mkstemp(dir=Path(image_path).parent, suffix=".tmp")
     os.close(fd)
+    temp_path = Path(temp_path_str)
 
     try:
         shutil.copy2(image_path, temp_path)
         with metadata_lock:
             try:
                 # Primary attempt using pyexiv2 (separated into EXIF and XMP)
-                with pyexiv2.Image(temp_path, encoding="utf-8") as img:
-                    img.modify_exif({"Exif.Photo.UserComment": f"{tags_str} {marker}"})
-                    img.modify_xmp(
-                        {
-                            "Xmp.dc.subject": tags_list,
-                            "Xmp.dc.description": f"Tags: {tags_str} | {marker}",
-                        }
-                    )
+                _modify_with_pyexiv2(temp_path, write_tags)
 
             except RuntimeError as e:
                 # Auto-healing fallback for corrupted EXIF data (IFD buffer errors)
@@ -305,27 +339,36 @@ def write_metadata(image_path: str, tags_list: list[str]) -> None:
                     _sanitize_with_pillow(image_path, temp_path)
 
                     # Retry pyexiv2 on the newly cleaned temporary file
-                    with pyexiv2.Image(temp_path, encoding="utf-8") as img:
-                        img.modify_exif({"Exif.Photo.UserComment": f"{tags_str} {marker}"})
-                        img.modify_xmp(
-                            {
-                                "Xmp.dc.subject": tags_list,
-                                "Xmp.dc.description": f"Tags: {tags_str} | {marker}",
-                            }
-                        )
+                    _modify_with_pyexiv2(temp_path, write_tags)
 
                 else:
                     raise  # Re-raise if it's a different pyexiv2 error
 
-            robust_replace(Path(temp_path), Path(image_path))
+            robust_replace(temp_path, Path(image_path))
 
     finally:
-        Path(temp_path).unlink(missing_ok=True)
+        temp_path.unlink(missing_ok=True)
+
+
+def _gif_loop_kwargs(img: Image.Image) -> dict[str, int]:
+    """
+    Returns the save() loop argument that keeps a GIF's loop count.
+
+    A GIF without a loop count plays once; saving it with loop=0 would make it loop forever.
+
+    Args:
+        img: The open source GIF.
+
+    Returns:
+        {"loop": count} if the GIF has a loop count, otherwise {}.
+    """
+
+    return {"loop": img.info["loop"]} if "loop" in img.info else {}
 
 
 def write_gif_tags(image_path: str, tags_list: list[str]) -> None:
     """
-    Writes tags to GIF images using comments, handling large GIFs memory-efficiently.
+    Writes tags to GIF images using comments, keeping frames, durations and loop count.
 
     Args:
         image_path: The path to the GIF file.
@@ -336,13 +379,13 @@ def write_gif_tags(image_path: str, tags_list: list[str]) -> None:
     tags_str = ", ".join(tags_list)
 
     with Image.open(image_path) as img:
-        loop = img.info.get("loop", 0)
+        loop = _gif_loop_kwargs(img)
         # Capture per-frame duration to preserve variable frame rates
         durations = [f.info.get("duration", 100) for f in ImageSequence.Iterator(img)]
 
     def frame_generator():
-        # This generator streams frame copies one-by-one into the file writer.
-        # It handles files larger than 64MB flawlessly with O(1) memory overhead.
+        # Hands Pillow one frame copy at a time (its GIF writer still collects
+        # every frame before writing, so memory grows with the frame count).
         with Image.open(image_path) as img:
             for i, frame in enumerate(ImageSequence.Iterator(img)):
                 if i == 0:
@@ -365,9 +408,11 @@ def write_gif_tags(image_path: str, tags_list: list[str]) -> None:
             save_all=True,
             append_images=frame_generator(),
             duration=durations,
-            loop=loop,
             comment=f"{tags_str} {marker}",
+            **loop,
         )
+        # mkstemp files are owner-only (0600 on POSIX); keep the original's permissions
+        shutil.copymode(image_path, temp_path)
 
         robust_replace(Path(temp_path), Path(image_path))
 
@@ -406,7 +451,18 @@ def tag_image(image_path: str, tags_list: list[str], fmt: str | None = None) -> 
         raise RuntimeError(f"Tagging failed for {image_path}: {e}") from e
 
 
-def _clear_standard(image_path: Path, temp_path: Path) -> None:
+def _clear_all(img: Any) -> None:
+    """Wipes EXIF, XMP and IPTC from an open pyexiv2 image."""
+
+    img.clear_exif()
+    img.clear_xmp()
+    # On WebP, clear_xmp() alone leaves the XMP chunk in the saved file;
+    # also emptying the raw packet removes it (harmless for JPEG/PNG).
+    img.modify_raw_xmp("")
+    img.clear_iptc()
+
+
+def _clear_standard(image_path: Path, temp_path: Path, fmt: str | None = None) -> None:
     """
     Wipes EXIF, XMP and IPTC from a JPEG/WebP/PNG via pyexiv2, falling back to
     a Pillow re-save when pyexiv2 reports corrupt metadata.
@@ -414,6 +470,7 @@ def _clear_standard(image_path: Path, temp_path: Path) -> None:
     Args:
         image_path: The path to the image file.
         temp_path: Temp file in the image's directory to build the result in.
+        fmt: Pillow format for the fallback re-save; defaults to the image's own format.
 
     Raises:
         RuntimeError: If pyexiv2 fails for a reason other than corrupt metadata.
@@ -422,13 +479,8 @@ def _clear_standard(image_path: Path, temp_path: Path) -> None:
     shutil.copy2(image_path, temp_path)
     try:
         # Primary attempt using pyexiv2 to wipe EVERYTHING
-        with metadata_lock, pyexiv2.Image(str(temp_path), encoding="utf-8") as img:
-            img.clear_exif()
-            img.clear_xmp()
-            # On WebP, clear_xmp() alone leaves the XMP chunk in the saved file;
-            # also emptying the raw packet removes it (harmless for JPEG/PNG).
-            img.modify_raw_xmp("")
-            img.clear_iptc()
+        with metadata_lock:
+            _modify_with_pyexiv2(temp_path, _clear_all)
 
         robust_replace(temp_path, image_path)
         logger.info(f"Cleared metadata (pyexiv2) for: {image_path.name}")
@@ -439,9 +491,7 @@ def _clear_standard(image_path: Path, temp_path: Path) -> None:
             raise
 
         # Sanitize with Pillow to strip broken headers.
-        ext = image_path.suffix.lower().lstrip(".")
-        format_map = {"jpg": "JPEG", "jpeg": "JPEG", "png": "PNG", "webp": "WEBP"}
-        _sanitize_with_pillow(image_path, temp_path, format_map.get(ext, "JPEG"))
+        _sanitize_with_pillow(image_path, temp_path, fmt)
 
         robust_replace(temp_path, image_path)
         logger.warning(f"Corrupted metadata ({e}); sanitized and cleared (Pillow) for: {image_path.name}")
@@ -450,7 +500,7 @@ def _clear_standard(image_path: Path, temp_path: Path) -> None:
 
 def _clear_gif(image_path: Path, temp_path: Path) -> None:
     """
-    Re-saves a GIF with an empty comment, streaming frames to keep memory flat.
+    Re-saves a GIF with an empty comment, keeping frames, durations and loop count.
 
     Args:
         image_path: The path to the GIF file.
@@ -458,7 +508,7 @@ def _clear_gif(image_path: Path, temp_path: Path) -> None:
     """
 
     with Image.open(image_path) as img:
-        loop = img.info.get("loop", 0)
+        loop = _gif_loop_kwargs(img)
         # Capture per-frame duration to preserve variable frame rates
         durations = [f.info.get("duration", 100) for f in ImageSequence.Iterator(img)]
 
@@ -466,8 +516,8 @@ def _clear_gif(image_path: Path, temp_path: Path) -> None:
         img.seek(0)
         first_frame = img.copy()
 
-        # This generator streams frame copies one-by-one into the file writer.
-        # It handles files larger than 64MB flawlessly with O(1) memory overhead.
+        # Hands Pillow one frame copy at a time (its GIF writer still collects
+        # every frame before writing, so memory grows with the frame count).
         def frame_generator():
             for i, frame in enumerate(ImageSequence.Iterator(img)):
                 if i == 0:
@@ -480,14 +530,16 @@ def _clear_gif(image_path: Path, temp_path: Path) -> None:
             save_all=True,
             append_images=frame_generator(),
             duration=durations,
-            loop=loop,
             comment="",
+            **loop,
         )
         first_frame.close()
+    # mkstemp files are owner-only (0600 on POSIX); keep the original's permissions
+    shutil.copymode(image_path, temp_path)
 
     robust_replace(temp_path, image_path)
-    logger.info(f"Cleared GIF comment (memory-efficient stream): {image_path.name}")
-    print(f"  Cleared GIF comment (memory-efficient stream): {image_path.name}")
+    logger.info(f"Cleared GIF comment: {image_path.name}")
+    print(f"  Cleared GIF comment: {image_path.name}")
 
 
 def clear_tags(image_path: Path | str) -> None:
@@ -502,20 +554,21 @@ def clear_tags(image_path: Path | str) -> None:
     """
 
     p = Path(image_path)
-    ext = p.suffix.lower().lstrip(".")
-    if ext in ["jpg", "jpeg", "webp", "png"]:
-        clear_fn = _clear_standard
-    elif ext == "gif":
-        clear_fn = _clear_gif
-    else:
+    if p.suffix.lower() not in IMAGE_EXTENSIONS:
         return
+    fmt = get_image_format(p)
 
     try:
         fd, temp_path_str = tempfile.mkstemp(dir=p.parent, suffix=".tmp")
         os.close(fd)
         temp_path = Path(temp_path_str)
         try:
-            clear_fn(p, temp_path)
+            # Route on the real format like tag_image() does, so a mislabeled file is cleared
+            # the way it was tagged; the extension only decides for files Pillow can't read.
+            if _is_gif(p, fmt):
+                _clear_gif(p, temp_path)
+            else:
+                _clear_standard(p, temp_path, fmt)
         finally:
             temp_path.unlink(missing_ok=True)
     except Exception as e:
@@ -759,40 +812,44 @@ def _pillow_has_marker(p: Path) -> bool:
         return any(isinstance(v, str) and PROCESSED_MARKER in v for v in img.info.values())
 
 
-def is_already_processed(img_path: Path) -> bool:
+def is_already_processed(img_path: Path, fmt: str | None = None) -> bool:
     """Checks if the image already contains the AI processed marker.
+
+    Like tag_image(), it goes by the real format, not the extension: a PNG named
+    .gif is tagged via pyexiv2, so its marker is in EXIF/XMP, not a GIF comment.
 
     Args:
         img_path: The path to the image file to check.
+        fmt: The format from get_image_format(); looked up if None.
 
     Returns:
         True if the marker is found in metadata or comments, False otherwise.
     """
 
     p = Path(img_path)
-    ext = p.suffix.lower().lstrip(".")
+    if p.suffix.lower() not in IMAGE_EXTENSIONS:
+        return False
 
-    if ext in ["jpg", "jpeg", "webp", "png"]:
-        # 1. Primary metadata inspection using pyexiv2
-        try:
-            if _pyexiv2_has_marker(p):
-                return True
-        except Exception as e:  # noqa: BLE001 - unreadable metadata means "not processed"
-            _warn(f"pyexiv2 could not read the metadata of {p.name} ({e}); checking it with Pillow instead")
-
-        # 2. Fully isolated fallback check using Pillow
-        try:
-            return _pillow_has_marker(p)
-        except Exception as e:  # noqa: BLE001
-            _warn(f"Could not read the metadata of {p.name} ({e}); treating it as not yet tagged")
-
-    elif ext == "gif":
+    if _is_gif(p, fmt or get_image_format(p)):
         try:
             with Image.open(p) as img:
                 return _contains_marker(img.info.get("comment"))
         except Exception as e:  # noqa: BLE001
             _warn(f"Could not read the GIF comment of {p.name} ({e}); treating it as not yet tagged")
+        return False
 
+    # 1. Primary metadata inspection using pyexiv2
+    try:
+        if _pyexiv2_has_marker(p):
+            return True
+    except Exception as e:  # noqa: BLE001 - unreadable metadata means "not processed"
+        _warn(f"pyexiv2 could not read the metadata of {p.name} ({e}); checking it with Pillow instead")
+
+    # 2. Fully isolated fallback check using Pillow
+    try:
+        return _pillow_has_marker(p)
+    except Exception as e:  # noqa: BLE001
+        _warn(f"Could not read the metadata of {p.name} ({e}); treating it as not yet tagged")
     return False
 
 
@@ -823,9 +880,13 @@ def process_single_image(
     if fmt is None:
         logger.warning(f"Skipping invalid/unsupported file: {img_path.name}")
         return "FAILED", img_path.name, "Skipping unsupported or corrupted file", 0
+    if fmt not in TAGGABLE_FORMATS:
+        # e.g. a BMP named .jpg or an MPO (multi-picture) JPEG: fail before asking the model
+        logger.warning(f"Skipping {img_path.name}: unsupported format {fmt}")
+        return "FAILED", img_path.name, f"Unsupported file format: {fmt}", 0
 
     # Skip check
-    if is_already_processed(img_path):
+    if is_already_processed(img_path, fmt):
         logger.info(f"Skipping already processed image: {img_path.name}")
         return "SKIPPED", img_path.name, "Skipped: Already Tagged", 0
 
@@ -903,8 +964,7 @@ def _find_images(directory: str, recursive: bool) -> list[Path]:
     base_path = Path(directory)
     files = base_path.rglob("*") if recursive else base_path.iterdir()
     # We keep a broad filter for performance, but the final check is done in process_single_image via get_image_format
-    valid_extensions = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-    return [f for f in files if f.is_file() and f.suffix.lower() in valid_extensions]
+    return [f for f in files if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS]
 
 
 def _load_prompt() -> str:
@@ -1132,8 +1192,10 @@ def process_directory(
         print(f"An unexpected error occurred during processing: {e}")
         raise
     finally:
-        if quit_thread.is_alive():
-            quit_thread.join(timeout=2)
+        # Also stops the quit listener after a normal finish, so it restores the
+        # terminal (POSIX) and the report isn't held up waiting for it.
+        stop_event.set()
+        quit_thread.join(timeout=2)
 
     total_seconds = time.time() - start_time
     _print_report(stats, total_seconds)
@@ -1183,6 +1245,11 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    # Redirected output on Windows uses the ANSI code page (e.g. cp1252), which can't encode
+    # "✓" or many file names; print "?" for those instead of failing the image or the run.
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(errors="replace")
 
     setup_logging(args.log)
 

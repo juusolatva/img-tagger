@@ -1,5 +1,7 @@
 """Tests for writing/reading tag metadata and the file-replacement helpers in img_tagger.py."""
 
+import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -84,6 +86,19 @@ class TestWriteMetadata:
         assert exif["Exif.Photo.UserComment"].startswith("café, kesä, 日本")
         assert img_tagger.is_already_processed(path)
 
+    @pytest.mark.parametrize("ext", ["jpg", "png", "webp"])
+    def test_non_ascii_directory(self, tmp_path, ext):
+        # The temp file is created next to the image, so a non-ASCII folder reaches pyexiv2 too
+        folder = tmp_path / "kesä_日本"
+        folder.mkdir()
+        path = make_image(folder / f"a.{ext}")
+
+        img_tagger.write_metadata(str(path), SAMPLE_TAGS)
+
+        _, xmp = read_metadata(path)
+        assert xmp["Xmp.dc.subject"] == SAMPLE_TAGS
+        assert img_tagger.is_already_processed(path)
+
     def test_overwrites_previous_tags(self, static_image):
         img_tagger.write_metadata(str(static_image), SAMPLE_TAGS)
         new_tags = ["cat", "meme", "funny", "reaction", "pet", "animal"]
@@ -120,7 +135,7 @@ class TestWriteMetadata:
             def __init__(self, *args, **kwargs):
                 raise RuntimeError("some unrelated pyexiv2 failure")
 
-        monkeypatch.setattr(img_tagger.pyexiv2, "Image", BrokenImage)
+        monkeypatch.setattr(img_tagger.pyexiv2, "ImageData", BrokenImage)
 
         with pytest.raises(RuntimeError, match="unrelated"):
             img_tagger.write_metadata(str(static_image), SAMPLE_TAGS)
@@ -130,7 +145,7 @@ class TestWriteMetadata:
 
     @pytest.mark.parametrize("error", ["Invalid IFD structure", "Image data is corrupt"])
     def test_auto_heals_corrupt_metadata_via_pillow(self, static_image, monkeypatch, capsys, error):
-        real_image = img_tagger.pyexiv2.Image
+        real_image = img_tagger.pyexiv2.ImageData
         attempts = []
 
         def flaky_image(*args, **kwargs):
@@ -139,9 +154,9 @@ class TestWriteMetadata:
                 raise RuntimeError(error)
             return real_image(*args, **kwargs)
 
-        monkeypatch.setattr(img_tagger.pyexiv2, "Image", flaky_image)
+        monkeypatch.setattr(img_tagger.pyexiv2, "ImageData", flaky_image)
         img_tagger.write_metadata(str(static_image), SAMPLE_TAGS)
-        monkeypatch.setattr(img_tagger.pyexiv2, "Image", real_image)
+        monkeypatch.setattr(img_tagger.pyexiv2, "ImageData", real_image)
 
         assert len(attempts) == 2, "pyexiv2 should be retried once on the sanitized file"
         assert f"Warning: Corrupted metadata in {static_image.name} ({error})" in capsys.readouterr().out
@@ -164,7 +179,7 @@ class TestWriteMetadata:
     @pytest.mark.parametrize("ext", ["webp", "png"])
     def test_auto_heal_keeps_animation(self, tmp_path, monkeypatch, ext):
         path = make_animated(tmp_path / f"anim.{ext}", durations=[40, 250, 90], loop=3)
-        real_image = img_tagger.pyexiv2.Image
+        real_image = img_tagger.pyexiv2.ImageData
         attempts = []
 
         def flaky_image(*args, **kwargs):
@@ -173,9 +188,9 @@ class TestWriteMetadata:
                 raise RuntimeError("Image data is corrupt")
             return real_image(*args, **kwargs)
 
-        monkeypatch.setattr(img_tagger.pyexiv2, "Image", flaky_image)
+        monkeypatch.setattr(img_tagger.pyexiv2, "ImageData", flaky_image)
         img_tagger.write_metadata(str(path), SAMPLE_TAGS)
-        monkeypatch.setattr(img_tagger.pyexiv2, "Image", real_image)
+        monkeypatch.setattr(img_tagger.pyexiv2, "ImageData", real_image)
 
         assert len(attempts) == 2
         assert animation_info(path) == {
@@ -204,6 +219,17 @@ class TestWriteGifTags:
         assert info["n_frames"] == 4
         assert info["durations"] == [40, 250, 90, 500]
         assert info["loop"] == 3
+
+    def test_play_once_gif_stays_play_once(self, tmp_path):
+        path = make_gif(tmp_path / "once.gif", loop=None)
+        img_tagger.write_gif_tags(str(path), SAMPLE_TAGS)
+        assert gif_info(path)["loop"] is None
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+    def test_keeps_file_permissions(self, gif_image):
+        gif_image.chmod(0o644)
+        img_tagger.write_gif_tags(str(gif_image), SAMPLE_TAGS)
+        assert stat.S_IMODE(gif_image.stat().st_mode) == 0o644
 
     def test_preserves_frame_content(self, gif_image):
         def frame_pixels(path):
@@ -256,6 +282,8 @@ class TestTagImage:
         img_tagger.tag_image(str(path), SAMPLE_TAGS)
         _, xmp = read_metadata(path)
         assert xmp["Xmp.dc.subject"] == SAMPLE_TAGS
+        # ...and found again by the skip check, which must not look for a GIF comment
+        assert img_tagger.is_already_processed(path)
 
     def test_invalid_file_raises(self, tmp_path):
         bogus = tmp_path / "bogus.png"

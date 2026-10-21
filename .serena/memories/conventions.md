@@ -1,12 +1,12 @@
 # Conventions
-- Google-style docstrings (`Args:` / `Returns:`) on every function; summary sometimes on the opening line, sometimes the next — either is accepted.
-- Type hints on all signatures. Mixed style exists: builtin generics (`list[str]`, `tuple[...]`) alongside `typing.Optional`/`List`/`Any`. Prefer builtin generics for new code; don't churn existing hints unprompted.
+- Docstring on every function: Google-style `Args:`/`Returns:`/`Raises:` for public and multi-param functions, a one-line summary for small `_private` helpers; summary on the opening line or the next — either is accepted.
+- Type hints on all signatures, PEP 604/585 style (`str | None`, `list[str]`); `typing.Any` only for backend clients and pyexiv2 images. Known gaps: `_sanitize_with_pillow` params, nested `frame_generator`s.
 - Paths: functions take `Path` or `str` inconsistently (e.g. `tag_image`/`write_metadata` take `str`, pipeline uses `Path`); convert at the boundary, keep existing signatures.
+- pyexiv2 only ever gets bytes: read via `pyexiv2.ImageData`, write via `_modify_with_pyexiv2()`; never pass a path to `pyexiv2.Image` (Windows non-ASCII paths fail).
 - Logging via module `logger = logging.getLogger("img_tagger")` (has a `NullHandler`), never root `logging.*`; f-strings. In `except` blocks use `logger.exception()`, not `logger.error(..., exc_info=True)` (SonarQube S8572).
 - Problems the user must see even without `--log` go through `_warn()` (logs a warning + `tqdm.write("  Warning: …")`); plain `logger.*` calls are invisible without `--log`. Console output otherwise via `tqdm.write()`/`print()`.
 - Tests: one condition per `assert` (SonarQube S9073 flags `assert a and b`).
 - User-facing CLI errors: `print(...)` + `sys.exit(1)` in `__main__`, not exceptions.
 - Wrap low-level failures as `RuntimeError(f"... {path}: {e}")` at format-router level (`tag_image`).
-- Split large functions into `_private` module-level helpers (SonarQube cognitive complexity ≤ 15). Repeated literals become module constants (`PROCESSED_MARKER`, `DEFAULT_MIME_TYPE`).
+- Split large functions into `_private` module-level helpers (SonarQube cognitive complexity ≤ 15). Repeated literals become module constants (`PROCESSED_MARKER`, `DEFAULT_MIME_TYPE`, `IMAGE_EXTENSIONS`, `TAGGABLE_FORMATS`).
 - Inline comments explain intent of non-obvious blocks (locking, auto-heal); keep similar density.
-- Single quotes for pyexiv2 keys/kwargs, double quotes elsewhere (not enforced).

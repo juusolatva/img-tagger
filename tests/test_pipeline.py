@@ -16,6 +16,7 @@ from conftest import (
     make_image,
     read_metadata,
 )
+from PIL import Image
 
 import img_tagger
 
@@ -71,6 +72,16 @@ class TestProcessSingleImage:
 
         assert status == "FAILED"
         assert "unsupported or corrupted" in message
+        assert client.calls == []
+
+    def test_unsupported_format_fails_without_calling_model(self, tmp_path):
+        bmp = tmp_path / "really_a_bmp.jpg"
+        Image.new("RGB", (4, 4)).save(bmp, format="BMP")
+        client = FakeOllamaClient()
+
+        status, _, message, _ = run_single(bmp, client=client)
+
+        assert (status, message) == ("FAILED", "Unsupported file format: BMP")
         assert client.calls == []
 
     def test_stop_event_cancels_before_model_call(self, static_image):
@@ -285,6 +296,24 @@ class TestProcessDirectory:
         assert "Processed images: 0" in out
         assert "Failed images: 0" in out
         assert fake_ollama.instances[0].calls == []
+
+    def test_quit_listener_is_stopped_after_a_normal_run(self, tmp_path, fake_ollama, monkeypatch, capsys):
+        # A listener still waiting for 'Q' must be told to stop rather than waited out
+        stopped = threading.Event()
+
+        def listener(stop_event):
+            if stop_event.wait(timeout=10):
+                stopped.set()
+
+        monkeypatch.setattr(img_tagger, "listen_for_quit", listener)
+        make_image(tmp_path / "a.jpg")
+
+        start = time.monotonic()
+        self._run(tmp_path)
+
+        assert time.monotonic() - start < 1.5
+        assert stopped.wait(timeout=1)
+        assert "Processed images: 1" in capsys.readouterr().out
 
 
 # --- listen_for_quit ------------------------------------------------------

@@ -1,5 +1,6 @@
 """End-to-end CLI tests that run the scripts as subprocesses (no model server needed)."""
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -12,7 +13,7 @@ import img_tagger
 REPO = Path(__file__).resolve().parent.parent
 
 
-def run(script: str, *args: str) -> subprocess.CompletedProcess:
+def run(script: str, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(REPO / script), *args],
         capture_output=True,
@@ -20,6 +21,7 @@ def run(script: str, *args: str) -> subprocess.CompletedProcess:
         stdin=subprocess.DEVNULL,
         check=False,
         timeout=60,
+        env={**os.environ, **env} if env else None,
     )
 
 
@@ -121,6 +123,17 @@ class TestImgTaggerCli:
         assert not img_tagger.is_already_processed(top_jpg)
         assert not img_tagger.is_already_processed(top_gif)
         assert img_tagger.is_already_processed(nested) is not recursive
+
+    def test_output_encoding_without_the_characters_does_not_crash(self, tmp_path):
+        # Like Windows output redirected to a file (cp1252), only stricter
+        path = make_image(tmp_path / "日本.jpg")
+        img_tagger.tag_image(str(path), SAMPLE_TAGS)
+
+        result = run("img_tagger.py", str(tmp_path), "--clear", env={"PYTHONIOENCODING": "ascii"})
+
+        assert result.returncode == 0
+        assert "Cleared metadata (pyexiv2) for: ??.jpg" in result.stdout
+        assert not img_tagger.is_already_processed(path)
 
     def test_clears_with_multiple_workers(self, tmp_path):
         paths = [make_image(tmp_path / f"img_{i}.jpg") for i in range(4)]
