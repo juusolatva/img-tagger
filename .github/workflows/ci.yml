@@ -73,14 +73,18 @@ jobs:
   sonarqube:
     name: SonarQube Cloud
     needs: test
-    # Fork and Dependabot PRs get no repository secrets, so SONAR_TOKEN would be empty.
-    if: >-
-      github.event_name != 'pull_request' ||
-      (github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.user.login != 'dependabot[bot]')
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # `if:` can't read secrets, so the scan step checks this env var instead. It is empty on
+    # fork PRs (no secrets) and wherever the secret is missing; Dependabot-triggered runs read
+    # Dependabot secrets, so SONAR_TOKEN is stored there too.
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
     steps:
+      - name: Report missing token
+        if: env.SONAR_TOKEN == ''
+        run: echo "::warning::SONAR_TOKEN is not available to this run (fork PR or unset secret); skipping the SonarQube scan."
+
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
@@ -92,6 +96,5 @@ jobs:
           name: coverage
 
       - name: SonarQube Scan
+        if: env.SONAR_TOKEN != ''
         uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
