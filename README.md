@@ -4,7 +4,7 @@
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=juusolatva_img_tagger&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=juusolatva_img_tagger)
 [![Coverage](https://sonarcloud.io/api/project_badges/measure?project=juusolatva_img_tagger&metric=coverage)](https://sonarcloud.io/summary/new_code?id=juusolatva_img_tagger)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
-[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://www.python.org/downloads/)
+[![Python](https://img.shields.io/badge/python-3.13%20%7C%203.14-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/github/license/juusolatva/img_tagger)](LICENSE)
 
 A Python script that tags all the **JPEG**, **WebP**, **PNG** and **GIF** files in a folder (and optionally its subfolders). It sends each image to a vision-language model running in **Ollama** or **LM Studio**, either on your own computer or on another machine in your local network, and writes the tags the model sends back into the image's own metadata.
@@ -38,7 +38,7 @@ The tags are standard EXIF and XMP fields (a comment for GIFs), so they stay wit
 
 ## Requirements
 
-- [Python](https://www.python.org/downloads/) **3.10 or newer** (tested on 3.10 to 3.14). Check with `python --version` (or `python3 --version`). On macOS, the `python3` that comes with Apple's command line tools may be too old; install a newer one from python.org or Homebrew. `pyexiv2` is built separately for each Python version, so a Python newer than 3.14 works only once `pyexiv2` has a release for it.
+- [Python](https://www.python.org/downloads/) **3.13 or newer** (tested on 3.13 and 3.14). Check with `python --version` (or `python3 --version`). On macOS, the `python3` that comes with Apple's command line tools may be too old; install a newer one from python.org or Homebrew. `pyexiv2` is built separately for each Python version, so a Python newer than 3.14 works only once `pyexiv2` has a release for it.
 - [Ollama](https://ollama.com/download) or [LM Studio](https://lmstudio.ai/download) with a vision-capable model. A GPU makes a big difference to speed, see [Choosing a model and performance](#choosing-a-model-and-performance).
 - The Python packages in [`requirements.txt`](requirements.txt):
 
@@ -604,7 +604,7 @@ Notes for coding agents and contributors are in [AGENTS.md](AGENTS.md).
 Every push to `main` and every pull request runs [GitHub Actions](.github/workflows/ci.yml), and you can also start it by hand:
 
 - **Ruff** lint and format checks, using the Ruff version pinned in `requirements-dev.txt`
-- the offline **tests** with coverage on Python 3.10 to 3.14 (on Linux)
+- the offline **tests** with coverage on Python 3.13 and 3.14 (on Linux)
 - a **SonarQube Cloud** scan, which uses the coverage report from the Python 3.14 job (needs `SONAR_TOKEN` as a repository secret and as a Dependabot secret; pull requests from forks get no secrets, so there the scan is skipped with a warning)
 - an [**OSV-Scanner**](.github/workflows/osv-scanner.yml) dependency vulnerability scan (`requirements-dev.lock` and `requirements*.txt`), which also runs on a weekly schedule; on pull requests it checks only for newly introduced vulnerabilities and skips the SARIF upload on fork PRs
 
@@ -613,7 +613,7 @@ To run the same checks locally, use `ruff check .`, `ruff format --check .` and 
 CI installs the exact package versions in `requirements-dev.lock` (with `--require-hashes --only-binary :all:`). If you change `requirements.txt` or `requirements-dev.txt`, regenerate the lock with [uv](https://docs.astral.sh/uv/):
 
 ```bash
-uv pip compile requirements-dev.txt --universal --python-version 3.10 --generate-hashes --no-header -o requirements-dev.lock
+uv pip compile requirements-dev.txt --universal --python-version 3.13 --generate-hashes --no-header -o requirements-dev.lock
 ```
 
 This keeps the versions already in the lock where they still fit. To update the locked versions, add `--upgrade` (or `-P <package>` for a single package).
