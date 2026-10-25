@@ -198,6 +198,7 @@ python img_tagger.py "C:\Users\you\Pictures\My memes"
 
 - Files ending in `.jpg`, `.jpeg`, `.png`, `.webp` or `.gif`, in any letter case (`photo.JPG` counts). Hidden files such as `.hidden.jpg` are included.
 - Everything else (`.jfif`, `.tif`, `.heic`, `.avif`, `.bmp`, ...) is silently ignored and not counted.
+- Image symlinks and symlinked parent directories are refused; choose the real image directory. POSIX also refuses image directories writable by another user/group or owned by someone other than the current user or root. Shared ancestors such as `/tmp` are allowed because directory handles stay pinned. Paths containing `..` are refused.
 - Each file is opened with Pillow first, and img tagger goes by the image's real format, not its extension (a PNG named `.gif` is tagged like a PNG).
   - A file with an image extension that isn't a valid image fails with `Skipping unsupported or corrupted file`.
   - A valid image in a format img tagger can't tag (e.g. a BMP named `.jpg`, or an MPO, see [Known issues](#known-issues-and-limitations)) fails with `Unsupported file format: <format>`.
@@ -295,8 +296,10 @@ IPTC keywords are not updated, so apps that read IPTC keywords may still show th
 
 - **JPEG, WebP and PNG**: only the metadata is edited; the image data is not re-encoded. Animated WebPs keep their frames, frame durations and loop count.
 - **GIF**: the whole file is re-encoded through Pillow. Each frame keeps its duration (100 ms if it had none) and the loop setting is kept (a GIF that plays once still plays once). Consecutive identical frames are merged into one frame with their combined duration, so playback looks the same. Pillow keeps all of a GIF's frames in memory while writing it, so a very large animated GIF can need a lot of RAM. See [Known issues](#known-issues-and-limitations) for the side effects.
-- Each image is copied to a temporary `tmpXXXX.tmp` file **in the same folder**, edited there and then moved over the original. If the original is locked (e.g. open in another program), the move is retried up to 10 times, half a second apart. The temporary file is removed afterwards.
-- File permissions are kept. The file's modified time changes.
+- Each image is read through guarded file access. Output is written to an open temporary `tmpXXXX.tmp` file **in the same folder**, edited through that file handle and then moved over the original. If the original is locked (e.g. open in another program), the move is retried up to 10 times, half a second apart. The temporary file is removed afterwards.
+- File mode permissions are kept. Linux extended attributes and POSIX ACLs are preserved through the opened file handles; inherited temporary-file ACL grants are removed. Timestamps are not copied.
+- On POSIX, parent directories are opened without following symlinks, and replacement uses pinned directory descriptors. This protects against other-user directory substitution subject to the directory ownership/write restrictions above; it does not isolate another process running as your own account or root.
+- **Windows protection gap:** existing symlinks, junctions and other reparse points are refused, and temporary writes use an open file handle. Windows still uses pathname checks and closes the temporary handle before replacement, so concurrent file/parent-directory substitution is not fully prevented. NTFS ACL preservation is not implemented. Keep image folders private. These changes have not been tested on Windows.
 
 ### Repairing corrupted metadata
 
@@ -518,7 +521,7 @@ A file whose metadata had to be repaired shows `Sanitized and cleared (Pillow) f
 - The file has a `.jpg`, `.jpeg`, `.png`, `.webp` or `.gif` extension, but its real format is something else. For MPO see [Known issues](#known-issues-and-limitations); otherwise convert the file to a supported format.
 
 **`[WinError 5] Access is denied: '...\tmpXXXX.tmp'`** or **`Failed to replace ... after retries.`** on Windows
-- The image is read-only, or (for the second message) another program kept it locked for the 5 seconds img tagger waited, e.g. an image viewer or editor that has it open. Clear the image's read-only attribute or close the other program and run again; only the failed images are retried. A leftover `tmpXXXX.tmp` file is read-only too, so clear its read-only attribute before deleting it (or use `del /f`).
+- The image is read-only, or another program kept it locked for the 5 seconds img tagger waited. Clear the read-only attribute or close the other program and run again. Replacement or cleanup may leave a read-only `tmpXXXX.tmp`; clear its read-only attribute before deleting it (or use `del /f`). The updated Windows file-handling behavior needs verification on Windows.
 
 **`Error: The folder '<folder>' could not be located.`**
 - Check the path. On Windows, quote paths that contain spaces and don't use `~` (see [Examples](#examples)).
@@ -542,7 +545,7 @@ A file whose metadata had to be repaired shows `Sanitized and cleared (Pillow) f
 - **IPTC keywords** are left as they are, and existing XMP keywords are replaced. See [What happens to existing metadata](#what-happens-to-existing-metadata).
 - **No forced re-tagging**: tagged images are always skipped. See [Already tagged images are skipped](#already-tagged-images-are-skipped).
 - **MPO JPEGs are not supported**: JPEGs that hold several embedded images (some cameras and phones save these) are reported by Pillow as `MPO` and fail with `Unsupported file format: MPO`, without contacting the model.
-- **Read-only files on Windows** fail after the model has already been asked: JPEG, WebP and PNG files with `[WinError 5] Access is denied`, leaving a read-only `tmpXXXX.tmp` file in the folder (`--clear` does the same); GIFs after about 5 seconds of retries with `Failed to replace ... after retries.`, leaving nothing behind.
+- **Read-only files on Windows** may fail during replacement or cleanup after the model has already been asked, possibly leaving a read-only temporary file. The updated file-handling behavior has not been verified on Windows.
 - **No upfront server check**: if the server is down or the model is wrong, every image fails separately.
 - **Ctrl+C** doesn't stop a run cleanly. Use `Q`.
 

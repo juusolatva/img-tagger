@@ -10,7 +10,7 @@ import img_tagger
 
 
 class TestGetTagsOllama:
-    def test_sends_prompt_and_image_path(self, tmp_path):
+    def test_sends_prompt_and_image_bytes(self, tmp_path):
         image = make_image(tmp_path / "a.jpg")
         client = FakeOllamaClient()
         client.reply = "a, b, c"
@@ -21,7 +21,7 @@ class TestGetTagsOllama:
         assert client.calls == [
             {
                 "model": "qwen3-vl:8b",
-                "messages": [{"role": "user", "content": "describe it", "images": [str(image)]}],
+                "messages": [{"role": "user", "content": "describe it", "images": [image.read_bytes()]}],
             }
         ]
 
