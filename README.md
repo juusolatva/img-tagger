@@ -606,6 +606,7 @@ Every push to `main` and every pull request runs [GitHub Actions](.github/workfl
 - **Ruff** lint and format checks, using the Ruff version pinned in `requirements-dev.txt`
 - the offline **tests** with coverage on Python 3.10 to 3.14 (on Linux)
 - a **SonarQube Cloud** scan, which uses the coverage report from the Python 3.14 job (needs `SONAR_TOKEN` as a repository secret and as a Dependabot secret; pull requests from forks get no secrets, so there the scan is skipped with a warning)
+- an [**OSV-Scanner**](.github/workflows/osv-scanner.yml) dependency vulnerability scan (`requirements-dev.lock` and `requirements*.txt`), which also runs on a weekly schedule; on pull requests it checks only for newly introduced vulnerabilities and skips the SARIF upload on fork PRs
 
 To run the same checks locally, use `ruff check .`, `ruff format --check .` and `python -m pytest --cov`.
 
