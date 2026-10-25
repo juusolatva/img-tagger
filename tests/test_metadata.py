@@ -118,13 +118,13 @@ class TestWriteMetadata:
 
     def test_temp_file_created_next_to_image(self, static_image, monkeypatch):
         seen_dirs = []
-        real_mkstemp = img_tagger.tempfile.mkstemp
+        real_create = img_tagger._create_image_temp
 
-        def spy_mkstemp(*args, **kwargs):
-            seen_dirs.append(Path(kwargs["dir"]))
-            return real_mkstemp(*args, **kwargs)
+        def spy_create(directory, parent_fd):
+            seen_dirs.append(directory)
+            return real_create(directory, parent_fd)
 
-        monkeypatch.setattr(img_tagger.tempfile, "mkstemp", spy_mkstemp)
+        monkeypatch.setattr(img_tagger, "_create_image_temp", spy_create)
         img_tagger.write_metadata(str(static_image), SAMPLE_TAGS)
         assert seen_dirs == [static_image.parent]
 

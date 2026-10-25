@@ -13,8 +13,9 @@ Authoritative detailed spec lives in `AGENTS.md` (CLAUDE.md just `@`-includes it
 ## Invariants
 - `process_single_image` returns `(status, filename, message, duration)`; status ∈ SUCCESS/FAILED/SKIPPED/CANCELLED. Designed not to raise (exceptions → FAILED); keep the `_run_tasks` guard around `future.result()` as a backstop.
 - Format dispatch is by Pillow-detected format everywhere (`tag_image`, `is_already_processed`, `clear_tags`); the extension only decides for unreadable files (`_is_gif`).
-- All pyexiv2 calls under module-level `metadata_lock`, and pyexiv2 only gets bytes (`ImageData`), never a path. Model calls and Pillow work stay outside the lock (exception: `write_metadata`'s auto-heal re-save + replace run inside it).
-- Writes go to `tempfile.mkstemp(dir=<image dir>)` copy, then `robust_replace`, cleanup in `finally`.
+- All pyexiv2 calls under module-level `metadata_lock`, and pyexiv2 only gets bytes (`ImageData`), never a path. Model calls and Pillow work stay outside the lock (exception: `write_metadata`'s auto-heal re-save runs inside it).
+- `_read_image_bytes` guards reads; Pillow and backends use snapshots (Ollama gets bytes, never paths). Reject image/ancestor symlinks and `..`. POSIX pins no-follow directory fds, requires final image directory owner root/current UID and no group/other writes. Ancestors are pinned without trusting unmapped/overflow UIDs.
+- `_image_edit` retains an exclusively created same-directory temporary handle for copying, Pillow and pyexiv2 edits; mode comes from opened source fstat and is applied by fd. Check identities before descriptor-relative replace/cleanup on POSIX. Linux ACLs/xattrs copied by fd (remove inherited extra grants); no copy2/copymode; timestamps not copied. Same-UID/root writers excluded. POSIX temporary creation also uses the pinned dir_fd. Windows retains support with existing reparse checks but concurrent parent/leaf and close-before-replace races remain; updated Windows paths untested.
 - Skip marker string `[PROCESSED BY AI]` (constant `PROCESSED_MARKER`) is the idempotency contract between tagger, `--clear` and already-tagged user files — don't change its text.
 - Worker bound (1–4) checked in `__main__` arg handling only.
 - Optional imports (`msvcrt`, `termios`/`tty`, `ollama`, `openai`) fall back to `None`; code checks for `None` rather than importing lazily.

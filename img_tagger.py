@@ -12,6 +12,7 @@ images via the --clear option. Run it as a script; see -h for the options.
 import argparse
 import base64
 import contextlib
+import errno
 import io
 import json
 import logging
@@ -19,8 +20,9 @@ import math
 import os
 import platform
 import re
+import secrets
 import select
-import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -29,7 +31,7 @@ from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import pyexiv2
 from PIL import Image, ImageSequence
@@ -200,7 +202,156 @@ def _wait_for_quit_posix(stop_event: threading.Event, idle_sleep: float = 0.0) -
         time.sleep(idle_sleep)
 
 
-def get_image_format(img_path: Path) -> str | None:
+class _UnsafeImagePath(OSError):
+    """An image path cannot be used without crossing a filesystem trust boundary."""
+
+
+def _check_directory(info: os.stat_result) -> None:
+    """Reject directories another POSIX user can replace entries in."""
+    if info.st_uid not in {0, os.geteuid()}:
+        raise _UnsafeImagePath("Image directory must belong to this user or root")
+    if info.st_mode & 0o022:
+        raise _UnsafeImagePath("Image directories must not be writable by other users")
+
+
+def _check_windows_path(path: Path) -> None:
+    """Reject existing Windows symlinks, junctions and other reparse points."""
+    for part in (*reversed(path.parents), path):
+        info = part.lstat()
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise _UnsafeImagePath(f"Image paths must not contain links or reparse points: {part}")
+
+
+@contextlib.contextmanager
+def _image_parent(path: Path) -> Generator[tuple[Path, int | None]]:
+    """Pin POSIX ancestors without following links; Windows checks existing reparse points."""
+    if ".." in path.parts:
+        raise _UnsafeImagePath("Image paths must not contain '..'")
+    path = path.absolute()
+    if os.name == "nt":
+        _check_windows_path(path.parent)
+        yield path, None
+        return
+    # O_PATH preserves access through execute-only ancestors without requiring directory listing rights.
+    flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW
+    with contextlib.ExitStack() as stack:
+        fd = os.open(path.anchor, flags)
+        stack.callback(os.close, fd)
+        for part in path.parent.parts[1:]:
+            fd = os.open(part, flags, dir_fd=fd)
+            stack.callback(os.close, fd)
+        _check_directory(os.fstat(fd))
+        yield path, fd
+
+
+def _file_attributes(fd: int) -> dict[str, bytes]:
+    """Capture extended attributes, including POSIX ACLs, without reopening a pathname."""
+    if not hasattr(os, "listxattr"):
+        return {}
+    try:
+        return {name: os.getxattr(fd, name) for name in os.listxattr(fd)}
+    except OSError as error:
+        if error.errno not in {errno.ENOTSUP, errno.EOPNOTSUPP}:
+            raise
+        return {}
+
+
+def _apply_permissions(output: BinaryIO, mode: int, attributes: dict[str, bytes]) -> None:
+    """Preserve source ACLs and remove any inherited temporary-file access grants."""
+    fd = output.fileno()
+    existing = _file_attributes(fd)
+    for name in existing.keys() - attributes.keys():
+        os.removexattr(fd, name)
+    for name, value in attributes.items():
+        if existing.get(name) != value:
+            os.setxattr(fd, name, value)
+    os.chmod(fd, stat.S_IMODE(mode))
+
+
+def _source_bytes(path: Path, parent_fd: int | None) -> tuple[bytes, os.stat_result, dict[str, bytes]]:
+    """Read only an opened regular file, rejecting leaf links before consuming bytes."""
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    if parent_fd is not None:
+        flags |= os.O_NOFOLLOW
+    else:
+        _check_windows_path(path)
+    fd = os.open(path.name if parent_fd is not None else path, flags, dir_fd=parent_fd)
+    with os.fdopen(fd, "rb") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise _UnsafeImagePath("Image input must be a regular file")
+        if parent_fd is None:
+            _check_windows_path(path)
+            if not os.path.samestat(info, path.stat(follow_symlinks=False)):
+                raise _UnsafeImagePath("Image changed while opening it")
+        return source.read(), info, _file_attributes(source.fileno())
+
+
+def _read_image_bytes(path: Path | str) -> bytes:
+    """Read a guarded source snapshot instead of delegating pathname reads to libraries."""
+    with _image_parent(Path(path)) as (image, parent_fd):
+        return _source_bytes(image, parent_fd)[0]
+
+
+def _open_pillow(path: Path | str | bytes) -> Image.Image:
+    """Open Pillow on a private byte snapshot, never an attacker-replaceable pathname."""
+    data = path if isinstance(path, bytes) else _read_image_bytes(path)
+    return Image.open(io.BytesIO(data))
+
+
+def _check_replacement(path: Path, parent_fd: int | None, expected: os.stat_result) -> None:
+    """Refuse replacing a directory entry that no longer names the opened file."""
+    current = os.stat(path.name if parent_fd is not None else path, dir_fd=parent_fd, follow_symlinks=False)
+    if not os.path.samestat(current, expected):
+        raise _UnsafeImagePath(f"File changed during processing: {path.name}")
+
+
+@contextlib.contextmanager
+def _image_edit(image_path: Path | str) -> Generator[tuple[bytes, BinaryIO]]:
+    """Keep source permissions, parent identity and temporary descriptor bound to an edit."""
+    with _image_parent(Path(image_path)) as (path, parent_fd):
+        data, original, attributes = _source_bytes(path, parent_fd)
+        fd, temporary = _create_image_temp(path.parent, parent_fd)
+        expected = os.fstat(fd)
+        try:
+            with os.fdopen(fd, "w+b") as output:
+                yield data, output
+                output.flush()
+                _apply_permissions(output, original.st_mode, attributes)
+                _check_replacement(temporary, parent_fd, expected)
+                _check_replacement(path, parent_fd, original)
+                if parent_fd is not None:
+                    robust_replace(temporary, path, parent_fd=parent_fd)
+            if parent_fd is None:
+                # Windows cannot rename an open CRT file; the remaining close/rename race is documented.
+                _check_windows_path(path)
+                _check_replacement(temporary, None, expected)
+                _check_replacement(path, None, original)
+                robust_replace(temporary, path)
+        finally:
+            if parent_fd is None:
+                temporary.unlink(missing_ok=True)
+            else:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(temporary.name, dir_fd=parent_fd)
+
+
+def _create_image_temp(directory: Path, parent_fd: int | None) -> tuple[int, Path]:
+    """Create a same-directory temporary without resolving mutable POSIX ancestors again."""
+    if parent_fd is None:
+        fd, name = tempfile.mkstemp(dir=directory, suffix=".tmp")
+        return fd, Path(name)
+    for _ in range(10):
+        name = f"tmp{secrets.token_hex(12)}.tmp"
+        try:
+            fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
+            return fd, directory / name
+        except FileExistsError:
+            continue
+    raise FileExistsError("Could not create a unique image temporary")
+
+
+def get_image_format(img_path: Path | bytes) -> str | None:
     """
     Attempts to identify the image format using Pillow.
 
@@ -212,10 +363,11 @@ def get_image_format(img_path: Path) -> str | None:
     """
 
     try:
-        with Image.open(img_path) as img:
+        data = img_path if isinstance(img_path, bytes) else _read_image_bytes(img_path)
+        with _open_pillow(data) as img:
             img.verify()
         # Re-open because verify() closes/clears the file handle in some versions
-        with Image.open(img_path) as img:
+        with _open_pillow(data) as img:
             return img.format
     except Exception:  # noqa: BLE001 - Pillow raises arbitrary errors on malformed files
         return None
@@ -230,11 +382,14 @@ def _is_gif(img_path: Path, fmt: str | None) -> bool:
     return fmt == "GIF" if fmt else img_path.suffix.lower() == ".gif"
 
 
-def robust_replace(src: Path, dst: Path) -> None:
+def robust_replace(src: Path, dst: Path, *, parent_fd: int | None = None) -> None:
     """Atomically replace dst with src, retrying on transient OSErrors like lingering file locks on Windows)."""
     for _ in range(10):
         try:
-            src.replace(dst)
+            if parent_fd is None:
+                src.replace(dst)
+            else:
+                os.replace(src.name, dst.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
             return
         except OSError:
             time.sleep(0.5)
@@ -247,12 +402,12 @@ def _sanitize_with_pillow(src, dst, fmt=None) -> None:
     frame, per-frame duration and loop count of animated images (WebP, APNG).
 
     Args:
-        src: The path of the image to read.
-        dst: The path to write the sanitized copy to.
+        src: A guarded image path or source byte snapshot.
+        dst: The retained temporary file object to write the sanitized copy to.
         fmt: Pillow format name to save as; defaults to the source image's format.
     """
 
-    with Image.open(src) as img:
+    with _open_pillow(src) as img:
         fmt = fmt or img.format
         if not getattr(img, "is_animated", False):
             img.save(dst, format=fmt, quality=95)
@@ -273,7 +428,7 @@ def _sanitize_with_pillow(src, dst, fmt=None) -> None:
         )
 
 
-def _modify_with_pyexiv2(path: Path, edit: Callable[[Any], None]) -> None:
+def _modify_with_pyexiv2(output: BinaryIO, edit: Callable[[Any], None]) -> None:
     """
     Applies edit() to a file's metadata with pyexiv2 and saves the result in place.
 
@@ -281,14 +436,17 @@ def _modify_with_pyexiv2(path: Path, edit: Callable[[Any], None]) -> None:
     with non-ASCII characters, in the file name or in any folder above it.
 
     Args:
-        path: The file to modify (a temp copy in the image's directory).
+        output: The retained temporary file object.
         edit: Called with the open pyexiv2.ImageData to modify its metadata.
     """
 
-    with pyexiv2.ImageData(path.read_bytes()) as img:
+    output.seek(0)
+    with pyexiv2.ImageData(output.read()) as img:
         edit(img)
         data = img.get_bytes()
-    path.write_bytes(data)
+    output.seek(0)
+    output.write(data)
+    output.truncate()
 
 
 def write_metadata(image_path: str, tags_list: list[str]) -> None:
@@ -316,16 +474,12 @@ def write_metadata(image_path: str, tags_list: list[str]) -> None:
             }
         )
 
-    fd, temp_path_str = tempfile.mkstemp(dir=Path(image_path).parent, suffix=".tmp")
-    os.close(fd)
-    temp_path = Path(temp_path_str)
-
-    try:
-        shutil.copy2(image_path, temp_path)
+    with _image_edit(image_path) as (source, output):
+        output.write(source)
         with metadata_lock:
             try:
                 # Primary attempt using pyexiv2 (separated into EXIF and XMP)
-                _modify_with_pyexiv2(temp_path, write_tags)
+                _modify_with_pyexiv2(output, write_tags)
 
             except RuntimeError as e:
                 # Auto-healing fallback for corrupted EXIF data (IFD buffer errors)
@@ -335,19 +489,16 @@ def write_metadata(image_path: str, tags_list: list[str]) -> None:
                         "re-saving it with Pillow before tagging (JPEG/WebP are re-encoded)"
                     )
 
-                    # Re-save with Pillow (more forgiving) to temp_path to strip broken EXIF
-                    _sanitize_with_pillow(image_path, temp_path)
+                    # Re-save the guarded source snapshot into the retained output handle.
+                    output.seek(0)
+                    output.truncate()
+                    _sanitize_with_pillow(source, output)
 
                     # Retry pyexiv2 on the newly cleaned temporary file
-                    _modify_with_pyexiv2(temp_path, write_tags)
+                    _modify_with_pyexiv2(output, write_tags)
 
                 else:
                     raise  # Re-raise if it's a different pyexiv2 error
-
-            robust_replace(temp_path, Path(image_path))
-
-    finally:
-        temp_path.unlink(missing_ok=True)
 
 
 def _gif_loop_kwargs(img: Image.Image) -> dict[str, int]:
@@ -375,49 +526,30 @@ def write_gif_tags(image_path: str, tags_list: list[str]) -> None:
         tags_list: A list of strings representing the tags to embed.
     """
 
-    marker = PROCESSED_MARKER
-    tags_str = ", ".join(tags_list)
+    with _image_edit(image_path) as (source, output):
+        _save_gif(source, output, f"{', '.join(tags_list)} {PROCESSED_MARKER}")
 
-    with Image.open(image_path) as img:
+
+def _save_gif(source: bytes, output: BinaryIO, comment: str) -> None:
+    """Re-encode a source snapshot, preserving animation timing and loop semantics."""
+    with _open_pillow(source) as img:
         loop = _gif_loop_kwargs(img)
-        # Capture per-frame duration to preserve variable frame rates
-        durations = [f.info.get("duration", 100) for f in ImageSequence.Iterator(img)]
+        durations = [frame.info.get("duration", 100) for frame in ImageSequence.Iterator(img)]
+        img.seek(0)
+        first = img.copy()
 
-    def frame_generator():
-        # Hands Pillow one frame copy at a time (its GIF writer still collects
-        # every frame before writing, so memory grows with the frame count).
-        with Image.open(image_path) as img:
-            for i, frame in enumerate(ImageSequence.Iterator(img)):
-                if i == 0:
-                    continue
-                yield frame.copy()
+        def frames():
+            # Pillow collects these frames internally; memory still grows with animation size.
+            for index, frame in enumerate(ImageSequence.Iterator(img)):
+                if index:
+                    yield frame.copy()
 
-    fd, temp_path_str = tempfile.mkstemp(dir=Path(image_path).parent, suffix=".tmp")
-    os.close(fd)
-    temp_path = Path(temp_path_str)
-
-    try:
-        # Get the first frame to use as the base for saving
-        with Image.open(image_path) as img:
-            first_frame = ImageSequence.Iterator(img).__next__()
-            first_frame_copy = first_frame.copy()
-
-        first_frame_copy.save(
-            temp_path,
-            format="GIF",
-            save_all=True,
-            append_images=frame_generator(),
-            duration=durations,
-            comment=f"{tags_str} {marker}",
-            **loop,
-        )
-        # mkstemp files are owner-only (0600 on POSIX); keep the original's permissions
-        shutil.copymode(image_path, temp_path)
-
-        robust_replace(Path(temp_path), Path(image_path))
-
-    finally:
-        temp_path.unlink(missing_ok=True)
+        try:
+            first.save(
+                output, format="GIF", save_all=True, append_images=frames(), duration=durations, comment=comment, **loop
+            )
+        finally:
+            first.close()
 
 
 def tag_image(image_path: str, tags_list: list[str], fmt: str | None = None) -> None:
@@ -462,84 +594,27 @@ def _clear_all(img: Any) -> None:
     img.clear_iptc()
 
 
-def _clear_standard(image_path: Path, temp_path: Path, fmt: str | None = None) -> None:
-    """
-    Wipes EXIF, XMP and IPTC from a JPEG/WebP/PNG via pyexiv2, falling back to
-    a Pillow re-save when pyexiv2 reports corrupt metadata.
-
-    Args:
-        image_path: The path to the image file.
-        temp_path: Temp file in the image's directory to build the result in.
-        fmt: Pillow format for the fallback re-save; defaults to the image's own format.
-
-    Raises:
-        RuntimeError: If pyexiv2 fails for a reason other than corrupt metadata.
-    """
-
-    shutil.copy2(image_path, temp_path)
+def _clear_standard(source: bytes, output: BinaryIO, fmt: str | None = None) -> str:
+    """Clear a snapshot through pyexiv2, or sanitize corrupt metadata with Pillow."""
+    output.write(source)
     try:
-        # Primary attempt using pyexiv2 to wipe EVERYTHING
         with metadata_lock:
-            _modify_with_pyexiv2(temp_path, _clear_all)
-
-        robust_replace(temp_path, image_path)
-        logger.info(f"Cleared metadata (pyexiv2) for: {image_path.name}")
-        print(f"  Cleared metadata (pyexiv2) for: {image_path.name}")
-
-    except RuntimeError as e:
-        if "IFD" not in str(e).upper() and "corrupt" not in str(e).lower():
+            _modify_with_pyexiv2(output, _clear_all)
+        return "Cleared metadata (pyexiv2)"
+    except RuntimeError as error:
+        if "IFD" not in str(error).upper() and "corrupt" not in str(error).lower():
             raise
-
-        # Sanitize with Pillow to strip broken headers.
-        _sanitize_with_pillow(image_path, temp_path, fmt)
-
-        robust_replace(temp_path, image_path)
-        logger.warning(f"Corrupted metadata ({e}); sanitized and cleared (Pillow) for: {image_path.name}")
-        print(f"  Sanitized and cleared (Pillow) for: {image_path.name}")
+        logger.warning(f"Corrupted metadata ({error}); sanitizing image snapshot before clearing")
+        output.seek(0)
+        output.truncate()
+        _sanitize_with_pillow(source, output, fmt)
+        return "Sanitized and cleared (Pillow)"
 
 
-def _clear_gif(image_path: Path, temp_path: Path) -> None:
-    """
-    Re-saves a GIF with an empty comment, keeping frames, durations and loop count.
-
-    Args:
-        image_path: The path to the GIF file.
-        temp_path: Temp file in the image's directory to build the result in.
-    """
-
-    with Image.open(image_path) as img:
-        loop = _gif_loop_kwargs(img)
-        # Capture per-frame duration to preserve variable frame rates
-        durations = [f.info.get("duration", 100) for f in ImageSequence.Iterator(img)]
-
-        # Reset the image pointer back to the first frame
-        img.seek(0)
-        first_frame = img.copy()
-
-        # Hands Pillow one frame copy at a time (its GIF writer still collects
-        # every frame before writing, so memory grows with the frame count).
-        def frame_generator():
-            for i, frame in enumerate(ImageSequence.Iterator(img)):
-                if i == 0:
-                    continue
-                yield frame.copy()
-
-        first_frame.save(
-            temp_path,
-            format="GIF",
-            save_all=True,
-            append_images=frame_generator(),
-            duration=durations,
-            comment="",
-            **loop,
-        )
-        first_frame.close()
-    # mkstemp files are owner-only (0600 on POSIX); keep the original's permissions
-    shutil.copymode(image_path, temp_path)
-
-    robust_replace(temp_path, image_path)
-    logger.info(f"Cleared GIF comment: {image_path.name}")
-    print(f"  Cleared GIF comment: {image_path.name}")
+def _clear_gif(source: bytes, output: BinaryIO) -> str:
+    """Clear a GIF comment using only the opened source snapshot and output handle."""
+    _save_gif(source, output, "")
+    return "Cleared GIF comment"
 
 
 def clear_tags(image_path: Path | str) -> None:
@@ -556,21 +631,16 @@ def clear_tags(image_path: Path | str) -> None:
     p = Path(image_path)
     if p.suffix.lower() not in IMAGE_EXTENSIONS:
         return
-    fmt = get_image_format(p)
-
     try:
-        fd, temp_path_str = tempfile.mkstemp(dir=p.parent, suffix=".tmp")
-        os.close(fd)
-        temp_path = Path(temp_path_str)
-        try:
-            # Route on the real format like tag_image() does, so a mislabeled file is cleared
-            # the way it was tagged; the extension only decides for files Pillow can't read.
+        with _image_edit(p) as (source, output):
+            fmt = get_image_format(source)
             if _is_gif(p, fmt):
-                _clear_gif(p, temp_path)
+                message = _clear_gif(source, output)
             else:
-                _clear_standard(p, temp_path, fmt)
-        finally:
-            temp_path.unlink(missing_ok=True)
+                message = _clear_standard(source, output, fmt)
+        separator = ": " if fmt == "GIF" else " for: "
+        logger.info(f"{message}{separator}{p.name}")
+        print(f"  {message}{separator}{p.name}")
     except Exception as e:
         logger.exception(f"Failed to clear {p.name}")
         print(f"  Failed to clear {p.name}: {e}")
@@ -593,7 +663,7 @@ def get_tags_ollama(client: Any, model: str, img_path: Path, prompt: str) -> str
     logger.debug(f"Requesting tags from Ollama ({model}) for {img_path}")
     response = client.chat(
         model=model,
-        messages=[{"role": "user", "content": prompt, "images": [str(img_path)]}],
+        messages=[{"role": "user", "content": prompt, "images": [_read_image_bytes(img_path)]}],
     )
     content = response.message.content if hasattr(response, "message") else response["message"]["content"]
     logger.debug(f"Raw Ollama response for {img_path}: {content}")
@@ -615,7 +685,8 @@ def get_tags_lm_studio(client: Any, model: str, img_path: Path, prompt: str) -> 
     """
 
     logger.debug(f"Requesting tags from LM Studio ({model}) for {img_path}")
-    fmt = get_image_format(img_path)
+    source = _read_image_bytes(img_path)
+    fmt = get_image_format(source)
     if fmt is None:
         logger.error(f"Pillow could not determine the format for {img_path}")
     mime_map = {
@@ -627,8 +698,7 @@ def get_tags_lm_studio(client: Any, model: str, img_path: Path, prompt: str) -> 
     }
     mime_type = mime_map.get((fmt or "").lower(), DEFAULT_MIME_TYPE)
 
-    with open(img_path, "rb") as image_file:
-        base64_image = base64.b64encode(image_file.read()).decode("utf-8")
+    base64_image = base64.b64encode(source).decode("utf-8")
 
     response = client.chat.completions.create(
         model=model,
@@ -789,7 +859,7 @@ def _pyexiv2_has_marker(p: Path) -> bool:
 
     values = []
     # Hand pyexiv2 the bytes, not the path: on Windows it can't open non-ASCII paths like 'ö'
-    data = p.read_bytes()
+    data = _read_image_bytes(p)
     with metadata_lock, pyexiv2.ImageData(data) as img:
         # Read EXIF and XMP independently so one failing doesn't kill both
         for kind, read in (("EXIF", img.read_exif), ("XMP", img.read_xmp)):
@@ -808,7 +878,7 @@ def _pillow_has_marker(p: Path) -> bool:
         Exception: If Pillow cannot open the file.
     """
 
-    with Image.open(p) as img:
+    with _open_pillow(p) as img:
         return any(isinstance(v, str) and PROCESSED_MARKER in v for v in img.info.values())
 
 
@@ -832,7 +902,7 @@ def is_already_processed(img_path: Path, fmt: str | None = None) -> bool:
 
     if _is_gif(p, fmt or get_image_format(p)):
         try:
-            with Image.open(p) as img:
+            with _open_pillow(p) as img:
                 return _contains_marker(img.info.get("comment"))
         except Exception as e:  # noqa: BLE001
             _warn(f"Could not read the GIF comment of {p.name} ({e}); treating it as not yet tagged")
@@ -962,9 +1032,10 @@ def _find_images(directory: str, recursive: bool) -> list[Path]:
     """Lists files in directory (optionally recursive) with a supported image extension."""
 
     base_path = Path(directory)
-    files = base_path.rglob("*") if recursive else base_path.iterdir()
-    # We keep a broad filter for performance, but the final check is done in process_single_image via get_image_format
-    return [f for f in files if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS]
+    with _image_parent(base_path / ".image-directory-check"):
+        files = base_path.rglob("*") if recursive else base_path.iterdir()
+        # Reads revalidate ancestors and the opened leaf; this filter only avoids existing links.
+        return [f for f in files if not f.is_symlink() and f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS]
 
 
 def _load_prompt() -> str:

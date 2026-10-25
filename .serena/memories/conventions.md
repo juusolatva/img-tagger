@@ -2,7 +2,7 @@
 - Docstring on every function: Google-style `Args:`/`Returns:`/`Raises:` for public and multi-param functions, a one-line summary for small `_private` helpers; summary on the opening line or the next — either is accepted.
 - Type hints on all signatures, PEP 604/585 style (`str | None`, `list[str]`); `typing.Any` only for backend clients and pyexiv2 images. Known gaps: `_sanitize_with_pillow` params, nested `frame_generator`s.
 - Paths: functions take `Path` or `str` inconsistently (e.g. `tag_image`/`write_metadata` take `str`, pipeline uses `Path`); convert at the boundary, keep existing signatures.
-- pyexiv2 only ever gets bytes: read via `pyexiv2.ImageData`, write via `_modify_with_pyexiv2()`; never pass a path to `pyexiv2.Image` (Windows non-ASCII paths fail).
+- pyexiv2 only ever gets bytes: read via `pyexiv2.ImageData`, write via `_modify_with_pyexiv2()` on the retained temporary file object; never pass a path to `pyexiv2.Image` (Windows non-ASCII paths fail).
 - Logging via module `logger = logging.getLogger("img_tagger")` (has a `NullHandler`), never root `logging.*`; f-strings. In `except` blocks use `logger.exception()`, not `logger.error(..., exc_info=True)` (SonarQube S8572).
 - Problems the user must see even without `--log` go through `_warn()` (logs a warning + `tqdm.write("  Warning: …")`); plain `logger.*` calls are invisible without `--log`. Console output otherwise via `tqdm.write()`/`print()`.
 - Tests: one condition per `assert` (SonarQube S9073 flags `assert a and b`).
