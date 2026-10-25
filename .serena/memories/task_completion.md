@@ -6,3 +6,4 @@ CI (GitHub Actions) enforces steps 1–2 on push/PR; run them locally first.
 4. Changed `requirements*.txt` → regenerate `requirements-dev.lock` (command in `AGENTS.md` CI section; add `--upgrade`/`-P <pkg>` to actually bump pins).
 5. Update `AGENTS.md` (and README if user-visible) when behavior, invariants or CI change.
 6. New code should stay within SonarQube rules (scanned in CI): cognitive complexity ≤ 15, no duplicated literals, `logger.exception()` in `except`, one condition per test `assert`.
+7. Git commits are allowed; prefer a branch + pull request over pushing directly to `main`.

@@ -150,7 +150,7 @@ def _wait_for_quit_windows(stop_event: threading.Event) -> None:
 
 
 @contextlib.contextmanager
-def _cbreak_stdin() -> Generator[None, None, None]:
+def _cbreak_stdin() -> Generator[None]:
     """
     Puts the stdin terminal into cbreak mode (keys arrive without Enter) and
     restores the previous settings on exit.
