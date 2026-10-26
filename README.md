@@ -190,7 +190,7 @@ python img_tagger.py "C:\Users\you\Pictures\My memes"
 | `--model` | `qwen3-vl:8b` | The model to use. The default is Ollama's name for it, so with LM Studio pass LM Studio's id (e.g. `qwen/qwen3-vl-8b`). |
 | `--workers` | `1` | How many images to process at the same time, from 1 to 4. |
 | `--timeout` | `600` | Seconds to wait for the model's answer to one image, including loading the model, before that image is marked failed. Must be a positive number. Raise it for slow hardware. |
-| `--log` | off | Append a detailed log to this file, e.g. `--log logs/run.log`. Missing folders are created; a relative path is relative to the current directory. |
+| `--log` | off | Append a detailed log to this file, e.g. `--log logs/run.log`. Missing folders are created; a relative path is relative to the current directory. The name must end in `.log` (any letter case), and an existing path must be a regular file, not a symlink or folder. |
 | `--clear` | off | Remove metadata from the images instead of tagging them. See [Clearing tags](#clearing-tags). |
 | `-h`, `--help` | | Show the options and exit. |
 
@@ -210,7 +210,7 @@ python img_tagger.py "C:\Users\you\Pictures\My memes"
 | Code | When |
 |---|---|
 | `0` | The run finished, even if some images failed. Also after pressing `Q`, when no images were found, and when the backend's Python library is missing (an error is printed). |
-| `1` | The folder doesn't exist, `--workers` is outside 1 to 4, `--timeout` is zero, negative or `nan`, or `prompt.txt` exists but can't be read. Also when the script stops with a Python traceback, e.g. a required package such as `pyexiv2` is missing or the `--log` file can't be created. |
+| `1` | The folder doesn't exist, `--workers` is outside 1 to 4, `--timeout` is zero, negative or `nan`, `--log` doesn't name a regular `.log` file, or `prompt.txt` exists but can't be read. Also when the script stops with a Python traceback, e.g. a required package such as `pyexiv2` is missing or the `--log` file can't be created. |
 | `2` | An invalid option, e.g. an unknown `--backend` or a non-number for `--workers` or `--timeout`. |
 
 ### Examples
