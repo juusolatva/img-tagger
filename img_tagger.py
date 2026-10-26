@@ -110,6 +110,30 @@ def setup_logging(log_path: str | None) -> None:
     logger.info(f"Logging started (Python {platform.python_version()} on {platform.system()})")
 
 
+def _log_path_error(log_path: str | None) -> str | None:
+    """
+    Checks the --log path before anything is created or appended to it.
+
+    The log holds raw model replies, which text inside an image can steer, so a
+    misused --log (e.g. from a prompt-injected agent) must not append to shell
+    profiles, keys or source files. Only regular .log files are accepted.
+
+    Returns:
+        The error message, or None if the path is acceptable (or logging is off).
+    """
+
+    if log_path is None:
+        return None
+    path = Path(log_path)
+    if path.suffix.lower() != ".log":
+        return f"The log file '{log_path}' must end in .log"
+    if path.is_symlink():
+        return f"The log file '{log_path}' must not be a symlink"
+    if path.exists() and not path.is_file():
+        return f"The log file '{log_path}' must be a regular file"
+    return None
+
+
 def _warn(message: str) -> None:
     """Logs a warning and shows it on the console too, so it is seen with or without --log."""
 
@@ -1308,7 +1332,7 @@ if __name__ == "__main__":
         default=DEFAULT_TIMEOUT,
         help=f"seconds to wait for each model reply before the image fails (default {DEFAULT_TIMEOUT:g})",
     )
-    parser.add_argument("--log", help="enable logging and create log file (e.g., --log logs/run.log)")
+    parser.add_argument("--log", help="enable logging and append to this .log file (e.g., --log logs/run.log)")
     parser.add_argument(
         "--clear",
         action="store_true",
@@ -1321,6 +1345,10 @@ if __name__ == "__main__":
     # "✓" or many file names; print "?" for those instead of failing the image or the run.
     if isinstance(sys.stdout, io.TextIOWrapper):
         sys.stdout.reconfigure(errors="replace")
+
+    if log_error := _log_path_error(args.log):
+        print(f"Error: {log_error}.")
+        sys.exit(1)
 
     setup_logging(args.log)
 

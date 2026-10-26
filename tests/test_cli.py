@@ -74,6 +74,39 @@ class TestImgTaggerCli:
         assert result.returncode == 0
         assert log.parent.is_dir()
 
+    @pytest.mark.parametrize("name", ["notes.txt", ".bashrc", "authorized_keys", "run.log.py"])
+    def test_rejects_log_without_log_suffix(self, tmp_path, name):
+        log = tmp_path / "logs" / name
+        result = run("img_tagger.py", str(tmp_path), "--log", str(log))
+        assert result.returncode == 1
+        assert "must end in .log" in result.stdout
+        assert not log.parent.exists()
+
+    @pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges on Windows")
+    def test_rejects_symlinked_log(self, tmp_path):
+        target = tmp_path / "profile"
+        target.write_text("original\n", encoding="utf-8")
+        log = tmp_path / "run.log"
+        log.symlink_to(target)
+        result = run("img_tagger.py", str(tmp_path), "--log", str(log))
+        assert result.returncode == 1
+        assert "must not be a symlink" in result.stdout
+        assert target.read_text(encoding="utf-8") == "original\n"
+
+    def test_rejects_non_regular_log(self, tmp_path):
+        log = tmp_path / "dir.log"
+        log.mkdir()
+        result = run("img_tagger.py", str(tmp_path), "--log", str(log))
+        assert result.returncode == 1
+        assert "must be a regular file" in result.stdout
+
+    def test_appends_to_existing_uppercase_log(self, tmp_path):
+        log = tmp_path / "RUN.LOG"
+        log.write_text("earlier run\n", encoding="utf-8")
+        result = run("img_tagger.py", str(tmp_path), "--log", str(log))
+        assert result.returncode == 0
+        assert log.read_text(encoding="utf-8").startswith("earlier run\n")
+
     # Port 9 (discard) refuses connections, so tagging fails fast without a model server.
     DEAD_HOST = "http://127.0.0.1:9"
 
