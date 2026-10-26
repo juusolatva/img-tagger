@@ -194,8 +194,9 @@ def test_leaf_substitution_between_parent_open_and_read_is_rejected(tmp_path, mo
 @pytest.mark.skipif(os.name == "nt", reason="POSIX UID ownership checks")
 def test_unmapped_owner_is_not_trusted_as_namespace_root_owner():
     unknown_uid = max(os.geteuid(), 65534) + 1
+    info = SimpleNamespace(st_uid=unknown_uid, st_mode=stat.S_IFDIR | 0o755)
     with pytest.raises(img_tagger._UnsafeImagePath, match="belong"):
-        img_tagger._check_directory(SimpleNamespace(st_uid=unknown_uid, st_mode=stat.S_IFDIR | 0o755))
+        img_tagger._check_directory(info)
 
 
 def test_windows_reparse_attribute_is_rejected(tmp_path, monkeypatch):
