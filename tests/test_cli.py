@@ -280,3 +280,10 @@ def test_log_stream_tolerates_undecodable_file_names(tmp_path):
     finally:
         stream.close()
     assert log.read_text(encoding="utf-8") == r"Processing caf\udce9.jpg" + "\n"  # escaped, not dropped
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_new_log_is_private(tmp_path):
+    log = tmp_path / "run.log"
+    img_tagger._open_log(log).close()
+    assert log.stat().st_mode & 0o077 == 0

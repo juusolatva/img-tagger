@@ -136,7 +136,8 @@ class TestModelImage:
         sent, _ = img_tagger._model_image(path.read_bytes())
         assert b"secret description" not in sent
         assert img_tagger.PROCESSED_MARKER.encode() not in sent
-        assert b"Exif" not in sent and b"xmp" not in sent.lower()
+        assert b"Exif" not in sent
+        assert b"xmp" not in sent.lower()
 
     def test_transparency_is_kept_as_png(self, tmp_path):
         path = tmp_path / "alpha.webp"
@@ -144,6 +145,18 @@ class TestModelImage:
         sent, mime = model_image(path.read_bytes())
         assert (mime, sent.format, sent.mode) == ("image/png", "PNG", "RGBA")
         assert sent.width * sent.height <= 1_000_000
+
+    @pytest.mark.parametrize(("mode", "color"), [("RGB", (255, 0, 0)), ("L", 255)])
+    def test_png_transparent_colour_is_kept_as_alpha(self, tmp_path, mode, color):
+        path = tmp_path / f"trns-{mode}.png"
+        image = Image.new(mode, (2000, 1000), color)
+        image.paste(0, (0, 0, 1000, 1000))  # left half in the transparent colour
+        image.save(path, format="PNG", transparency=0 if mode == "L" else (0, 0, 0))
+        sent, mime = model_image(path.read_bytes())
+        assert mime == "image/png"
+        assert sent.mode == "RGBA"
+        assert sent.getpixel((10, 10))[3] == 0  # transparent area stays transparent
+        assert sent.getpixel((sent.width - 10, 10))[3] == 255
 
     def test_opaque_webp_becomes_jpeg(self, tmp_path):
         source = make_image(tmp_path / "a.webp", size=(1500, 1000)).read_bytes()
@@ -156,7 +169,10 @@ class TestModelImage:
         sent, _ = model_image(path.read_bytes())
         assert not getattr(sent, "is_animated", False)
         red, green, blue = sent.convert("RGB").getpixel((0, 0))
-        assert red > 240 and green < 16 and blue < 16  # the red first frame (JPEG may shift it slightly)
+        # the red first frame (JPEG may shift it slightly)
+        assert red > 240
+        assert green < 16
+        assert blue < 16
 
     def test_sixteen_bit_png_keeps_its_brightness(self, tmp_path):
         path = tmp_path / "deep.png"

@@ -127,7 +127,7 @@ def _open_log(path: Path) -> TextIO:
     else:
         # O_NONBLOCK: opening a FIFO fails (ENXIO) instead of waiting for a reader
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
-        fd = os.open(path, flags, 0o666)
+        fd = os.open(path, flags, 0o600)  # private: the log holds raw model replies and file paths
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & _Win.ATTRIBUTE_REPARSE_POINT:
@@ -1023,7 +1023,8 @@ def _scaled_image(source: bytes, max_megapixels: float) -> tuple[bytes, str]:
 
     if frame.mode in {"I;16", "I;16B", "I;16L"}:
         frame = frame.convert("I").point(lambda value: value / 256).convert("L")  # 16-bit PNG: keep the range
-    alpha = frame.mode in {"RGBA", "LA", "PA"} or (frame.mode == "P" and "transparency" in frame.info)
+    # "transparency" covers palette images and RGB/grayscale PNGs with a transparent colour (tRNS)
+    alpha = frame.mode in {"RGBA", "LA", "PA"} or "transparency" in frame.info
     frame = frame.convert("RGBA" if alpha else "RGB")
     if frame.width * frame.height > budget:
         scale = math.sqrt(budget / (frame.width * frame.height))

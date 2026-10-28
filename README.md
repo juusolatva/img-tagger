@@ -191,7 +191,7 @@ python img_tagger.py "C:\Users\you\Pictures\My memes"
 | `--workers` | `1` | How many images to process at the same time, from 1 to 4. |
 | `--timeout` | `600` | Seconds to wait for the model's answer to one image, including loading the model, before that image is marked failed. Must be a positive number. Raise it for slow hardware. |
 | `--max-pixels` | `1` | Largest size, in megapixels, of the copy sent to the model; bigger images are scaled down (keeping their shape) before sending. `0` sends the original file. Your files are never changed. See [Choosing a model and performance](#choosing-a-model-and-performance). |
-| `--log` | off | Append a detailed log to this file, e.g. `--log logs/run.log`. Missing folders are created; a relative path is relative to the current directory. The name must end in `.log` (any letter case), and an existing path must be a regular file of yours, not a symlink, folder or someone else's file. The file is opened once and kept open, so it can't be swapped for a link during the run. |
+| `--log` | off | Append a detailed log to this file, e.g. `--log logs/run.log`. Missing folders are created; a relative path is relative to the current directory. The name must end in `.log` (any letter case), and an existing path must be a regular file of yours, not a symlink, folder or someone else's file. The file is opened once and kept open, so it can't be swapped for a link during the run. On Linux and macOS a new log is readable only by you. |
 | `--clear` | off | Remove metadata from the images instead of tagging them. See [Clearing tags](#clearing-tags). |
 | `-h`, `--help` | | Show the options and exit. |
 
