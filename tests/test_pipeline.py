@@ -457,6 +457,50 @@ class TestListenForQuitCbreak:
         assert attrs() == original
 
 
+class TestListenForQuitWindows:
+    """The msvcrt console polling, driven by a fake msvcrt (real console input can't be scripted)."""
+
+    class FakeMsvcrt:
+        def __init__(self, keys):
+            self.keys = list(keys)
+
+        def kbhit(self):
+            return bool(self.keys)
+
+        def getch(self):
+            return self.keys.pop(0)
+
+    def run(self, monkeypatch, keys, event=None):
+        fake = self.FakeMsvcrt(keys)
+        monkeypatch.setattr(img_tagger.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(img_tagger, "msvcrt", fake)
+        event = event or threading.Event()
+        thread = threading.Thread(target=img_tagger.listen_for_quit, args=(event,), daemon=True)
+        thread.start()
+        return event, thread, fake
+
+    @pytest.mark.parametrize("key", [b"q", b"Q"])
+    def test_q_sets_stop_event(self, monkeypatch, key):
+        event, thread, fake = self.run(monkeypatch, [b"x", b"\xe0", key])
+        assert event.wait(timeout=3)
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+        assert fake.keys == []
+
+    def test_other_keys_are_ignored_until_stopped_externally(self, monkeypatch):
+        event, thread, fake = self.run(monkeypatch, [b"a", b"b"])
+        assert not event.wait(timeout=0.3)
+        assert thread.is_alive()
+        assert fake.keys == []
+        event.set()
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+
+    def test_missing_msvcrt_returns_immediately(self, monkeypatch):
+        monkeypatch.setattr(img_tagger, "msvcrt", None)
+        img_tagger._wait_for_quit_windows(threading.Event())
+
+
 class TestClearDirectory:
     def test_clear_directory_removes_tags(self, tmp_path, capsys):
         top_jpg = make_image(tmp_path / "a.jpg")
