@@ -67,8 +67,14 @@ DEFAULT_MIME_TYPE = "image/jpeg"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 # Pillow formats tag_image() can write (GIFs get a comment, the rest EXIF/XMP via pyexiv2)
 TAGGABLE_FORMATS = {"JPEG", "WEBP", "PNG", "GIF"}
+# Formats tagged and cleared through pyexiv2 (EXIF/XMP); GIFs get a comment instead
+PYEXIV2_FORMATS = TAGGABLE_FORMATS - {"GIF"}
+MIME_TYPES = {"JPEG": DEFAULT_MIME_TYPE, "PNG": "image/png", "WEBP": "image/webp", "GIF": "image/gif"}
 # Seconds to wait for one model reply; covers model loading and slow (thinking/CPU) generation.
 DEFAULT_TIMEOUT = 600.0
+# Ollama naming; LM Studio ids differ (e.g. qwen/qwen3-vl-8b), so pass --model there
+DEFAULT_MODEL = "qwen3-vl:8b"
+DEFAULT_HOSTS = {"ollama": "http://localhost:11434", "lm-studio": "http://localhost:1234"}
 
 DEFAULT_PROMPT = (
     "Analyze this image, which could be an internet meme, screenshot, artwork, or photograph. "
@@ -699,6 +705,12 @@ def _sanitize_with_pillow(src, dst, fmt=None) -> None:
         )
 
 
+def _is_corrupt_metadata_error(error: RuntimeError) -> bool:
+    """Tells whether a pyexiv2 error means broken metadata that a Pillow re-save can repair."""
+
+    return "IFD" in str(error).upper() or "corrupt" in str(error).lower()
+
+
 def _modify_with_pyexiv2(output: BinaryIO, edit: Callable[[Any], None]) -> None:
     """
     Applies edit() to a file's metadata with pyexiv2 and saves the result in place.
@@ -754,7 +766,7 @@ def write_metadata(image_path: str, tags_list: list[str]) -> None:
 
             except RuntimeError as e:
                 # Auto-healing fallback for corrupted EXIF data (IFD buffer errors)
-                if "IFD" in str(e).upper() or "corrupt" in str(e).lower():
+                if _is_corrupt_metadata_error(e):
                     _warn(
                         f"Corrupted metadata in {Path(image_path).name} ({e}); "
                         "re-saving it with Pillow before tagging (JPEG/WebP are re-encoded)"
@@ -844,9 +856,9 @@ def tag_image(image_path: str, tags_list: list[str], fmt: str | None = None) -> 
         raise RuntimeError(f"Could not determine format for {image_path}")
 
     try:
-        if fmt.lower() in ["jpg", "jpeg", "webp", "png"]:
+        if fmt in PYEXIV2_FORMATS:
             write_metadata(image_path, tags_list)
-        elif fmt.lower() == "gif":
+        elif fmt == "GIF":
             write_gif_tags(image_path, tags_list)
         else:
             raise ValueError(f"Unsupported file format: {fmt}")
@@ -873,7 +885,7 @@ def _clear_standard(source: bytes, output: BinaryIO, fmt: str | None = None) -> 
             _modify_with_pyexiv2(output, _clear_all)
         return "Cleared metadata (pyexiv2)"
     except RuntimeError as error:
-        if "IFD" not in str(error).upper() and "corrupt" not in str(error).lower():
+        if not _is_corrupt_metadata_error(error):
             raise
         logger.warning(f"Corrupted metadata ({error}); sanitizing image snapshot before clearing")
         output.seek(0)
@@ -960,14 +972,7 @@ def get_tags_lm_studio(client: Any, model: str, img_path: Path, prompt: str) -> 
     fmt = get_image_format(source)
     if fmt is None:
         logger.error(f"Pillow could not determine the format for {img_path}")
-    mime_map = {
-        "jpeg": DEFAULT_MIME_TYPE,
-        "jpg": DEFAULT_MIME_TYPE,
-        "png": "image/png",
-        "webp": "image/webp",
-        "gif": "image/gif",
-    }
-    mime_type = mime_map.get((fmt or "").lower(), DEFAULT_MIME_TYPE)
+    mime_type = MIME_TYPES.get(fmt or "", DEFAULT_MIME_TYPE)
 
     base64_image = base64.b64encode(source).decode("utf-8")
 
@@ -1473,8 +1478,8 @@ def process_directory(
     directory: str,
     recursive: bool = False,
     backend: str = "ollama",
-    host: str = "http://localhost:11434",
-    model: str = "qwen3-vl:8b",
+    host: str | None = None,
+    model: str = DEFAULT_MODEL,
     max_workers: int = 1,
     clear: bool = False,
     timeout: float = DEFAULT_TIMEOUT,
@@ -1490,9 +1495,9 @@ def process_directory(
         directory: The root directory to scan for images.
         recursive: Whether to include subdirectories in the search.
         backend: The model provider backend ('ollama' or 'lm-studio').
-        host: The endpoint URL for the chosen backend.
+        host: The endpoint URL for the chosen backend; defaults to its localhost URL (DEFAULT_HOSTS).
         model: The specific model name/ID to use.
-        max_workers: The maximum number of concurrent threads (limited to 4).
+        max_workers: The maximum number of concurrent threads (the CLI allows 1-4).
         clear: If True, clears metadata and comments instead of tagging.
         timeout: Seconds to wait for each model reply before that image fails.
     """
@@ -1506,6 +1511,7 @@ def process_directory(
         print(f"No valid images found in '{directory}'.")
         return
 
+    host = host or DEFAULT_HOSTS[backend]
     print(f"Initialized backend: {backend} | Target: {host}")
     print(f"Found {len(image_files)} images to process. Starting...\n")
     logger.info(
@@ -1546,7 +1552,9 @@ def process_directory(
     )
 
 
-if __name__ == "__main__":
+def _build_parser() -> argparse.ArgumentParser:
+    """Builds the command-line parser."""
+
     parser = argparse.ArgumentParser(description="Image tagger using a vision-language model")
     parser.add_argument("directory", help="Path to your image folder")
     parser.add_argument(
@@ -1564,8 +1572,8 @@ if __name__ == "__main__":
     parser.add_argument("--host", help="backend endpoint URL (localhost by default)")
     parser.add_argument(
         "--model",
-        default="qwen3-vl:8b",
-        help="model identification tag (defaults to qwen3-vl:8b)",
+        default=DEFAULT_MODEL,
+        help=f"model identification tag (defaults to {DEFAULT_MODEL})",
     )
     parser.add_argument(
         "--workers",
@@ -1585,8 +1593,34 @@ if __name__ == "__main__":
         action="store_true",
         help="clear metadata (EXIF/XMP/IPTC) and comments from images instead of tagging",
     )
+    return parser
 
-    args = parser.parse_args()
+
+def _argument_error(args: argparse.Namespace) -> str | None:
+    """Returns the message for the first invalid argument, or None if they are all valid."""
+
+    if not Path(args.directory).is_dir():
+        return f"The folder '{args.directory}' could not be located."
+    # Max 4 workers as it's the default limit for both ollama and LM Studio.
+    if not 1 <= args.workers <= 4:
+        return f"Workers must be between 1 and 4, got {args.workers}"
+    if math.isnan(args.timeout) or args.timeout <= 0:
+        return f"Timeout must be a positive number of seconds, got {args.timeout:g}"
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    """
+    Runs the command-line interface.
+
+    Args:
+        argv: The arguments without the program name; defaults to sys.argv[1:].
+
+    Returns:
+        The exit code: 0, or 1 for invalid arguments.
+    """
+
+    args = _build_parser().parse_args(argv)
 
     # Redirected output on Windows uses the ANSI code page (e.g. cp1252), which can't encode
     # "✓" or many file names; print "?" for those instead of failing the image or the run.
@@ -1595,25 +1629,13 @@ if __name__ == "__main__":
 
     if log_error := _log_path_error(args.log):
         print(f"Error: {log_error}.")
-        sys.exit(1)
+        return 1
 
     setup_logging(args.log)
 
-    if not Path(args.directory).is_dir():
-        print(f"Error: The folder '{args.directory}' could not be located.")
-        sys.exit(1)
-
-    # Max 4 workers as it's the default limit for both ollama and LM Studio.
-    if not 1 <= args.workers <= 4:
-        print(f"Error: Workers must be between 1 and 4, got {args.workers}")
-        sys.exit(1)
-
-    if math.isnan(args.timeout) or args.timeout <= 0:
-        print(f"Error: Timeout must be a positive number of seconds, got {args.timeout:g}")
-        sys.exit(1)
-
-    if not args.host:
-        args.host = "http://localhost:11434" if args.backend == "ollama" else "http://localhost:1234"
+    if error := _argument_error(args):
+        print(f"Error: {error}")
+        return 1
 
     process_directory(
         args.directory,
@@ -1625,3 +1647,8 @@ if __name__ == "__main__":
         clear=args.clear,
         timeout=args.timeout,
     )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,4 +1,4 @@
-"""End-to-end CLI tests that run the scripts as subprocesses (no model server needed)."""
+"""CLI tests: main() in-process for argument handling, subprocesses for end-to-end runs (no model server needed)."""
 
 import os
 import subprocess
@@ -25,6 +25,82 @@ def run(script: str, *args: str, env: dict[str, str] | None = None) -> subproces
     )
 
 
+def call_main(capsys, *args: str) -> tuple[int, str]:
+    """Runs main() in-process; returns (exit code, stdout)."""
+    code = img_tagger.main(list(args))
+    return code, capsys.readouterr().out
+
+
+class TestMain:
+    """Argument handling through main(); none of these reach setup_logging()."""
+
+    def test_missing_directory(self, capsys, tmp_path):
+        code, out = call_main(capsys, str(tmp_path / "nope"))
+        assert code == 1
+        assert "could not be located" in out
+
+    @pytest.mark.parametrize("workers", ["0", "5", "-1"])
+    def test_rejects_out_of_range_workers(self, capsys, tmp_path, workers):
+        code, out = call_main(capsys, str(tmp_path), "--workers", workers)
+        assert code == 1
+        assert "Workers must be between 1 and 4" in out
+
+    @pytest.mark.parametrize("timeout", ["0", "-5", "nan"])
+    def test_rejects_non_positive_timeout(self, capsys, tmp_path, timeout):
+        code, out = call_main(capsys, str(tmp_path), "--timeout", timeout)
+        assert code == 1
+        assert "Timeout must be a positive number" in out
+
+    def test_rejects_unknown_backend(self, capsys, tmp_path):
+        with pytest.raises(SystemExit) as exit_info:
+            img_tagger.main([str(tmp_path), "--backend", "bogus"])
+        assert exit_info.value.code == 2
+        assert "invalid choice" in capsys.readouterr().err
+
+    def test_empty_directory_exits_cleanly(self, capsys, tmp_path):
+        code, out = call_main(capsys, str(tmp_path))
+        assert code == 0
+        assert "No valid images found" in out
+
+    @pytest.mark.parametrize("name", ["notes.txt", ".bashrc", "authorized_keys", "run.log.py"])
+    def test_rejects_log_without_log_suffix(self, capsys, tmp_path, name):
+        log = tmp_path / "logs" / name
+        code, out = call_main(capsys, str(tmp_path), "--log", str(log))
+        assert code == 1
+        assert "must end in .log" in out
+        assert not log.parent.exists()
+
+    @pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges on Windows")
+    def test_rejects_symlinked_log(self, capsys, tmp_path):
+        target = tmp_path / "profile"
+        target.write_text("original\n", encoding="utf-8")
+        log = tmp_path / "run.log"
+        log.symlink_to(target)
+        code, out = call_main(capsys, str(tmp_path), "--log", str(log))
+        assert code == 1
+        assert "must not be a symlink" in out
+        assert target.read_text(encoding="utf-8") == "original\n"
+
+    def test_rejects_non_regular_log(self, capsys, tmp_path):
+        log = tmp_path / "dir.log"
+        log.mkdir()
+        code, out = call_main(capsys, str(tmp_path), "--log", str(log))
+        assert code == 1
+        assert "must be a regular file" in out
+
+    def test_lm_studio_without_host_uses_its_own_default(self, tmp_path, monkeypatch):
+        make_image(tmp_path / "a.png")
+        hosts = []
+
+        def no_client(backend, host, timeout):
+            hosts.append(host)
+
+        monkeypatch.setattr(img_tagger, "_create_client", no_client)
+        assert img_tagger.main([str(tmp_path), "--backend", "lm-studio"]) == 0
+        img_tagger.process_directory(str(tmp_path), backend="lm-studio")
+        assert hosts == [img_tagger.DEFAULT_HOSTS["lm-studio"]] * 2
+
+
 class TestImgTaggerCli:
     def test_help(self):
         result = run("img_tagger.py", "--help")
@@ -41,64 +117,11 @@ class TestImgTaggerCli:
         ]:
             assert flag in result.stdout
 
-    def test_missing_directory(self, tmp_path):
-        result = run("img_tagger.py", str(tmp_path / "nope"))
-        assert result.returncode == 1
-        assert "could not be located" in result.stdout
-
-    @pytest.mark.parametrize("workers", ["0", "5", "-1"])
-    def test_rejects_out_of_range_workers(self, tmp_path, workers):
-        result = run("img_tagger.py", str(tmp_path), "--workers", workers)
-        assert result.returncode == 1
-        assert "Workers must be between 1 and 4" in result.stdout
-
-    @pytest.mark.parametrize("timeout", ["0", "-5", "nan"])
-    def test_rejects_non_positive_timeout(self, tmp_path, timeout):
-        result = run("img_tagger.py", str(tmp_path), "--timeout", timeout)
-        assert result.returncode == 1
-        assert "Timeout must be a positive number" in result.stdout
-
-    def test_rejects_unknown_backend(self, tmp_path):
-        result = run("img_tagger.py", str(tmp_path), "--backend", "bogus")
-        assert result.returncode == 2
-        assert "invalid choice" in result.stderr
-
-    def test_empty_directory_exits_cleanly(self, tmp_path):
-        result = run("img_tagger.py", str(tmp_path))
-        assert result.returncode == 0
-        assert "No valid images found" in result.stdout
-
     def test_log_file_created(self, tmp_path):
         log = tmp_path / "logs" / "run.log"
         result = run("img_tagger.py", str(tmp_path), "--log", str(log))
         assert result.returncode == 0
         assert log.parent.is_dir()
-
-    @pytest.mark.parametrize("name", ["notes.txt", ".bashrc", "authorized_keys", "run.log.py"])
-    def test_rejects_log_without_log_suffix(self, tmp_path, name):
-        log = tmp_path / "logs" / name
-        result = run("img_tagger.py", str(tmp_path), "--log", str(log))
-        assert result.returncode == 1
-        assert "must end in .log" in result.stdout
-        assert not log.parent.exists()
-
-    @pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges on Windows")
-    def test_rejects_symlinked_log(self, tmp_path):
-        target = tmp_path / "profile"
-        target.write_text("original\n", encoding="utf-8")
-        log = tmp_path / "run.log"
-        log.symlink_to(target)
-        result = run("img_tagger.py", str(tmp_path), "--log", str(log))
-        assert result.returncode == 1
-        assert "must not be a symlink" in result.stdout
-        assert target.read_text(encoding="utf-8") == "original\n"
-
-    def test_rejects_non_regular_log(self, tmp_path):
-        log = tmp_path / "dir.log"
-        log.mkdir()
-        result = run("img_tagger.py", str(tmp_path), "--log", str(log))
-        assert result.returncode == 1
-        assert "must be a regular file" in result.stdout
 
     def test_appends_to_existing_uppercase_log(self, tmp_path):
         log = tmp_path / "RUN.LOG"
