@@ -52,7 +52,7 @@ The tags are standard EXIF and XMP fields (a comment for GIFs), so they stay wit
 
 `pyexiv2` ships with the exiv2 library built in, so you **don't need exiftool or a separate exiv2 install**. Both backend libraries are installed, but only the one for the backend you use is needed at run time.
 
-It has been run on Windows 11 and is tested on Linux in CI. It has not been tried on macOS.
+It has been run on Windows 11 and is tested on Linux and Windows in CI. It has not been tried on macOS.
 
 
 ---
@@ -297,9 +297,9 @@ IPTC keywords are not updated, so apps that read IPTC keywords may still show th
 - **JPEG, WebP and PNG**: only the metadata is edited; the image data is not re-encoded. Animated WebPs keep their frames, frame durations and loop count.
 - **GIF**: the whole file is re-encoded through Pillow. Each frame keeps its duration (100 ms if it had none) and the loop setting is kept (a GIF that plays once still plays once). Consecutive identical frames are merged into one frame with their combined duration, so playback looks the same. Pillow keeps all of a GIF's frames in memory while writing it, so a very large animated GIF can need a lot of RAM. See [Known issues](#known-issues-and-limitations) for the side effects.
 - Each image is read through guarded file access. Output is written to an open temporary `tmpXXXX.tmp` file **in the same folder**, edited through that file handle and then moved over the original. If the original is locked (e.g. open in another program), the move is retried up to 10 times, half a second apart. The temporary file is removed afterwards.
-- File mode permissions are kept. Linux extended attributes and POSIX ACLs are preserved through the opened file handles; inherited temporary-file ACL grants are removed. Timestamps are not copied.
+- File mode permissions are kept. Linux extended attributes and POSIX ACLs are preserved through the opened file handles; inherited temporary-file ACL grants are removed. On Windows the image's NTFS permissions (its DACL, including whether it inherits from the folder) are given to the temporary file when it is created, before anything is written to it, and the read-only attribute is kept. Timestamps are not copied, and on Windows the file's owner becomes your account.
 - On POSIX, parent directories are opened without following symlinks, and replacement uses pinned directory descriptors. This protects against other-user directory substitution subject to the directory ownership/write restrictions above; it does not isolate another process running as your own account or root.
-- **Windows protection gap:** existing symlinks, junctions and other reparse points are refused, and temporary writes use an open file handle. Windows still uses pathname checks and closes the temporary handle before replacement, so concurrent file/parent-directory substitution is not fully prevented. NTFS ACL preservation is not implemented. Keep image folders private. These changes have not been tested on Windows.
+- On Windows, every folder above an image is held open while the image is read or written, so it can't be renamed or swapped for a junction meanwhile (while that happens, renaming those folders fails with "in use"). Symlinks, junctions and other reparse points are refused. Nobody else can open the temporary file, and it replaces the original through its open handle. Tested on local NTFS drives only; see [Known issues](#known-issues-and-limitations) for USB sticks and network folders.
 
 ### Repairing corrupted metadata
 
@@ -426,7 +426,7 @@ Good to know:
 - Keys you type during a run are used by the quit listener: on Windows they're consumed, and on Linux and macOS they're not echoed until the run ends.
 - `Q` is not available with `--clear`.
 - On Linux and macOS, when input isn't a terminal (e.g. it's piped in), a `q` in the input stops the run. If the input is empty (`</dev/null`), `Q` isn't available.
-- On Windows, `Q` has no automated tests yet. If it doesn't react, closing the terminal window stops the run; an image being written at that moment may leave a `tmpXXXX.tmp` file in its folder, which you can delete.
+- On Windows, `Q` is only tested against a simulated console. If it doesn't react, closing the terminal window stops the run; an image being written at that moment may leave a `tmpXXXX.tmp` file in its folder, which you can delete.
 - **Ctrl+C does not stop a run cleanly.** The images already queued keep being tagged, and you end up with a traceback and no report. Use `Q` instead.
 
 
@@ -521,7 +521,7 @@ A file whose metadata had to be repaired shows `Sanitized and cleared (Pillow) f
 - The file has a `.jpg`, `.jpeg`, `.png`, `.webp` or `.gif` extension, but its real format is something else. For MPO see [Known issues](#known-issues-and-limitations); otherwise convert the file to a supported format.
 
 **`[WinError 5] Access is denied: '...\tmpXXXX.tmp'`** or **`Failed to replace ... after retries.`** on Windows
-- The image is read-only, or another program kept it locked for the 5 seconds img tagger waited. Clear the read-only attribute or close the other program and run again. Replacement or cleanup may leave a read-only `tmpXXXX.tmp`; clear its read-only attribute before deleting it (or use `del /f`). The updated Windows file-handling behavior needs verification on Windows.
+- Another program kept the image locked for the 5 seconds img tagger waited. Close the other program and run again. Read-only images are replaced (and stay read-only) on NTFS; on other drives (FAT32/exFAT, some network shares) a read-only image can fail this way, so clear its read-only attribute first.
 
 **`Error: The folder '<folder>' could not be located.`**
 - Check the path. On Windows, quote paths that contain spaces and don't use `~` (see [Examples](#examples)).
@@ -545,7 +545,7 @@ A file whose metadata had to be repaired shows `Sanitized and cleared (Pillow) f
 - **IPTC keywords** are left as they are, and existing XMP keywords are replaced. See [What happens to existing metadata](#what-happens-to-existing-metadata).
 - **No forced re-tagging**: tagged images are always skipped. See [Already tagged images are skipped](#already-tagged-images-are-skipped).
 - **MPO JPEGs are not supported**: JPEGs that hold several embedded images (some cameras and phones save these) are reported by Pillow as `MPO` and fail with `Unsupported file format: MPO`, without contacting the model.
-- **Read-only files on Windows** may fail during replacement or cleanup after the model has already been asked, possibly leaving a read-only temporary file. The updated file-handling behavior has not been verified on Windows.
+- **Windows USB sticks and network folders are untested**: the Windows file handling (copying the image's permissions, replacing it through the open file handle) has only been tried on local NTFS drives. FAT32/exFAT drives and network shares handle permissions and renames differently; if they behave unexpectedly, every image there may fail with a permissions or replace error, so try a few copies first.
 - **No upfront server check**: if the server is down or the model is wrong, every image fails separately.
 - **Ctrl+C** doesn't stop a run cleanly. Use `Q`.
 
@@ -571,7 +571,7 @@ ruff check .
 ruff format --check .
 ```
 
-On Windows, the tests for the Linux/macOS quit listener and file permissions are skipped, and the Windows quit listener has no automated tests.
+On Windows, the tests for the Linux/macOS quit listener and file permissions are skipped; the Windows file-safety tests (folder pins, junctions, NTFS permissions, read-only files) run instead, and the Windows quit listener is tested with a simulated console.
 
 ### Integration tests
 
