@@ -244,6 +244,7 @@ class _Win:
     GENERIC_WRITE = 0x40000000
     DELETE = 0x00010000
     READ_CONTROL = 0x00020000
+    FILE_LIST_DIRECTORY = 0x0001
     FILE_TRAVERSE = 0x0020
     FILE_READ_ATTRIBUTES = 0x0080
     SHARE_READ_WRITE = 0x1 | 0x2
@@ -256,6 +257,7 @@ class _Win:
     SE_FILE_OBJECT = 1
     DACL_SECURITY_INFORMATION = 0x4
     SE_DACL_PROTECTED = 0x1000
+    FILE_PERSISTENT_ACLS = 0x8
     FILE_RENAME_INFO = 3
     FILE_DISPOSITION_INFO = 4
     FILE_RENAME_INFO_EX = 22
@@ -285,6 +287,16 @@ if os.name == "nt":
     _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     _kernel32.LocalFree.argtypes = [wintypes.LPVOID]
     _kernel32.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    _kernel32.GetVolumeInformationByHandleW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
     _advapi32.GetSecurityInfo.restype = wintypes.DWORD
     _advapi32.GetSecurityInfo.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, *[wintypes.LPVOID] * 5]
     _advapi32.GetSecurityDescriptorLength.restype = wintypes.DWORD
@@ -325,11 +337,23 @@ def _win_open(
 def _pin_windows_directory(path: Path) -> int:
     """
     Hold a directory open without delete sharing, so nobody can rename it or swap in a junction
-    while the handle is open. Traverse access matters: Windows ignores the share mode of handles
-    that only read attributes.
+    while the handle is open. A data right (traverse, else list) matters: Windows ignores the
+    share mode of handles that only read attributes. A folder granting neither (reached through
+    the "bypass traverse checking" privilege) is only checked for reparse points, not pinned.
     """
-    access = _Win.FILE_TRAVERSE | _Win.FILE_READ_ATTRIBUTES
-    fd = _win_open(path, access, _Win.SHARE_READ_WRITE, _Win.OPEN_EXISTING, _Win.FLAG_BACKUP_SEMANTICS)
+    for access in (_Win.FILE_TRAVERSE, _Win.FILE_LIST_DIRECTORY, 0):
+        try:
+            fd = _win_open(
+                path,
+                access | _Win.FILE_READ_ATTRIBUTES,
+                _Win.SHARE_READ_WRITE,
+                _Win.OPEN_EXISTING,
+                _Win.FLAG_BACKUP_SEMANTICS,
+            )
+            break
+        except PermissionError:
+            if not access:
+                raise
     info = os.fstat(fd)
     if info.st_file_attributes & _Win.ATTRIBUTE_REPARSE_POINT or not stat.S_ISDIR(info.st_mode):
         os.close(fd)
@@ -351,6 +375,15 @@ def _windows_security(fd: int) -> bytes:
         return ctypes.string_at(descriptor, _advapi32.GetSecurityDescriptorLength(descriptor))
     finally:
         _kernel32.LocalFree(descriptor)
+
+
+def _windows_persistent_acls(fd: int) -> bool:
+    """Tell whether the file's volume stores ACLs (FILE_PERSISTENT_ACLS; false on FAT32/exFAT)."""
+    flags = wintypes.DWORD()
+    handle = msvcrt.get_osfhandle(fd)
+    if not _kernel32.GetVolumeInformationByHandleW(handle, None, 0, None, None, ctypes.byref(flags), None, 0):
+        raise _win_error(ctypes.get_last_error())
+    return bool(flags.value & _Win.FILE_PERSISTENT_ACLS)
 
 
 def _windows_dacl(security: bytes) -> tuple[bytes | None, bool]:
@@ -385,15 +418,21 @@ def _create_windows_temp(path: Path, security: bytes | None) -> int:
             if _windows_dacl(_windows_security(fd)) != _windows_dacl(security):
                 raise _UnsafeImagePath("Could not give the temporary file the image's permissions")
         except BaseException:
-            _discard_windows_temp(fd)
+            _discard_windows_temp(fd, path)
             os.close(fd)
             raise
     return fd
 
 
-def _discard_windows_temp(fd: int) -> None:
-    """Delete an uncommitted temporary through its handle (on close), even if it was made read-only."""
+def _discard_windows_temp(fd: int, temporary: Path) -> None:
+    """
+    Delete an uncommitted temporary through its handle (on close), even if it was made read-only.
+    Does nothing once the handle no longer sits at the temporary's name: after a completed rename
+    (e.g. Ctrl+C arriving right after it) the handle is the committed image.
+    """
     with contextlib.suppress(OSError):
+        if not os.path.samestat(os.fstat(fd), os.stat(temporary, follow_symlinks=False)):
+            return
         os.chmod(fd, stat.S_IREAD | stat.S_IWRITE)
         delete = wintypes.BOOLEAN(True)
         handle = msvcrt.get_osfhandle(fd)
@@ -409,20 +448,24 @@ def _rename_windows_handle(fd: int, target: Path) -> None:
     temporary's place before the rename. Replaces read-only targets where the filesystem allows
     (FileRenameInfoEx, NTFS on Windows 10 1809+); elsewhere falls back to a plain replace.
     """
-    name = str(target)
+    if not target.is_absolute():
+        raise ValueError(f"Rename target must be absolute, not resolved against the working directory: {target}")
+    # Sized in UTF-16 code units: characters outside the BMP (e.g. emoji) take two
+    name = str(target).encode("utf-16-le")
 
     class _RenameInfo(ctypes.Structure):
         _fields_ = [
             ("flags", wintypes.DWORD),  # a BOOLEAN ReplaceIfExists for FileRenameInfo
             ("root", wintypes.HANDLE),
             ("length", wintypes.DWORD),
-            ("name", wintypes.WCHAR * (len(name) + 1)),
+            ("name", ctypes.c_ubyte * (len(name) + 2)),  # WCHAR[] plus the terminating null
         ]
 
     handle = msvcrt.get_osfhandle(fd)
     error = 0
     for info_class, flags in ((_Win.FILE_RENAME_INFO_EX, _Win.RENAME_EX_FLAGS), (_Win.FILE_RENAME_INFO, 1)):
-        info = _RenameInfo(flags, None, len(name) * 2, name)
+        # Copied as raw bytes: c_char arrays stop at the first NUL, and UTF-16 has one in every ASCII character
+        info = _RenameInfo(flags, None, len(name), (ctypes.c_ubyte * (len(name) + 2)).from_buffer_copy(name + b"\0\0"))
         if _kernel32.SetFileInformationByHandle(handle, info_class, ctypes.byref(info), ctypes.sizeof(info)):
             return
         error = ctypes.get_last_error()
@@ -459,9 +502,12 @@ def _image_parent(path: Path) -> Generator[tuple[Path, int | None]]:
 
 
 def _file_attributes(fd: int) -> dict[str, bytes]:
-    """Capture extended attributes, including POSIX ACLs, or the Windows DACL, without reopening a pathname."""
+    """
+    Capture extended attributes, including POSIX ACLs, or the Windows DACL, without reopening a pathname.
+    Volumes that don't store ACLs (FAT32/exFAT) have no DACL to keep.
+    """
     if os.name == "nt":
-        return {_Win.SECURITY_KEY: _windows_security(fd)}
+        return {_Win.SECURITY_KEY: _windows_security(fd)} if _windows_persistent_acls(fd) else {}
     if not hasattr(os, "listxattr"):
         return {}
     try:
@@ -488,8 +534,13 @@ def _apply_permissions(output: BinaryIO, mode: int, attributes: dict[str, bytes]
     os.chmod(fd, stat.S_IMODE(mode))
 
 
-def _source_bytes(path: Path, parent_fd: int | None) -> tuple[bytes, os.stat_result, dict[str, bytes]]:
-    """Read only an opened regular file, rejecting leaf links before consuming bytes."""
+def _source_bytes(
+    path: Path, parent_fd: int | None, permissions: bool = False
+) -> tuple[bytes, os.stat_result, dict[str, bytes]]:
+    """
+    Read only an opened regular file, rejecting leaf links before consuming bytes. With permissions,
+    also capture its extended attributes/ACLs or DACL (only edits need them).
+    """
     if parent_fd is None:
         fd = _win_open(path, _Win.GENERIC_READ, _Win.SHARE_ALL, _Win.OPEN_EXISTING)
     else:
@@ -499,7 +550,7 @@ def _source_bytes(path: Path, parent_fd: int | None) -> tuple[bytes, os.stat_res
         info = os.fstat(source.fileno())
         if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & _Win.ATTRIBUTE_REPARSE_POINT:
             raise _UnsafeImagePath("Image input must be a regular file")
-        return source.read(), info, _file_attributes(source.fileno())
+        return source.read(), info, _file_attributes(source.fileno()) if permissions else {}
 
 
 def _read_image_bytes(path: Path | str) -> bytes:
@@ -525,7 +576,7 @@ def _check_replacement(path: Path, parent_fd: int | None, expected: os.stat_resu
 def _image_edit(image_path: Path | str) -> Generator[tuple[bytes, BinaryIO]]:
     """Keep source permissions, parent identity and temporary descriptor bound to an edit."""
     with _image_parent(Path(image_path)) as (path, parent_fd):
-        data, original, attributes = _source_bytes(path, parent_fd)
+        data, original, attributes = _source_bytes(path, parent_fd, permissions=True)
         fd, temporary = _create_image_temp(path.parent, parent_fd, attributes.get(_Win.SECURITY_KEY))
         expected = os.fstat(fd)
         try:
@@ -541,7 +592,7 @@ def _image_edit(image_path: Path | str) -> Generator[tuple[bytes, BinaryIO]]:
                     robust_replace(temporary, path, parent_fd=parent_fd, source_fd=source_fd)
                 except BaseException:
                     if parent_fd is None:
-                        _discard_windows_temp(output.fileno())
+                        _discard_windows_temp(output.fileno(), temporary)
                     raise
         finally:
             if parent_fd is not None:

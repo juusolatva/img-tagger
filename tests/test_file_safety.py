@@ -382,3 +382,76 @@ def test_direct_reads_allow_execute_only_ancestors(tmp_path):
         assert img_tagger.get_image_format(image) == "PNG"
     finally:
         ancestor.chmod(0o700)
+
+
+@windows_only
+def test_windows_interrupt_after_rename_keeps_committed_image(tmp_path, monkeypatch):
+    image = make_image(tmp_path / "a.png")
+    real_rename = img_tagger._rename_windows_handle
+
+    def rename_then_interrupt(fd, target):
+        real_rename(fd, target)
+        raise KeyboardInterrupt  # Ctrl+C landing right after the rename completed
+
+    monkeypatch.setattr(img_tagger, "_rename_windows_handle", rename_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        img_tagger.write_metadata(str(image), SAMPLE_TAGS)
+    assert img_tagger.is_already_processed(image)
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+@windows_only
+def test_windows_non_bmp_path_is_renamed_exactly(tmp_path):
+    folder = tmp_path / "Trip \U0001f600\U0001f30d"
+    folder.mkdir()
+    image = make_image(folder / "a\U0001f600.jpg")
+    img_tagger.tag_image(str(image), SAMPLE_TAGS)
+    assert img_tagger.is_already_processed(image)
+    assert sorted(p.name for p in folder.iterdir()) == [image.name]
+
+
+@windows_only
+@pytest.mark.parametrize("denied", [{0x20}, {0x20, 0x01}])
+def test_windows_folder_without_traverse_right_still_works(tmp_path, monkeypatch, denied):
+    folder = tmp_path / "list-only"
+    folder.mkdir()
+    image = make_image(folder / "a.png")
+    real_open = img_tagger._win_open
+    granted = []
+
+    def restricted(path, access, *args, **kwargs):
+        if path == folder and any(access & right for right in denied):
+            raise PermissionError(13, "Access is denied", str(path))
+        if path == folder:
+            granted.append(access)
+        return real_open(path, access, *args, **kwargs)
+
+    monkeypatch.setattr(img_tagger, "_win_open", restricted)
+    img_tagger.tag_image(str(image), SAMPLE_TAGS)
+    assert img_tagger.is_already_processed(image)
+    expected = img_tagger._Win.FILE_READ_ATTRIBUTES | (0 if 0x01 in denied else img_tagger._Win.FILE_LIST_DIRECTORY)
+    assert set(granted) == {expected}
+
+
+@windows_only
+def test_windows_volume_without_acls_skips_dacl_handling(tmp_path, monkeypatch):
+    image = make_image(tmp_path / "a.png")
+
+    def no_security(fd):
+        raise AssertionError("DACL must not be read on a volume without ACLs")
+
+    monkeypatch.setattr(img_tagger, "_windows_persistent_acls", lambda fd: False)
+    monkeypatch.setattr(img_tagger, "_windows_security", no_security)
+    img_tagger.tag_image(str(image), SAMPLE_TAGS)
+    assert img_tagger.is_already_processed(image)
+
+
+def test_reads_do_not_capture_permissions(tmp_path, monkeypatch):
+    image = make_image(tmp_path / "a.png")
+
+    def no_attributes(fd):
+        raise AssertionError("only edits need the permissions")
+
+    monkeypatch.setattr(img_tagger, "_file_attributes", no_attributes)
+    assert img_tagger.get_image_format(image) == "PNG"
+    assert not img_tagger.is_already_processed(image)
