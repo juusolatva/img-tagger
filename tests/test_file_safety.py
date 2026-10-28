@@ -3,6 +3,7 @@
 import os
 import stat
 import struct
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -13,11 +14,18 @@ from conftest import SAMPLE_TAGS, FakeOllamaClient, FakeOpenAIClient, make_gif, 
 
 import img_tagger
 
+windows_only = pytest.mark.skipif(os.name != "nt", reason="Windows handles, junctions and DACLs")
+
 
 def link_or_skip(link: Path, target: Path) -> None:
-    """Create a test link where the platform permits it."""
+    """Create a test link where the platform permits it (a junction for Windows folders)."""
     try:
-        link.symlink_to(target, target_is_directory=target.is_dir())
+        if os.name == "nt" and target.is_dir():
+            import _winapi
+
+            _winapi.CreateJunction(str(target), str(link))
+        else:
+            link.symlink_to(target, target_is_directory=target.is_dir())
     except OSError as error:
         pytest.skip(f"Symlink creation unavailable: {error}")
 
@@ -159,11 +167,11 @@ def test_parent_rename_does_not_redirect_temporary_creation_or_commit(tmp_path, 
     moved = tmp_path / "moved"
     real_create = img_tagger._create_image_temp
 
-    def rename_parent(directory, parent_fd):
+    def rename_parent(directory, *args):
         folder.rename(moved)
         folder.mkdir()
         (folder / image.name).write_bytes(b"unrelated replacement directory")
-        return real_create(directory, parent_fd)
+        return real_create(directory, *args)
 
     monkeypatch.setattr(img_tagger, "_create_image_temp", rename_parent)
     img_tagger.tag_image(str(image), SAMPLE_TAGS)
@@ -199,19 +207,167 @@ def test_unmapped_owner_is_not_trusted_as_namespace_root_owner():
         img_tagger._check_directory(info)
 
 
-def test_windows_reparse_attribute_is_rejected(tmp_path, monkeypatch):
+@windows_only
+def test_windows_leaf_reparse_point_is_rejected(tmp_path, monkeypatch):
     image = make_image(tmp_path / "a.png")
-    real_lstat = Path.lstat
+    real_fstat = os.fstat
 
-    def reparse(path, *args, **kwargs):
-        info = real_lstat(path, *args, **kwargs)
-        if path == image:
-            return SimpleNamespace(st_mode=info.st_mode, st_file_attributes=0x400)
-        return info
+    class Reparse:
+        def __init__(self, info):
+            self.info = info
 
-    monkeypatch.setattr(Path, "lstat", reparse)
-    with pytest.raises(img_tagger._UnsafeImagePath, match="reparse"):
-        img_tagger._check_windows_path(image)
+        st_file_attributes = 0x400
+
+        def __getattr__(self, name):
+            return getattr(self.info, name)
+
+    def reparse(fd):
+        info = real_fstat(fd)
+        return Reparse(info) if stat.S_ISREG(info.st_mode) else info  # folders are checked separately
+
+    monkeypatch.setattr(img_tagger.os, "fstat", reparse)
+    with pytest.raises(img_tagger._UnsafeImagePath, match="regular"):
+        img_tagger._read_image_bytes(image)
+
+
+@windows_only
+def test_windows_ancestors_and_temporary_are_locked_during_edit(tmp_path, monkeypatch):
+    outer = tmp_path / "outer"
+    folder = outer / "images"
+    folder.mkdir(parents=True)
+    image = make_image(folder / "a.png")
+    real_create = img_tagger._create_image_temp
+    attempts = []
+
+    def swap_attempts(directory, *args):
+        fd, temporary = real_create(directory, *args)
+        for ancestor in (folder, outer):
+            with pytest.raises(PermissionError):
+                ancestor.rename(tmp_path / "moved")
+            attempts.append(ancestor)
+        with pytest.raises(PermissionError):
+            temporary.read_bytes()
+        return fd, temporary
+
+    monkeypatch.setattr(img_tagger, "_create_image_temp", swap_attempts)
+    img_tagger.tag_image(str(image), SAMPLE_TAGS)
+    assert attempts == [folder, outer]
+    assert img_tagger.is_already_processed(image)
+    outer.rename(tmp_path / "moved")  # the pins are released afterwards
+
+
+def windows_dacl(path: Path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        return img_tagger._windows_dacl(img_tagger._windows_security(fd))
+    finally:
+        os.close(fd)
+
+
+def icacls(path: Path, *args: str) -> None:
+    subprocess.run(["icacls", str(path), *args], check=True, capture_output=True)
+
+
+@windows_only
+@pytest.mark.parametrize("clear", [False, True])
+@pytest.mark.parametrize("extension", ["png", "gif"])
+@pytest.mark.parametrize("protected", [False, True])
+def test_windows_preserves_restrictive_dacl(tmp_path, clear, extension, protected):
+    image = tmp_path / f"acl.{extension}"
+    (make_gif if extension == "gif" else make_image)(image)
+    if protected:
+        icacls(image, "/inheritance:r", "/grant:r", f"{os.environ['USERNAME']}:F", "*S-1-5-18:F")
+    else:
+        icacls(image, "/deny", "*S-1-5-32-546:R")  # explicit Guests deny on top of the inherited entries
+    before = windows_dacl(image)
+    if clear:
+        img_tagger.clear_tags(image)
+    else:
+        img_tagger.tag_image(str(image), SAMPLE_TAGS)
+    assert windows_dacl(image) == before
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+@windows_only
+def test_windows_dacl_mismatch_fails_closed(tmp_path, monkeypatch):
+    image = make_image(tmp_path / "a.png")
+    original = image.read_bytes()
+    real_dacl = img_tagger._windows_dacl
+    calls = []
+
+    def differing(security):
+        calls.append(1)
+        entries, protected = real_dacl(security)
+        return (entries, not protected) if len(calls) == 1 else (entries, protected)
+
+    monkeypatch.setattr(img_tagger, "_windows_dacl", differing)
+    with pytest.raises(RuntimeError, match="permissions"):
+        img_tagger.tag_image(str(image), SAMPLE_TAGS)
+    assert image.read_bytes() == original
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+@windows_only
+@pytest.mark.parametrize("clear", [False, True])
+def test_windows_read_only_image_is_replaced_and_stays_read_only(tmp_path, clear):
+    image = make_image(tmp_path / "a.jpg")
+    image.chmod(stat.S_IREAD)
+    try:
+        if clear:
+            img_tagger.tag_image(str(image), SAMPLE_TAGS)
+            img_tagger.clear_tags(image)
+            assert not img_tagger.is_already_processed(image)
+        else:
+            img_tagger.tag_image(str(image), SAMPLE_TAGS)
+            assert img_tagger.is_already_processed(image)
+        assert not os.access(image, os.W_OK)
+        assert list(tmp_path.glob("*.tmp")) == []
+    finally:
+        image.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+
+@windows_only
+def test_windows_failed_commit_discards_read_only_temporary(tmp_path, monkeypatch):
+    image = make_image(tmp_path / "a.jpg")
+    image.chmod(stat.S_IREAD)
+    original = image.read_bytes()
+
+    def changed(path, parent_fd, expected):
+        raise img_tagger._UnsafeImagePath("File changed during processing")
+
+    monkeypatch.setattr(img_tagger, "_check_replacement", changed)
+    try:
+        with pytest.raises(RuntimeError, match="File changed"):
+            img_tagger.tag_image(str(image), SAMPLE_TAGS)
+        assert image.read_bytes() == original
+        assert list(tmp_path.glob("*.tmp")) == []
+    finally:
+        image.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+
+@windows_only
+def test_windows_rename_falls_back_without_rename_info_ex(tmp_path, monkeypatch):
+    import ctypes
+
+    image = make_image(tmp_path / "a.png")
+    real = img_tagger._kernel32
+    classes = []
+
+    class NoRenameEx:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def SetFileInformationByHandle(self, handle, info_class, info, size):
+            classes.append(info_class)
+            if info_class == img_tagger._Win.FILE_RENAME_INFO_EX:
+                ctypes.set_last_error(87)  # ERROR_INVALID_PARAMETER, as on filesystems without it
+                return 0
+            return real.SetFileInformationByHandle(handle, info_class, info, size)
+
+    monkeypatch.setattr(img_tagger, "_kernel32", NoRenameEx())
+    img_tagger.tag_image(str(image), SAMPLE_TAGS)
+    assert classes == [img_tagger._Win.FILE_RENAME_INFO_EX, img_tagger._Win.FILE_RENAME_INFO]
+    assert img_tagger.is_already_processed(image)
 
 
 @pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="Linux execute-only directory handles")
