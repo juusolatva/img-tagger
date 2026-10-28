@@ -1,5 +1,6 @@
 """Regression tests for image disclosure and redirected temporary-file writes."""
 
+import errno
 import os
 import stat
 import struct
@@ -493,5 +494,22 @@ def test_unkeepable_group_drops_group_access(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr(img_tagger.os, "fchown", not_a_member)
     img_tagger.tag_image(str(image), SAMPLE_TAGS)
+    assert stat.S_IMODE(image.stat().st_mode) == 0o600
+    assert "removed its group permissions" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX owning group")
+@pytest.mark.parametrize("error", [errno.EINVAL, errno.EOPNOTSUPP, errno.ENOSYS])
+def test_group_refused_by_filesystem_drops_group_access(tmp_path, monkeypatch, capsys, error):
+    image = make_image(tmp_path / "a.png")
+    os.chown(image, -1, other_group_or_skip())
+    image.chmod(0o640)
+
+    def refuse(fd, uid, gid):
+        raise OSError(error, os.strerror(error))
+
+    monkeypatch.setattr(img_tagger.os, "fchown", refuse)
+    img_tagger.tag_image(str(image), SAMPLE_TAGS)
+    assert img_tagger.is_already_processed(image)
     assert stat.S_IMODE(image.stat().st_mode) == 0o600
     assert "removed its group permissions" in capsys.readouterr().out

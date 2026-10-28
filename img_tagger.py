@@ -136,7 +136,8 @@ def _open_log(path: Path) -> TextIO:
             raise OSError(errno.EPERM, "The log file must belong to the current user", str(path))
         if os.name != "nt":
             os.set_blocking(fd, True)
-        return open(fd, "a", encoding="utf-8")
+        # backslashreplace like logging's own FileHandler: non-UTF-8 POSIX file names arrive as lone surrogates
+        return open(fd, "a", encoding="utf-8", errors="backslashreplace")
     except BaseException:
         os.close(fd)
         raise
@@ -556,7 +557,8 @@ def _restore_group(fd: int, source: os.stat_result, name: str) -> int:
     """
     Give the POSIX temporary the source's owning group, so the kept mode doesn't grant its group
     bits to a different (e.g. setgid-directory or primary) group. If that group can't be set
-    (this user isn't a member), group access is dropped instead. Returns the mode to apply.
+    (this user isn't a member, or the filesystem/user namespace refuses it, e.g. EINVAL for an
+    unmapped gid), group access is dropped instead. Returns the mode to apply.
     """
     mode = stat.S_IMODE(source.st_mode)
     if os.fstat(fd).st_gid == source.st_gid:
@@ -564,8 +566,8 @@ def _restore_group(fd: int, source: os.stat_result, name: str) -> int:
     try:
         os.fchown(fd, -1, source.st_gid)
         return mode
-    except PermissionError:
-        _warn(f"Could not keep group {source.st_gid} on {name}; removed its group permissions instead")
+    except OSError as error:
+        _warn(f"Could not keep group {source.st_gid} on {name} ({error}); removed its group permissions instead")
         return mode & ~0o070
 
 
@@ -984,14 +986,31 @@ def _model_image(source: bytes, max_megapixels: float = DEFAULT_MAX_MEGAPIXELS) 
     With a pixel budget, the first frame is decoded, turned upright by its EXIF orientation,
     scaled down (never up, aspect ratio kept) to at most max_megapixels and re-encoded without
     metadata: PNG for PNG/GIF sources and anything with transparency (lossless, keeps text
-    sharp), JPEG otherwise. With max_megapixels 0 the original bytes are sent unchanged.
+    sharp), JPEG otherwise. With max_megapixels 0 the original bytes are sent unchanged, and
+    also when the copy can't be made (e.g. a truncated file Pillow identifies but can't decode).
 
     Returns:
         The bytes to send and their MIME type.
     """
 
     if not max_megapixels:
-        return source, MIME_TYPES.get(get_image_format(source) or "", DEFAULT_MIME_TYPE)
+        return _original_image(source)
+    try:
+        return _scaled_image(source, max_megapixels)
+    except (OSError, ValueError, SyntaxError, EOFError) as error:
+        # e.g. a truncated JPEG: verify() doesn't decode JPEG pixels, but servers decode leniently
+        logger.warning(f"Could not prepare a scaled copy ({error}); sending the original file instead")
+        return _original_image(source)
+
+
+def _original_image(source: bytes) -> tuple[bytes, str]:
+    """The original bytes and their Pillow-detected MIME type (fallback image/jpeg)."""
+
+    return source, MIME_TYPES.get(get_image_format(source) or "", DEFAULT_MIME_TYPE)
+
+
+def _scaled_image(source: bytes, max_megapixels: float) -> tuple[bytes, str]:
+    """The scaled, upright, metadata-free first-frame copy described in _model_image()."""
 
     budget = max_megapixels * 1_000_000
     with _open_pillow(source) as img:

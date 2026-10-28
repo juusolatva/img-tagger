@@ -168,3 +168,11 @@ class TestModelImage:
     def test_zero_budget_sends_the_original(self, tmp_path):
         source = make_image(tmp_path / "a.jpg", size=(3000, 2000)).read_bytes()
         assert img_tagger._model_image(source, 0) == (source, "image/jpeg")
+
+
+class TestModelImageFallback:
+    def test_truncated_jpeg_falls_back_to_the_original(self, tmp_path):
+        full = make_image(tmp_path / "a.jpg", size=(1600, 1200)).read_bytes()
+        truncated = full[: len(full) // 2]
+        assert img_tagger.get_image_format(truncated) == "JPEG"  # passes the pipeline's format check
+        assert img_tagger._model_image(truncated) == (truncated, "image/jpeg")

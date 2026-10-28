@@ -270,3 +270,13 @@ class TestMaxPixels:
         args = [str(tmp_path)] + (["--max-pixels", value] if value else [])
         assert img_tagger.main(args) == 0
         assert budgets == [expected]
+
+
+def test_log_stream_tolerates_undecodable_file_names(tmp_path):
+    log = tmp_path / "run.log"
+    stream = img_tagger._open_log(log)
+    try:
+        stream.write("Processing caf\udce9.jpg\n")  # how a Latin-1 name arrives on POSIX (surrogateescape)
+    finally:
+        stream.close()
+    assert log.read_text(encoding="utf-8") == r"Processing caf\udce9.jpg" + "\n"  # escaped, not dropped
