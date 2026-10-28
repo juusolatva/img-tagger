@@ -120,9 +120,9 @@ class TestWriteMetadata:
         seen_dirs = []
         real_create = img_tagger._create_image_temp
 
-        def spy_create(directory, parent_fd):
+        def spy_create(directory, *args):
             seen_dirs.append(directory)
-            return real_create(directory, parent_fd)
+            return real_create(directory, *args)
 
         monkeypatch.setattr(img_tagger, "_create_image_temp", spy_create)
         img_tagger.write_metadata(str(static_image), SAMPLE_TAGS)

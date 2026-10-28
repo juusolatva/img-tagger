@@ -24,7 +24,6 @@ import secrets
 import select
 import stat
 import sys
-import tempfile
 import threading
 import time
 from collections.abc import Callable, Generator
@@ -238,23 +237,256 @@ def _check_directory(info: os.stat_result) -> None:
         raise _UnsafeImagePath("Image directories must not be writable by other users")
 
 
-def _check_windows_path(path: Path) -> None:
-    """Reject existing Windows symlinks, junctions and other reparse points."""
-    for part in (*reversed(path.parents), path):
-        info = part.lstat()
-        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
-            raise _UnsafeImagePath(f"Image paths must not contain links or reparse points: {part}")
+class _Win:
+    """Win32 constants for the Windows file-safety helpers."""
+
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    DELETE = 0x00010000
+    READ_CONTROL = 0x00020000
+    FILE_LIST_DIRECTORY = 0x0001
+    FILE_TRAVERSE = 0x0020
+    FILE_READ_ATTRIBUTES = 0x0080
+    SHARE_READ_WRITE = 0x1 | 0x2
+    SHARE_ALL = 0x1 | 0x2 | 0x4
+    CREATE_NEW = 1
+    OPEN_EXISTING = 3
+    ATTRIBUTE_REPARSE_POINT = 0x400
+    FLAG_BACKUP_SEMANTICS = 0x02000000
+    FLAG_OPEN_REPARSE_POINT = 0x00200000
+    SE_FILE_OBJECT = 1
+    DACL_SECURITY_INFORMATION = 0x4
+    SE_DACL_PROTECTED = 0x1000
+    FILE_PERSISTENT_ACLS = 0x8
+    FILE_RENAME_INFO = 3
+    FILE_DISPOSITION_INFO = 4
+    FILE_RENAME_INFO_EX = 22
+    # FILE_RENAME_FLAG_REPLACE_IF_EXISTS | _POSIX_SEMANTICS | _IGNORE_READONLY_ATTRIBUTE
+    RENAME_EX_FLAGS = 0x1 | 0x2 | 0x40
+    # ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_INVALID_PARAMETER: FileRenameInfoEx is unavailable
+    RENAME_EX_UNSUPPORTED = frozenset({1, 50, 87})
+    SECURITY_KEY = "windows.security"
+
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    _kernel32.CreateFileW.restype = wintypes.HANDLE
+    _kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.LocalFree.argtypes = [wintypes.LPVOID]
+    _kernel32.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    _kernel32.GetVolumeInformationByHandleW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    _advapi32.GetSecurityInfo.restype = wintypes.DWORD
+    _advapi32.GetSecurityInfo.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, *[wintypes.LPVOID] * 5]
+    _advapi32.GetSecurityDescriptorLength.restype = wintypes.DWORD
+    _advapi32.GetSecurityDescriptorLength.argtypes = [wintypes.LPVOID]
+    _advapi32.GetSecurityDescriptorDacl.argtypes = [wintypes.LPVOID, *[wintypes.LPVOID] * 3]
+    _advapi32.GetSecurityDescriptorControl.argtypes = [wintypes.LPVOID, wintypes.LPVOID, wintypes.LPVOID]
+
+    class _SecurityAttributes(ctypes.Structure):
+        _fields_ = [("length", wintypes.DWORD), ("descriptor", wintypes.LPVOID), ("inherit", wintypes.BOOL)]
+
+
+def _win_error(code: int, path: Path | str | None = None) -> OSError:
+    """Build the OSError subclass Python uses for a Win32 error code (e.g. FileExistsError)."""
+    return OSError(0, ctypes.FormatError(code), None if path is None else str(path), code)
+
+
+def _win_open(
+    path: Path, access: int, share: int, disposition: int, flags: int = 0, security: bytes | None = None
+) -> int:
+    """Open a Windows handle without following a final reparse point and wrap it in a CRT descriptor."""
+    attributes = None
+    if security is not None:
+        buffer = ctypes.create_string_buffer(security, len(security))
+        descriptor = ctypes.cast(buffer, ctypes.c_void_p)
+        attributes = ctypes.byref(_SecurityAttributes(ctypes.sizeof(_SecurityAttributes), descriptor, False))
+    flags |= _Win.FLAG_OPEN_REPARSE_POINT
+    handle = _kernel32.CreateFileW(str(path), access, share, attributes, disposition, flags, None)
+    if handle in {None, wintypes.HANDLE(-1).value}:
+        raise _win_error(ctypes.get_last_error(), path)
+    try:
+        return msvcrt.open_osfhandle(handle, 0)
+    except OSError:
+        _kernel32.CloseHandle(handle)
+        raise
+
+
+def _pin_windows_directory(path: Path) -> int:
+    """
+    Hold a directory open without delete sharing, so nobody can rename it or swap in a junction
+    while the handle is open. A data right (traverse, else list) matters: Windows ignores the
+    share mode of handles that only read attributes. A folder granting neither (reached through
+    the "bypass traverse checking" privilege) is only checked for reparse points, not pinned.
+    """
+    for access in (_Win.FILE_TRAVERSE, _Win.FILE_LIST_DIRECTORY, 0):
+        try:
+            fd = _win_open(
+                path,
+                access | _Win.FILE_READ_ATTRIBUTES,
+                _Win.SHARE_READ_WRITE,
+                _Win.OPEN_EXISTING,
+                _Win.FLAG_BACKUP_SEMANTICS,
+            )
+            break
+        except PermissionError:
+            if not access:
+                raise
+    info = os.fstat(fd)
+    if info.st_file_attributes & _Win.ATTRIBUTE_REPARSE_POINT or not stat.S_ISDIR(info.st_mode):
+        os.close(fd)
+        raise _UnsafeImagePath(f"Image paths must not contain links or reparse points: {path}")
+    return fd
+
+
+def _windows_security(fd: int) -> bytes:
+    """Return a file's DACL (with its inheritance flags) as a self-relative security descriptor."""
+    descriptor = ctypes.c_void_p()
+    handle = msvcrt.get_osfhandle(fd)
+    info = _Win.DACL_SECURITY_INFORMATION
+    error = _advapi32.GetSecurityInfo(
+        handle, _Win.SE_FILE_OBJECT, info, None, None, None, None, ctypes.byref(descriptor)
+    )
+    if error:
+        raise _win_error(error)
+    try:
+        return ctypes.string_at(descriptor, _advapi32.GetSecurityDescriptorLength(descriptor))
+    finally:
+        _kernel32.LocalFree(descriptor)
+
+
+def _windows_persistent_acls(fd: int) -> bool:
+    """Tell whether the file's volume stores ACLs (FILE_PERSISTENT_ACLS; false on FAT32/exFAT)."""
+    flags = wintypes.DWORD()
+    handle = msvcrt.get_osfhandle(fd)
+    if not _kernel32.GetVolumeInformationByHandleW(handle, None, 0, None, None, ctypes.byref(flags), None, 0):
+        raise _win_error(ctypes.get_last_error())
+    return bool(flags.value & _Win.FILE_PERSISTENT_ACLS)
+
+
+def _windows_dacl(security: bytes) -> tuple[bytes | None, bool]:
+    """Return a security descriptor's DACL entries (None for no DACL) and whether inheritance is blocked."""
+    buffer = ctypes.create_string_buffer(security, len(security))
+    present, defaulted, dacl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
+    control, revision = wintypes.WORD(), wintypes.DWORD()
+    found = _advapi32.GetSecurityDescriptorDacl(
+        buffer, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)
+    )
+    if not found or not _advapi32.GetSecurityDescriptorControl(buffer, ctypes.byref(control), ctypes.byref(revision)):
+        raise _win_error(ctypes.get_last_error())
+    entries = None
+    if present.value and dacl.value:
+        # ACL header: revision, padding, then the WORD AclSize covering the whole list
+        entries = ctypes.string_at(dacl, ctypes.c_uint16.from_address(dacl.value + 2).value)
+    return entries, bool(control.value & _Win.SE_DACL_PROTECTED)
+
+
+def _create_windows_temp(path: Path, security: bytes | None) -> int:
+    """
+    Create a temporary nobody else can open (share mode 0) that already carries the source DACL,
+    so no other account can get a handle to it under the folder's broader inherited permissions.
+
+    CreateFileW copies the entries as given (inherited ones included) but drops the DACL's
+    auto-inherited marker flag; anything else differing fails closed before bytes are written.
+    """
+    access = _Win.GENERIC_READ | _Win.GENERIC_WRITE | _Win.DELETE | _Win.READ_CONTROL
+    fd = _win_open(path, access, 0, _Win.CREATE_NEW, security=security)
+    if security is not None:
+        try:
+            if _windows_dacl(_windows_security(fd)) != _windows_dacl(security):
+                raise _UnsafeImagePath("Could not give the temporary file the image's permissions")
+        except BaseException:
+            _discard_windows_temp(fd, path)
+            os.close(fd)
+            raise
+    return fd
+
+
+def _discard_windows_temp(fd: int, temporary: Path) -> None:
+    """
+    Delete an uncommitted temporary through its handle (on close), even if it was made read-only.
+    Does nothing once the handle no longer sits at the temporary's name: after a completed rename
+    (e.g. Ctrl+C arriving right after it) the handle is the committed image.
+    """
+    with contextlib.suppress(OSError):
+        if not os.path.samestat(os.fstat(fd), os.stat(temporary, follow_symlinks=False)):
+            return
+        os.chmod(fd, stat.S_IREAD | stat.S_IWRITE)
+        delete = wintypes.BOOLEAN(True)
+        handle = msvcrt.get_osfhandle(fd)
+        if not _kernel32.SetFileInformationByHandle(
+            handle, _Win.FILE_DISPOSITION_INFO, ctypes.byref(delete), ctypes.sizeof(delete)
+        ):
+            raise _win_error(ctypes.get_last_error())
+
+
+def _rename_windows_handle(fd: int, target: Path) -> None:
+    """
+    Rename the open temporary over target through its handle, so no other file can take the
+    temporary's place before the rename. Replaces read-only targets where the filesystem allows
+    (FileRenameInfoEx, NTFS on Windows 10 1809+); elsewhere falls back to a plain replace.
+    """
+    if not target.is_absolute():
+        raise ValueError(f"Rename target must be absolute, not resolved against the working directory: {target}")
+    # Sized in UTF-16 code units: characters outside the BMP (e.g. emoji) take two
+    name = str(target).encode("utf-16-le")
+
+    class _RenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("flags", wintypes.DWORD),  # a BOOLEAN ReplaceIfExists for FileRenameInfo
+            ("root", wintypes.HANDLE),
+            ("length", wintypes.DWORD),
+            ("name", ctypes.c_ubyte * (len(name) + 2)),  # WCHAR[] plus the terminating null
+        ]
+
+    handle = msvcrt.get_osfhandle(fd)
+    error = 0
+    for info_class, flags in ((_Win.FILE_RENAME_INFO_EX, _Win.RENAME_EX_FLAGS), (_Win.FILE_RENAME_INFO, 1)):
+        # Copied as raw bytes: c_char arrays stop at the first NUL, and UTF-16 has one in every ASCII character
+        info = _RenameInfo(flags, None, len(name), (ctypes.c_ubyte * (len(name) + 2)).from_buffer_copy(name + b"\0\0"))
+        if _kernel32.SetFileInformationByHandle(handle, info_class, ctypes.byref(info), ctypes.sizeof(info)):
+            return
+        error = ctypes.get_last_error()
+        if error not in _Win.RENAME_EX_UNSUPPORTED:
+            break
+    raise _win_error(error, target)
 
 
 @contextlib.contextmanager
 def _image_parent(path: Path) -> Generator[tuple[Path, int | None]]:
-    """Pin POSIX ancestors without following links; Windows checks existing reparse points."""
+    """
+    Pin every ancestor without following links: POSIX through descriptors used for relative
+    operations, Windows through handles that block renaming them (parent_fd is None there).
+    """
     if ".." in path.parts:
         raise _UnsafeImagePath("Image paths must not contain '..'")
     path = path.absolute()
     if os.name == "nt":
-        _check_windows_path(path.parent)
-        yield path, None
+        with contextlib.ExitStack() as stack:
+            for part in (*reversed(path.parent.parents), path.parent):
+                stack.callback(os.close, _pin_windows_directory(part))
+            yield path, None
         return
     # O_PATH preserves access through execute-only ancestors without requiring directory listing rights.
     flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -269,7 +501,12 @@ def _image_parent(path: Path) -> Generator[tuple[Path, int | None]]:
 
 
 def _file_attributes(fd: int) -> dict[str, bytes]:
-    """Capture extended attributes, including POSIX ACLs, without reopening a pathname."""
+    """
+    Capture extended attributes, including POSIX ACLs, or the Windows DACL, without reopening a pathname.
+    Volumes that don't store ACLs (FAT32/exFAT) have no DACL to keep.
+    """
+    if os.name == "nt":
+        return {_Win.SECURITY_KEY: _windows_security(fd)} if _windows_persistent_acls(fd) else {}
     if not hasattr(os, "listxattr"):
         return {}
     try:
@@ -281,34 +518,38 @@ def _file_attributes(fd: int) -> dict[str, bytes]:
 
 
 def _apply_permissions(output: BinaryIO, mode: int, attributes: dict[str, bytes]) -> None:
-    """Preserve source ACLs and remove any inherited temporary-file access grants."""
+    """
+    Preserve source ACLs and remove any inherited temporary-file access grants, then the mode
+    (on Windows only the read-only attribute; the DACL was set when the temporary was created).
+    """
     fd = output.fileno()
-    existing = _file_attributes(fd)
-    for name in existing.keys() - attributes.keys():
-        os.removexattr(fd, name)
-    for name, value in attributes.items():
-        if existing.get(name) != value:
-            os.setxattr(fd, name, value)
+    if os.name != "nt":
+        existing = _file_attributes(fd)
+        for name in existing.keys() - attributes.keys():
+            os.removexattr(fd, name)
+        for name, value in attributes.items():
+            if existing.get(name) != value:
+                os.setxattr(fd, name, value)
     os.chmod(fd, stat.S_IMODE(mode))
 
 
-def _source_bytes(path: Path, parent_fd: int | None) -> tuple[bytes, os.stat_result, dict[str, bytes]]:
-    """Read only an opened regular file, rejecting leaf links before consuming bytes."""
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
-    if parent_fd is not None:
-        flags |= os.O_NOFOLLOW
+def _source_bytes(
+    path: Path, parent_fd: int | None, permissions: bool = False
+) -> tuple[bytes, os.stat_result, dict[str, bytes]]:
+    """
+    Read only an opened regular file, rejecting leaf links before consuming bytes. With permissions,
+    also capture its extended attributes/ACLs or DACL (only edits need them).
+    """
+    if parent_fd is None:
+        fd = _win_open(path, _Win.GENERIC_READ, _Win.SHARE_ALL, _Win.OPEN_EXISTING)
     else:
-        _check_windows_path(path)
-    fd = os.open(path.name if parent_fd is not None else path, flags, dir_fd=parent_fd)
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(path.name, flags, dir_fd=parent_fd)
     with os.fdopen(fd, "rb") as source:
         info = os.fstat(source.fileno())
-        if not stat.S_ISREG(info.st_mode):
+        if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & _Win.ATTRIBUTE_REPARSE_POINT:
             raise _UnsafeImagePath("Image input must be a regular file")
-        if parent_fd is None:
-            _check_windows_path(path)
-            if not os.path.samestat(info, path.stat(follow_symlinks=False)):
-                raise _UnsafeImagePath("Image changed while opening it")
-        return source.read(), info, _file_attributes(source.fileno())
+        return source.read(), info, _file_attributes(source.fileno()) if permissions else {}
 
 
 def _read_image_bytes(path: Path | str) -> bytes:
@@ -334,40 +575,40 @@ def _check_replacement(path: Path, parent_fd: int | None, expected: os.stat_resu
 def _image_edit(image_path: Path | str) -> Generator[tuple[bytes, BinaryIO]]:
     """Keep source permissions, parent identity and temporary descriptor bound to an edit."""
     with _image_parent(Path(image_path)) as (path, parent_fd):
-        data, original, attributes = _source_bytes(path, parent_fd)
-        fd, temporary = _create_image_temp(path.parent, parent_fd)
+        data, original, attributes = _source_bytes(path, parent_fd, permissions=True)
+        fd, temporary = _create_image_temp(path.parent, parent_fd, attributes.get(_Win.SECURITY_KEY))
         expected = os.fstat(fd)
         try:
             with os.fdopen(fd, "w+b") as output:
-                yield data, output
-                output.flush()
-                _apply_permissions(output, original.st_mode, attributes)
-                _check_replacement(temporary, parent_fd, expected)
-                _check_replacement(path, parent_fd, original)
-                if parent_fd is not None:
-                    robust_replace(temporary, path, parent_fd=parent_fd)
-            if parent_fd is None:
-                # Windows cannot rename an open CRT file; the remaining close/rename race is documented.
-                _check_windows_path(path)
-                _check_replacement(temporary, None, expected)
-                _check_replacement(path, None, original)
-                robust_replace(temporary, path)
+                try:
+                    yield data, output
+                    output.flush()
+                    _apply_permissions(output, original.st_mode, attributes)
+                    _check_replacement(temporary, parent_fd, expected)
+                    _check_replacement(path, parent_fd, original)
+                    # Windows renames the still-open temporary through its handle
+                    source_fd = output.fileno() if parent_fd is None else None
+                    robust_replace(temporary, path, parent_fd=parent_fd, source_fd=source_fd)
+                except BaseException:
+                    if parent_fd is None:
+                        _discard_windows_temp(output.fileno(), temporary)
+                    raise
         finally:
-            if parent_fd is None:
-                temporary.unlink(missing_ok=True)
-            else:
+            if parent_fd is not None:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(temporary.name, dir_fd=parent_fd)
 
 
-def _create_image_temp(directory: Path, parent_fd: int | None) -> tuple[int, Path]:
-    """Create a same-directory temporary without resolving mutable POSIX ancestors again."""
-    if parent_fd is None:
-        fd, name = tempfile.mkstemp(dir=directory, suffix=".tmp")
-        return fd, Path(name)
+def _create_image_temp(directory: Path, parent_fd: int | None, security: bytes | None = None) -> tuple[int, Path]:
+    """
+    Create a same-directory temporary without resolving mutable POSIX ancestors again; on Windows
+    (parent_fd None) it gets the source's DACL (security) and no sharing.
+    """
     for _ in range(10):
         name = f"tmp{secrets.token_hex(12)}.tmp"
         try:
+            if parent_fd is None:
+                return _create_windows_temp(directory / name, security), directory / name
             fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
             return fd, directory / name
         except FileExistsError:
@@ -406,11 +647,17 @@ def _is_gif(img_path: Path, fmt: str | None) -> bool:
     return fmt == "GIF" if fmt else img_path.suffix.lower() == ".gif"
 
 
-def robust_replace(src: Path, dst: Path, *, parent_fd: int | None = None) -> None:
-    """Atomically replace dst with src, retrying on transient OSErrors like lingering file locks on Windows)."""
+def robust_replace(src: Path, dst: Path, *, parent_fd: int | None = None, source_fd: int | None = None) -> None:
+    """
+    Atomically replace dst with src, retrying on transient OSErrors like lingering file locks on Windows.
+    With parent_fd both names are relative to that POSIX directory; with source_fd (Windows) src is
+    renamed through that open descriptor.
+    """
     for _ in range(10):
         try:
-            if parent_fd is None:
+            if source_fd is not None:
+                _rename_windows_handle(source_fd, dst)
+            elif parent_fd is None:
                 src.replace(dst)
             else:
                 os.replace(src.name, dst.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)

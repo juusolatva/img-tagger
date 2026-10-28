@@ -37,13 +37,18 @@ jobs:
           args: format --check --diff
 
   test:
-    name: Tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.13", "3.14"]
+        # One Windows job covers the Windows file-safety code (handles, DACLs, quit listener)
+        include:
+          - os: windows-latest
+            python-version: "3.14"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -66,7 +71,7 @@ jobs:
         if: matrix.python-version == '3.14'
         uses: actions/upload-artifact@v7
         with:
-          name: coverage
+          name: ${{ matrix.os == 'windows-latest' && 'coverage-windows' || 'coverage' }}
           path: coverage.xml
           retention-days: 7
 
@@ -94,6 +99,12 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: coverage
+
+      - name: Download Windows coverage report
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-windows
+          path: coverage-windows
 
       - name: SonarQube Scan
         if: env.SONAR_TOKEN != ''
