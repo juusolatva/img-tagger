@@ -320,9 +320,8 @@ def _win_open(
     attributes = None
     if security is not None:
         buffer = ctypes.create_string_buffer(security, len(security))
-        attributes = ctypes.byref(
-            _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), ctypes.addressof(buffer), False)
-        )
+        descriptor = ctypes.cast(buffer, ctypes.c_void_p)
+        attributes = ctypes.byref(_SecurityAttributes(ctypes.sizeof(_SecurityAttributes), descriptor, False))
     flags |= _Win.FLAG_OPEN_REPARSE_POINT
     handle = _kernel32.CreateFileW(str(path), access, share, attributes, disposition, flags, None)
     if handle in {None, wintypes.HANDLE(-1).value}:
