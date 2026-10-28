@@ -30,7 +30,7 @@ from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, TextIO
 
 import pyexiv2
 from ollama import Client as OllamaClient
@@ -87,6 +87,9 @@ def setup_logging(log_path: str | None) -> None:
     Args:
         log_path: The file path where logs should be written. If None, nothing
             is logged; warnings still reach the console through _warn().
+
+    Raises:
+        OSError: If the log can't be opened or isn't a regular file of this user (see _open_log()).
     """
 
     if log_path is None:
@@ -97,15 +100,41 @@ def setup_logging(log_path: str | None) -> None:
     path_obj.parent.mkdir(parents=True, exist_ok=True)
 
     logging.basicConfig(
-        filename=str(path_obj),
+        handlers=[logging.StreamHandler(_open_log(path_obj))],
         # INFO for other libraries keeps httpx's request lines but drops Pillow's per-chunk DEBUG noise
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(threadName)s %(name)s: %(message)s",
-        filemode="a",
-        encoding="utf-8",
     )
     logger.setLevel(logging.DEBUG)
     logger.info(f"Logging started (Python {platform.python_version()} on {platform.system()})")
+
+
+def _open_log(path: Path) -> TextIO:
+    """
+    Opens the log for appending once, without following a link at the leaf, and keeps that stream:
+    a check by name followed by a later open could be raced by swapping the file for a symlink.
+    The opened file must be a regular file and, on POSIX, belong to this user (a file someone
+    else planted, e.g. in /tmp, would receive the raw model replies).
+    """
+
+    if os.name == "nt":
+        fd = _win_open(path, _Win.FILE_APPEND_DATA, _Win.SHARE_ALL, _Win.OPEN_ALWAYS)
+    else:
+        # O_NONBLOCK: opening a FIFO fails (ENXIO) instead of waiting for a reader
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        fd = os.open(path, flags, 0o666)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & _Win.ATTRIBUTE_REPARSE_POINT:
+            raise OSError(errno.EINVAL, "The log file must be a regular file", str(path))
+        if os.name != "nt" and info.st_uid != os.geteuid():
+            raise OSError(errno.EPERM, "The log file must belong to the current user", str(path))
+        if os.name != "nt":
+            os.set_blocking(fd, True)
+        return open(fd, "a", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _log_path_error(log_path: str | None) -> str | None:
@@ -244,12 +273,14 @@ class _Win:
     DELETE = 0x00010000
     READ_CONTROL = 0x00020000
     FILE_LIST_DIRECTORY = 0x0001
+    FILE_APPEND_DATA = 0x0004
     FILE_TRAVERSE = 0x0020
     FILE_READ_ATTRIBUTES = 0x0080
     SHARE_READ_WRITE = 0x1 | 0x2
     SHARE_ALL = 0x1 | 0x2 | 0x4
     CREATE_NEW = 1
     OPEN_EXISTING = 3
+    OPEN_ALWAYS = 4
     ATTRIBUTE_REPARSE_POINT = 0x400
     FLAG_BACKUP_SEMANTICS = 0x02000000
     FLAG_OPEN_REPARSE_POINT = 0x00200000
@@ -516,20 +547,39 @@ def _file_attributes(fd: int) -> dict[str, bytes]:
         return {}
 
 
-def _apply_permissions(output: BinaryIO, mode: int, attributes: dict[str, bytes]) -> None:
+def _restore_group(fd: int, source: os.stat_result, name: str) -> int:
     """
-    Preserve source ACLs and remove any inherited temporary-file access grants, then the mode
-    (on Windows only the read-only attribute; the DACL was set when the temporary was created).
+    Give the POSIX temporary the source's owning group, so the kept mode doesn't grant its group
+    bits to a different (e.g. setgid-directory or primary) group. If that group can't be set
+    (this user isn't a member), group access is dropped instead. Returns the mode to apply.
+    """
+    mode = stat.S_IMODE(source.st_mode)
+    if os.fstat(fd).st_gid == source.st_gid:
+        return mode
+    try:
+        os.fchown(fd, -1, source.st_gid)
+        return mode
+    except PermissionError:
+        _warn(f"Could not keep group {source.st_gid} on {name}; removed its group permissions instead")
+        return mode & ~0o070
+
+
+def _apply_permissions(output: BinaryIO, source: os.stat_result, attributes: dict[str, bytes], image_name: str) -> None:
+    """
+    Preserve the source group and ACLs and remove any inherited temporary-file access grants, then
+    the mode (on Windows only the read-only attribute; the DACL was set when the temporary was created).
     """
     fd = output.fileno()
+    mode = stat.S_IMODE(source.st_mode)
     if os.name != "nt":
+        mode = _restore_group(fd, source, image_name)
         existing = _file_attributes(fd)
         for name in existing.keys() - attributes.keys():
             os.removexattr(fd, name)
         for name, value in attributes.items():
             if existing.get(name) != value:
                 os.setxattr(fd, name, value)
-    os.chmod(fd, stat.S_IMODE(mode))
+    os.chmod(fd, mode)
 
 
 def _source_bytes(
@@ -582,7 +632,7 @@ def _image_edit(image_path: Path | str) -> Generator[tuple[bytes, BinaryIO]]:
                 try:
                     yield data, output
                     output.flush()
-                    _apply_permissions(output, original.st_mode, attributes)
+                    _apply_permissions(output, original, attributes, path.name)
                     _check_replacement(temporary, parent_fd, expected)
                     _check_replacement(path, parent_fd, original)
                     # Windows renames the still-open temporary through its handle
@@ -1615,7 +1665,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: {log_error}.")
         return 1
 
-    setup_logging(args.log)
+    try:
+        setup_logging(args.log)
+    except OSError as e:
+        print(f"Error: Could not open the log file '{args.log}': {e}")
+        return 1
 
     if error := _argument_error(args):
         print(f"Error: {error}")

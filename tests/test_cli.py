@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import SAMPLE_TAGS, make_gif, make_image
+from conftest import SAMPLE_TAGS, FakeOpenAIClient, make_gif, make_image
 
 import img_tagger
 
@@ -88,14 +88,15 @@ class TestMain:
         assert code == 1
         assert "must be a regular file" in out
 
-    def test_lm_studio_without_host_uses_its_own_default(self, tmp_path, monkeypatch):
+    def test_lm_studio_without_host_uses_its_own_default(self, tmp_path, monkeypatch, no_quit_listener):
         make_image(tmp_path / "a.png")
         hosts = []
 
-        def no_client(backend, host, timeout):
+        def fake_client(backend, host, timeout):
             hosts.append(host)
+            return FakeOpenAIClient()
 
-        monkeypatch.setattr(img_tagger, "_create_client", no_client)
+        monkeypatch.setattr(img_tagger, "_create_client", fake_client)
         assert img_tagger.main([str(tmp_path), "--backend", "lm-studio"]) == 0
         img_tagger.process_directory(str(tmp_path), backend="lm-studio")
         assert hosts == [img_tagger.DEFAULT_HOSTS["lm-studio"]] * 2
@@ -201,3 +202,45 @@ class TestImgTaggerCli:
         assert "Resetting tags for 4 images" in result.stdout
         for p in paths:
             assert not img_tagger.is_already_processed(p)
+
+
+class TestOpenLog:
+    """setup_logging() opens the log once, so a swap after _log_path_error() can't redirect appends."""
+
+    def test_symlink_swapped_in_after_validation_is_refused(self, tmp_path):
+        target = tmp_path / "profile"
+        target.write_text("original\n", encoding="utf-8")
+        log = tmp_path / "run.log"
+        assert img_tagger._log_path_error(str(log)) is None  # validated while it doesn't exist yet
+        try:
+            log.symlink_to(target)
+        except OSError as error:
+            pytest.skip(f"Symlink creation unavailable: {error}")
+        with pytest.raises(OSError):
+            img_tagger.setup_logging(str(log))
+        assert target.read_text(encoding="utf-8") == "original\n"
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX FIFOs")
+    def test_fifo_is_refused_without_blocking(self, tmp_path):
+        log = tmp_path / "pipe.log"
+        os.mkfifo(log)
+        with pytest.raises(OSError):
+            img_tagger.setup_logging(str(log))
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file ownership")
+    def test_log_owned_by_another_user_is_refused(self, tmp_path, monkeypatch):
+        log = tmp_path / "run.log"
+        log.write_text("someone else's\n", encoding="utf-8")
+        monkeypatch.setattr(img_tagger.os, "geteuid", lambda: log.stat().st_uid + 1)
+        with pytest.raises(OSError, match="belong"):
+            img_tagger.setup_logging(str(log))
+        assert log.read_text(encoding="utf-8") == "someone else's\n"
+
+    def test_main_reports_unopenable_log(self, capsys, tmp_path, monkeypatch):
+        def refuse(path):
+            raise OSError(1, "The log file must belong to the current user", str(path))
+
+        monkeypatch.setattr(img_tagger, "_open_log", refuse)
+        code, out = call_main(capsys, str(tmp_path), "--log", str(tmp_path / "run.log"))
+        assert code == 1
+        assert "Could not open the log file" in out
