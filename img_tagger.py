@@ -30,10 +30,12 @@ from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, TextIO
 
 import pyexiv2
-from PIL import Image, ImageSequence
+from ollama import Client as OllamaClient
+from openai import OpenAI
+from PIL import Image, ImageOps, ImageSequence
 from tqdm import tqdm
 
 try:
@@ -47,15 +49,6 @@ except ImportError:
     termios = None
     tty = None
 
-try:
-    from ollama import Client as OllamaClient
-except ImportError:
-    OllamaClient = None
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
-
 logger = logging.getLogger("img_tagger")
 # Without --log, records stop here instead of reaching Python's last-resort stderr handler,
 # which would print bare warnings and tracebacks over the progress bar.
@@ -67,8 +60,19 @@ DEFAULT_MIME_TYPE = "image/jpeg"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 # Pillow formats tag_image() can write (GIFs get a comment, the rest EXIF/XMP via pyexiv2)
 TAGGABLE_FORMATS = {"JPEG", "WEBP", "PNG", "GIF"}
+# Formats tagged and cleared through pyexiv2 (EXIF/XMP); GIFs get a comment instead
+PYEXIV2_FORMATS = TAGGABLE_FORMATS - {"GIF"}
+MIME_TYPES = {"JPEG": DEFAULT_MIME_TYPE, "PNG": "image/png", "WEBP": "image/webp", "GIF": "image/gif"}
 # Seconds to wait for one model reply; covers model loading and slow (thinking/CPU) generation.
 DEFAULT_TIMEOUT = 600.0
+# Ollama naming; LM Studio ids differ (e.g. qwen/qwen3-vl-8b), so pass --model there
+DEFAULT_MODEL = "qwen3-vl:8b"
+DEFAULT_HOSTS = {"ollama": "http://localhost:11434", "lm-studio": "http://localhost:1234"}
+# Pixel budget (megapixels) for the copy sent to the model. Measured with Qwen3-VL 4B: ~1 MP still
+# reads small diagram labels, Ollama enlarges anything smaller to ~1,200 tokens anyway, and a 12 MP
+# photo took 6x longer than its 1 MP copy for the same tags.
+DEFAULT_MAX_MEGAPIXELS = 1.0
+MODEL_JPEG_QUALITY = 90
 
 DEFAULT_PROMPT = (
     "Analyze this image, which could be an internet meme, screenshot, artwork, or photograph. "
@@ -88,6 +92,9 @@ def setup_logging(log_path: str | None) -> None:
     Args:
         log_path: The file path where logs should be written. If None, nothing
             is logged; warnings still reach the console through _warn().
+
+    Raises:
+        OSError: If the log can't be opened or isn't a regular file of this user (see _open_log()).
     """
 
     if log_path is None:
@@ -98,15 +105,42 @@ def setup_logging(log_path: str | None) -> None:
     path_obj.parent.mkdir(parents=True, exist_ok=True)
 
     logging.basicConfig(
-        filename=str(path_obj),
+        handlers=[logging.StreamHandler(_open_log(path_obj))],
         # INFO for other libraries keeps httpx's request lines but drops Pillow's per-chunk DEBUG noise
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(threadName)s %(name)s: %(message)s",
-        filemode="a",
-        encoding="utf-8",
     )
     logger.setLevel(logging.DEBUG)
     logger.info(f"Logging started (Python {platform.python_version()} on {platform.system()})")
+
+
+def _open_log(path: Path) -> TextIO:
+    """
+    Opens the log for appending once, without following a link at the leaf, and keeps that stream:
+    a check by name followed by a later open could be raced by swapping the file for a symlink.
+    The opened file must be a regular file and, on POSIX, belong to this user (a file someone
+    else planted, e.g. in /tmp, would receive the raw model replies).
+    """
+
+    if os.name == "nt":
+        fd = _win_open(path, _Win.FILE_APPEND_DATA, _Win.SHARE_ALL, _Win.OPEN_ALWAYS)
+    else:
+        # O_NONBLOCK: opening a FIFO fails (ENXIO) instead of waiting for a reader
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        fd = os.open(path, flags, 0o600)  # private: the log holds raw model replies and file paths
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & _Win.ATTRIBUTE_REPARSE_POINT:
+            raise OSError(errno.EINVAL, "The log file must be a regular file", str(path))
+        if os.name != "nt" and info.st_uid != os.geteuid():
+            raise OSError(errno.EPERM, "The log file must belong to the current user", str(path))
+        if os.name != "nt":
+            os.set_blocking(fd, True)
+        # backslashreplace like logging's own FileHandler: non-UTF-8 POSIX file names arrive as lone surrogates
+        return open(fd, "a", encoding="utf-8", errors="backslashreplace")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _log_path_error(log_path: str | None) -> str | None:
@@ -245,12 +279,14 @@ class _Win:
     DELETE = 0x00010000
     READ_CONTROL = 0x00020000
     FILE_LIST_DIRECTORY = 0x0001
+    FILE_APPEND_DATA = 0x0004
     FILE_TRAVERSE = 0x0020
     FILE_READ_ATTRIBUTES = 0x0080
     SHARE_READ_WRITE = 0x1 | 0x2
     SHARE_ALL = 0x1 | 0x2 | 0x4
     CREATE_NEW = 1
     OPEN_EXISTING = 3
+    OPEN_ALWAYS = 4
     ATTRIBUTE_REPARSE_POINT = 0x400
     FLAG_BACKUP_SEMANTICS = 0x02000000
     FLAG_OPEN_REPARSE_POINT = 0x00200000
@@ -517,20 +553,40 @@ def _file_attributes(fd: int) -> dict[str, bytes]:
         return {}
 
 
-def _apply_permissions(output: BinaryIO, mode: int, attributes: dict[str, bytes]) -> None:
+def _restore_group(fd: int, source: os.stat_result, name: str) -> int:
     """
-    Preserve source ACLs and remove any inherited temporary-file access grants, then the mode
-    (on Windows only the read-only attribute; the DACL was set when the temporary was created).
+    Give the POSIX temporary the source's owning group, so the kept mode doesn't grant its group
+    bits to a different (e.g. setgid-directory or primary) group. If that group can't be set
+    (this user isn't a member, or the filesystem/user namespace refuses it, e.g. EINVAL for an
+    unmapped gid), group access is dropped instead. Returns the mode to apply.
+    """
+    mode = stat.S_IMODE(source.st_mode)
+    if os.fstat(fd).st_gid == source.st_gid:
+        return mode
+    try:
+        os.fchown(fd, -1, source.st_gid)
+        return mode
+    except OSError as error:
+        _warn(f"Could not keep group {source.st_gid} on {name} ({error}); removed its group permissions instead")
+        return mode & ~0o070
+
+
+def _apply_permissions(output: BinaryIO, source: os.stat_result, attributes: dict[str, bytes], image_name: str) -> None:
+    """
+    Preserve the source group and ACLs and remove any inherited temporary-file access grants, then
+    the mode (on Windows only the read-only attribute; the DACL was set when the temporary was created).
     """
     fd = output.fileno()
+    mode = stat.S_IMODE(source.st_mode)
     if os.name != "nt":
+        mode = _restore_group(fd, source, image_name)
         existing = _file_attributes(fd)
         for name in existing.keys() - attributes.keys():
             os.removexattr(fd, name)
         for name, value in attributes.items():
             if existing.get(name) != value:
                 os.setxattr(fd, name, value)
-    os.chmod(fd, stat.S_IMODE(mode))
+    os.chmod(fd, mode)
 
 
 def _source_bytes(
@@ -583,7 +639,7 @@ def _image_edit(image_path: Path | str) -> Generator[tuple[bytes, BinaryIO]]:
                 try:
                     yield data, output
                     output.flush()
-                    _apply_permissions(output, original.st_mode, attributes)
+                    _apply_permissions(output, original, attributes, path.name)
                     _check_replacement(temporary, parent_fd, expected)
                     _check_replacement(path, parent_fd, original)
                     # Windows renames the still-open temporary through its handle
@@ -699,6 +755,12 @@ def _sanitize_with_pillow(src, dst, fmt=None) -> None:
         )
 
 
+def _is_corrupt_metadata_error(error: RuntimeError) -> bool:
+    """Tells whether a pyexiv2 error means broken metadata that a Pillow re-save can repair."""
+
+    return "IFD" in str(error).upper() or "corrupt" in str(error).lower()
+
+
 def _modify_with_pyexiv2(output: BinaryIO, edit: Callable[[Any], None]) -> None:
     """
     Applies edit() to a file's metadata with pyexiv2 and saves the result in place.
@@ -754,7 +816,7 @@ def write_metadata(image_path: str, tags_list: list[str]) -> None:
 
             except RuntimeError as e:
                 # Auto-healing fallback for corrupted EXIF data (IFD buffer errors)
-                if "IFD" in str(e).upper() or "corrupt" in str(e).lower():
+                if _is_corrupt_metadata_error(e):
                     _warn(
                         f"Corrupted metadata in {Path(image_path).name} ({e}); "
                         "re-saving it with Pillow before tagging (JPEG/WebP are re-encoded)"
@@ -844,9 +906,9 @@ def tag_image(image_path: str, tags_list: list[str], fmt: str | None = None) -> 
         raise RuntimeError(f"Could not determine format for {image_path}")
 
     try:
-        if fmt.lower() in ["jpg", "jpeg", "webp", "png"]:
+        if fmt in PYEXIV2_FORMATS:
             write_metadata(image_path, tags_list)
-        elif fmt.lower() == "gif":
+        elif fmt == "GIF":
             write_gif_tags(image_path, tags_list)
         else:
             raise ValueError(f"Unsupported file format: {fmt}")
@@ -873,7 +935,7 @@ def _clear_standard(source: bytes, output: BinaryIO, fmt: str | None = None) -> 
             _modify_with_pyexiv2(output, _clear_all)
         return "Cleared metadata (pyexiv2)"
     except RuntimeError as error:
-        if "IFD" not in str(error).upper() and "corrupt" not in str(error).lower():
+        if not _is_corrupt_metadata_error(error):
             raise
         logger.warning(f"Corrupted metadata ({error}); sanitizing image snapshot before clearing")
         output.seek(0)
@@ -917,7 +979,69 @@ def clear_tags(image_path: Path | str) -> None:
         print(f"  Failed to clear {p.name}: {e}")
 
 
-def get_tags_ollama(client: Any, model: str, img_path: Path, prompt: str) -> str:
+def _model_image(source: bytes, max_megapixels: float = DEFAULT_MAX_MEGAPIXELS) -> tuple[bytes, str]:
+    """
+    Prepares the copy of an image that is sent to the model; the file itself is never changed.
+
+    With a pixel budget, the first frame is decoded, turned upright by its EXIF orientation,
+    scaled down (never up, aspect ratio kept) to at most max_megapixels and re-encoded without
+    metadata: PNG for PNG/GIF sources and anything with transparency (lossless, keeps text
+    sharp), JPEG otherwise. With max_megapixels 0 the original bytes are sent unchanged, and
+    also when the copy can't be made (e.g. a truncated file Pillow identifies but can't decode).
+
+    Returns:
+        The bytes to send and their MIME type.
+    """
+
+    if not max_megapixels:
+        return _original_image(source)
+    try:
+        return _scaled_image(source, max_megapixels)
+    except (OSError, ValueError, SyntaxError, EOFError) as error:
+        # e.g. a truncated JPEG: verify() doesn't decode JPEG pixels, but servers decode leniently
+        logger.warning(f"Could not prepare a scaled copy ({error}); sending the original file instead")
+        return _original_image(source)
+
+
+def _original_image(source: bytes) -> tuple[bytes, str]:
+    """The original bytes and their Pillow-detected MIME type (fallback image/jpeg)."""
+
+    return source, MIME_TYPES.get(get_image_format(source) or "", DEFAULT_MIME_TYPE)
+
+
+def _scaled_image(source: bytes, max_megapixels: float) -> tuple[bytes, str]:
+    """The scaled, upright, metadata-free first-frame copy described in _model_image()."""
+
+    budget = max_megapixels * 1_000_000
+    with _open_pillow(source) as img:
+        lossless = img.format in {"PNG", "GIF"}
+        if img.format == "JPEG" and img.width * img.height > budget:
+            # Let libjpeg decode at a reduced scale (still at least the target size): much faster for big photos
+            scale = math.sqrt(budget / (img.width * img.height))
+            img.draft("RGB", (math.ceil(img.width * scale), math.ceil(img.height * scale)))
+        frame = ImageOps.exif_transpose(img)  # a copy of the first frame, upright
+
+    if frame.mode in {"I;16", "I;16B", "I;16L"}:
+        frame = frame.convert("I").point(lambda value: value / 256).convert("L")  # 16-bit PNG: keep the range
+    # "transparency" covers palette images and RGB/grayscale PNGs with a transparent colour (tRNS)
+    alpha = frame.mode in {"RGBA", "LA", "PA"} or "transparency" in frame.info
+    frame = frame.convert("RGBA" if alpha else "RGB")
+    if frame.width * frame.height > budget:
+        scale = math.sqrt(budget / (frame.width * frame.height))
+        size = (max(1, int(frame.width * scale)), max(1, int(frame.height * scale)))
+        frame = frame.resize(size, Image.Resampling.LANCZOS)
+
+    output = io.BytesIO()
+    if lossless or alpha:
+        frame.save(output, format="PNG")
+        return output.getvalue(), MIME_TYPES["PNG"]
+    frame.save(output, format="JPEG", quality=MODEL_JPEG_QUALITY)
+    return output.getvalue(), MIME_TYPES["JPEG"]
+
+
+def get_tags_ollama(
+    client: Any, model: str, img_path: Path, prompt: str, max_megapixels: float = DEFAULT_MAX_MEGAPIXELS
+) -> str:
     """
     Sends an image and prompt to an Ollama server for tag generation.
 
@@ -926,22 +1050,26 @@ def get_tags_ollama(client: Any, model: str, img_path: Path, prompt: str) -> str
         model: The identifier for the model to use (e.g., 'qwen3-vl:8b').
         img_path: The path to the image file.
         prompt: The prompt instructions for generating tags.
+        max_megapixels: Pixel budget for the copy sent (see _model_image(); 0 sends the original).
 
     Returns:
         A string containing the generated tags from the model response.
     """
 
     logger.debug(f"Requesting tags from Ollama ({model}) for {img_path}")
+    data, _ = _model_image(_read_image_bytes(img_path), max_megapixels)
     response = client.chat(
         model=model,
-        messages=[{"role": "user", "content": prompt, "images": [_read_image_bytes(img_path)]}],
+        messages=[{"role": "user", "content": prompt, "images": [data]}],
     )
-    content = response.message.content if hasattr(response, "message") else response["message"]["content"]
+    content = response.message.content
     logger.debug(f"Raw Ollama response for {img_path}: {content}")
     return content
 
 
-def get_tags_lm_studio(client: Any, model: str, img_path: Path, prompt: str) -> str:
+def get_tags_lm_studio(
+    client: Any, model: str, img_path: Path, prompt: str, max_megapixels: float = DEFAULT_MAX_MEGAPIXELS
+) -> str:
     """
     Encodes the image to base64 and sends a request to an LM Studio server.
 
@@ -950,26 +1078,15 @@ def get_tags_lm_studio(client: Any, model: str, img_path: Path, prompt: str) -> 
         model: The model identifier to use.
         img_path: The path to the image file.
         prompt: The text prompt for generating tags.
+        max_megapixels: Pixel budget for the copy sent (see _model_image(); 0 sends the original).
 
     Returns:
         A string containing the generated tags from the response content.
     """
 
     logger.debug(f"Requesting tags from LM Studio ({model}) for {img_path}")
-    source = _read_image_bytes(img_path)
-    fmt = get_image_format(source)
-    if fmt is None:
-        logger.error(f"Pillow could not determine the format for {img_path}")
-    mime_map = {
-        "jpeg": DEFAULT_MIME_TYPE,
-        "jpg": DEFAULT_MIME_TYPE,
-        "png": "image/png",
-        "webp": "image/webp",
-        "gif": "image/gif",
-    }
-    mime_type = mime_map.get((fmt or "").lower(), DEFAULT_MIME_TYPE)
-
-    base64_image = base64.b64encode(source).decode("utf-8")
+    data, mime_type = _model_image(_read_image_bytes(img_path), max_megapixels)
+    base64_image = base64.b64encode(data).decode("utf-8")
 
     response = client.chat.completions.create(
         model=model,
@@ -1201,6 +1318,7 @@ def process_single_image(
     model: str,
     prompt: str,
     stop_event: threading.Event,
+    max_megapixels: float = DEFAULT_MAX_MEGAPIXELS,
 ) -> tuple[str, str, str, float]:
     """Handles the full pipeline for a single image: validation -> AI -> tagging.
 
@@ -1211,6 +1329,7 @@ def process_single_image(
         model: The model identifier to use.
         prompt: The prompt instructions for tag generation.
         stop_event: A threading.Event to monitor for user cancellation.
+        max_megapixels: Pixel budget for the copy sent to the model (0 sends the original).
 
     Returns:
         A tuple containing (status, filename, message, duration).
@@ -1235,39 +1354,39 @@ def process_single_image(
         logger.info(f"Cancelled before start: {img_path.name}")
         return "CANCELLED", img_path.name, "Cancelled by user", 0
 
-    start = time.time()  # Start timing the actual processing
+    start = time.monotonic()  # Start timing the actual processing
     try:
         if backend == "ollama":
-            raw_output = get_tags_ollama(client, model, img_path, prompt)
+            raw_output = get_tags_ollama(client, model, img_path, prompt, max_megapixels)
         else:
-            raw_output = get_tags_lm_studio(client, model, img_path, prompt)
+            raw_output = get_tags_lm_studio(client, model, img_path, prompt, max_megapixels)
 
         # Parse model output robustly (handles JSON, bullets, intro text, or comma-separated)
         parsed_tags = parse_model_output(raw_output)
 
         if not parsed_tags:
             logger.warning(
-                f"Failed to extract valid tags from model response for {img_path.name} after {time.time() - start:.1f}s"
+                f"Failed to extract valid tags from model response for {img_path.name} after {time.monotonic() - start:.1f}s"
             )
             return (
                 "FAILED",
                 img_path.name,
                 "Invalid or insufficient tags returned from model",
-                time.time() - start,
+                time.monotonic() - start,
             )
 
         tag_image(str(img_path), parsed_tags, fmt=fmt)
-        logger.info(f"Tagged {img_path.name} in {time.time() - start:.1f}s with {parsed_tags}")
+        logger.info(f"Tagged {img_path.name} in {time.monotonic() - start:.1f}s with {parsed_tags}")
         return (
             "SUCCESS",
             img_path.name,
             f"Generated Tags: {parsed_tags}",
-            time.time() - start,
+            time.monotonic() - start,
         )
 
     except Exception as e:
-        logger.exception(f"Error processing {img_path.name} after {time.time() - start:.1f}s")
-        return "FAILED", img_path.name, str(e), time.time() - start
+        logger.exception(f"Error processing {img_path.name} after {time.monotonic() - start:.1f}s")
+        return "FAILED", img_path.name, str(e), time.monotonic() - start
 
 
 @dataclass
@@ -1341,18 +1460,11 @@ def _create_client(backend: str, host: str, timeout: float = DEFAULT_TIMEOUT) ->
         timeout: Seconds to wait for a model reply before the request fails.
 
     Returns:
-        The client, or None (after printing an error) if its library is not installed.
+        The ollama Client or the LM Studio OpenAI client.
     """
 
     if backend == "ollama":
-        if OllamaClient is None:
-            print("Error: 'ollama' library not found. Please install it using 'pip install ollama'.")
-            return None
         return OllamaClient(host=host, timeout=timeout)
-
-    if OpenAI is None:
-        print("Error: 'openai' library not found. Please install it using 'pip install openai'.")
-        return None
     # No retries: a timed-out request would be resent to a server still busy with it.
     return OpenAI(base_url=f"{host}/v1", api_key="lm-studio", timeout=timeout, max_retries=0)
 
@@ -1365,6 +1477,7 @@ def _run_tasks(
     prompt: str,
     max_workers: int,
     stop_event: threading.Event,
+    max_megapixels: float = DEFAULT_MAX_MEGAPIXELS,
 ) -> _RunStats:
     """Tags image_files concurrently with a progress bar and returns the totals."""
 
@@ -1379,6 +1492,7 @@ def _run_tasks(
                 model,
                 prompt,
                 stop_event,
+                max_megapixels,
             ): img_path
             for img_path in image_files
         }
@@ -1473,11 +1587,12 @@ def process_directory(
     directory: str,
     recursive: bool = False,
     backend: str = "ollama",
-    host: str = "http://localhost:11434",
-    model: str = "qwen3-vl:8b",
+    host: str | None = None,
+    model: str = DEFAULT_MODEL,
     max_workers: int = 1,
     clear: bool = False,
     timeout: float = DEFAULT_TIMEOUT,
+    max_megapixels: float = DEFAULT_MAX_MEGAPIXELS,
 ) -> None:
     """
     Orchestrates the image tagging process (or clearing when clear=True) for a directory.
@@ -1490,11 +1605,12 @@ def process_directory(
         directory: The root directory to scan for images.
         recursive: Whether to include subdirectories in the search.
         backend: The model provider backend ('ollama' or 'lm-studio').
-        host: The endpoint URL for the chosen backend.
+        host: The endpoint URL for the chosen backend; defaults to its localhost URL (DEFAULT_HOSTS).
         model: The specific model name/ID to use.
-        max_workers: The maximum number of concurrent threads (limited to 4).
+        max_workers: The maximum number of concurrent threads (the CLI allows 1-4).
         clear: If True, clears metadata and comments instead of tagging.
         timeout: Seconds to wait for each model reply before that image fails.
+        max_megapixels: Pixel budget for the copy of each image sent to the model (0 sends the original).
     """
 
     if clear:
@@ -1506,20 +1622,19 @@ def process_directory(
         print(f"No valid images found in '{directory}'.")
         return
 
+    host = host or DEFAULT_HOSTS[backend]
     print(f"Initialized backend: {backend} | Target: {host}")
     print(f"Found {len(image_files)} images to process. Starting...\n")
     logger.info(
         f"Tagging {len(image_files)} images in {directory} (recursive={recursive}) via {backend} at {host}: "
-        f"model={model}, workers={max_workers}, timeout={timeout:g}s"
+        f"model={model}, workers={max_workers}, timeout={timeout:g}s, max_pixels={max_megapixels:g} MP"
     )
 
     prompt = _load_prompt()
     logger.debug(f"Prompt: {prompt}")
     client = _create_client(backend, host, timeout)
-    if client is None:
-        return
 
-    start_time = time.time()
+    start_time = time.monotonic()
 
     # Concurrency and quitting
     stop_event = threading.Event()
@@ -1529,7 +1644,7 @@ def process_directory(
     try:
         print(f"Starting concurrent processing (max_workers={max_workers}).")
         print("Press 'q' at any time to stop and see the current report.\n")
-        stats = _run_tasks(image_files, client, backend, model, prompt, max_workers, stop_event)
+        stats = _run_tasks(image_files, client, backend, model, prompt, max_workers, stop_event, max_megapixels)
     except Exception as e:
         print(f"An unexpected error occurred during processing: {e}")
         raise
@@ -1539,14 +1654,16 @@ def process_directory(
         stop_event.set()
         quit_thread.join(timeout=2)
 
-    total_seconds = time.time() - start_time
+    total_seconds = time.monotonic() - start_time
     _print_report(stats, total_seconds)
     logger.info(
         f"Finished in {total_seconds:.1f}s: {stats.success} tagged, {stats.skipped} skipped, {stats.failed} failed"
     )
 
 
-if __name__ == "__main__":
+def _build_parser() -> argparse.ArgumentParser:
+    """Builds the command-line parser."""
+
     parser = argparse.ArgumentParser(description="Image tagger using a vision-language model")
     parser.add_argument("directory", help="Path to your image folder")
     parser.add_argument(
@@ -1564,8 +1681,8 @@ if __name__ == "__main__":
     parser.add_argument("--host", help="backend endpoint URL (localhost by default)")
     parser.add_argument(
         "--model",
-        default="qwen3-vl:8b",
-        help="model identification tag (defaults to qwen3-vl:8b)",
+        default=DEFAULT_MODEL,
+        help=f"model identification tag (defaults to {DEFAULT_MODEL})",
     )
     parser.add_argument(
         "--workers",
@@ -1579,14 +1696,52 @@ if __name__ == "__main__":
         default=DEFAULT_TIMEOUT,
         help=f"seconds to wait for each model reply before the image fails (default {DEFAULT_TIMEOUT:g})",
     )
+    parser.add_argument(
+        "--max-pixels",
+        type=float,
+        default=DEFAULT_MAX_MEGAPIXELS,
+        metavar="MEGAPIXELS",
+        help=(
+            "scale the copy sent to the model down to at most this many megapixels "
+            f"(default {DEFAULT_MAX_MEGAPIXELS:g}; 0 sends the original file); the files are not changed"
+        ),
+    )
     parser.add_argument("--log", help="enable logging and append to this .log file (e.g., --log logs/run.log)")
     parser.add_argument(
         "--clear",
         action="store_true",
         help="clear metadata (EXIF/XMP/IPTC) and comments from images instead of tagging",
     )
+    return parser
 
-    args = parser.parse_args()
+
+def _argument_error(args: argparse.Namespace) -> str | None:
+    """Returns the message for the first invalid argument, or None if they are all valid."""
+
+    if not Path(args.directory).is_dir():
+        return f"The folder '{args.directory}' could not be located."
+    # Max 4 workers as it's the default limit for both ollama and LM Studio.
+    if not 1 <= args.workers <= 4:
+        return f"Workers must be between 1 and 4, got {args.workers}"
+    if math.isnan(args.timeout) or args.timeout <= 0:
+        return f"Timeout must be a positive number of seconds, got {args.timeout:g}"
+    if math.isnan(args.max_pixels) or args.max_pixels < 0:
+        return f"Max pixels must be zero or a positive number of megapixels, got {args.max_pixels:g}"
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    """
+    Runs the command-line interface.
+
+    Args:
+        argv: The arguments without the program name; defaults to sys.argv[1:].
+
+    Returns:
+        The exit code: 0, or 1 for invalid arguments.
+    """
+
+    args = _build_parser().parse_args(argv)
 
     # Redirected output on Windows uses the ANSI code page (e.g. cp1252), which can't encode
     # "✓" or many file names; print "?" for those instead of failing the image or the run.
@@ -1595,25 +1750,17 @@ if __name__ == "__main__":
 
     if log_error := _log_path_error(args.log):
         print(f"Error: {log_error}.")
-        sys.exit(1)
+        return 1
 
-    setup_logging(args.log)
+    try:
+        setup_logging(args.log)
+    except OSError as e:
+        print(f"Error: Could not open the log file '{args.log}': {e}")
+        return 1
 
-    if not Path(args.directory).is_dir():
-        print(f"Error: The folder '{args.directory}' could not be located.")
-        sys.exit(1)
-
-    # Max 4 workers as it's the default limit for both ollama and LM Studio.
-    if not 1 <= args.workers <= 4:
-        print(f"Error: Workers must be between 1 and 4, got {args.workers}")
-        sys.exit(1)
-
-    if math.isnan(args.timeout) or args.timeout <= 0:
-        print(f"Error: Timeout must be a positive number of seconds, got {args.timeout:g}")
-        sys.exit(1)
-
-    if not args.host:
-        args.host = "http://localhost:11434" if args.backend == "ollama" else "http://localhost:1234"
+    if error := _argument_error(args):
+        print(f"Error: {error}")
+        return 1
 
     process_directory(
         args.directory,
@@ -1624,4 +1771,10 @@ if __name__ == "__main__":
         args.workers,
         clear=args.clear,
         timeout=args.timeout,
+        max_megapixels=args.max_pixels,
     )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

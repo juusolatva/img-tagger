@@ -1,4 +1,4 @@
-"""End-to-end CLI tests that run the scripts as subprocesses (no model server needed)."""
+"""CLI tests: main() in-process for argument handling, subprocesses for end-to-end runs (no model server needed)."""
 
 import os
 import subprocess
@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import SAMPLE_TAGS, make_gif, make_image
+from conftest import SAMPLE_TAGS, FakeOpenAIClient, make_gif, make_image
 
 import img_tagger
 
@@ -25,6 +25,83 @@ def run(script: str, *args: str, env: dict[str, str] | None = None) -> subproces
     )
 
 
+def call_main(capsys, *args: str) -> tuple[int, str]:
+    """Runs main() in-process; returns (exit code, stdout)."""
+    code = img_tagger.main(list(args))
+    return code, capsys.readouterr().out
+
+
+class TestMain:
+    """Argument handling through main(); none of these reach setup_logging()."""
+
+    def test_missing_directory(self, capsys, tmp_path):
+        code, out = call_main(capsys, str(tmp_path / "nope"))
+        assert code == 1
+        assert "could not be located" in out
+
+    @pytest.mark.parametrize("workers", ["0", "5", "-1"])
+    def test_rejects_out_of_range_workers(self, capsys, tmp_path, workers):
+        code, out = call_main(capsys, str(tmp_path), "--workers", workers)
+        assert code == 1
+        assert "Workers must be between 1 and 4" in out
+
+    @pytest.mark.parametrize("timeout", ["0", "-5", "nan"])
+    def test_rejects_non_positive_timeout(self, capsys, tmp_path, timeout):
+        code, out = call_main(capsys, str(tmp_path), "--timeout", timeout)
+        assert code == 1
+        assert "Timeout must be a positive number" in out
+
+    def test_rejects_unknown_backend(self, capsys, tmp_path):
+        with pytest.raises(SystemExit) as exit_info:
+            img_tagger.main([str(tmp_path), "--backend", "bogus"])
+        assert exit_info.value.code == 2
+        assert "invalid choice" in capsys.readouterr().err
+
+    def test_empty_directory_exits_cleanly(self, capsys, tmp_path):
+        code, out = call_main(capsys, str(tmp_path))
+        assert code == 0
+        assert "No valid images found" in out
+
+    @pytest.mark.parametrize("name", ["notes.txt", ".bashrc", "authorized_keys", "run.log.py"])
+    def test_rejects_log_without_log_suffix(self, capsys, tmp_path, name):
+        log = tmp_path / "logs" / name
+        code, out = call_main(capsys, str(tmp_path), "--log", str(log))
+        assert code == 1
+        assert "must end in .log" in out
+        assert not log.parent.exists()
+
+    @pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges on Windows")
+    def test_rejects_symlinked_log(self, capsys, tmp_path):
+        target = tmp_path / "profile"
+        target.write_text("original\n", encoding="utf-8")
+        log = tmp_path / "run.log"
+        log.symlink_to(target)
+        code, out = call_main(capsys, str(tmp_path), "--log", str(log))
+        assert code == 1
+        assert "must not be a symlink" in out
+        assert target.read_text(encoding="utf-8") == "original\n"
+
+    def test_rejects_non_regular_log(self, capsys, tmp_path):
+        log = tmp_path / "dir.log"
+        log.mkdir()
+        code, out = call_main(capsys, str(tmp_path), "--log", str(log))
+        assert code == 1
+        assert "must be a regular file" in out
+
+    def test_lm_studio_without_host_uses_its_own_default(self, tmp_path, monkeypatch, no_quit_listener):
+        make_image(tmp_path / "a.png")
+        hosts = []
+
+        def fake_client(backend, host, timeout):
+            hosts.append(host)
+            return FakeOpenAIClient()
+
+        monkeypatch.setattr(img_tagger, "_create_client", fake_client)
+        assert img_tagger.main([str(tmp_path), "--backend", "lm-studio"]) == 0
+        img_tagger.process_directory(str(tmp_path), backend="lm-studio")
+        assert hosts == [img_tagger.DEFAULT_HOSTS["lm-studio"]] * 2
+
+
 class TestImgTaggerCli:
     def test_help(self):
         result = run("img_tagger.py", "--help")
@@ -36,69 +113,17 @@ class TestImgTaggerCli:
             "--model",
             "--workers",
             "--timeout",
+            "--max-pixels",
             "--log",
             "--clear",
         ]:
             assert flag in result.stdout
-
-    def test_missing_directory(self, tmp_path):
-        result = run("img_tagger.py", str(tmp_path / "nope"))
-        assert result.returncode == 1
-        assert "could not be located" in result.stdout
-
-    @pytest.mark.parametrize("workers", ["0", "5", "-1"])
-    def test_rejects_out_of_range_workers(self, tmp_path, workers):
-        result = run("img_tagger.py", str(tmp_path), "--workers", workers)
-        assert result.returncode == 1
-        assert "Workers must be between 1 and 4" in result.stdout
-
-    @pytest.mark.parametrize("timeout", ["0", "-5", "nan"])
-    def test_rejects_non_positive_timeout(self, tmp_path, timeout):
-        result = run("img_tagger.py", str(tmp_path), "--timeout", timeout)
-        assert result.returncode == 1
-        assert "Timeout must be a positive number" in result.stdout
-
-    def test_rejects_unknown_backend(self, tmp_path):
-        result = run("img_tagger.py", str(tmp_path), "--backend", "bogus")
-        assert result.returncode == 2
-        assert "invalid choice" in result.stderr
-
-    def test_empty_directory_exits_cleanly(self, tmp_path):
-        result = run("img_tagger.py", str(tmp_path))
-        assert result.returncode == 0
-        assert "No valid images found" in result.stdout
 
     def test_log_file_created(self, tmp_path):
         log = tmp_path / "logs" / "run.log"
         result = run("img_tagger.py", str(tmp_path), "--log", str(log))
         assert result.returncode == 0
         assert log.parent.is_dir()
-
-    @pytest.mark.parametrize("name", ["notes.txt", ".bashrc", "authorized_keys", "run.log.py"])
-    def test_rejects_log_without_log_suffix(self, tmp_path, name):
-        log = tmp_path / "logs" / name
-        result = run("img_tagger.py", str(tmp_path), "--log", str(log))
-        assert result.returncode == 1
-        assert "must end in .log" in result.stdout
-        assert not log.parent.exists()
-
-    @pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges on Windows")
-    def test_rejects_symlinked_log(self, tmp_path):
-        target = tmp_path / "profile"
-        target.write_text("original\n", encoding="utf-8")
-        log = tmp_path / "run.log"
-        log.symlink_to(target)
-        result = run("img_tagger.py", str(tmp_path), "--log", str(log))
-        assert result.returncode == 1
-        assert "must not be a symlink" in result.stdout
-        assert target.read_text(encoding="utf-8") == "original\n"
-
-    def test_rejects_non_regular_log(self, tmp_path):
-        log = tmp_path / "dir.log"
-        log.mkdir()
-        result = run("img_tagger.py", str(tmp_path), "--log", str(log))
-        assert result.returncode == 1
-        assert "must be a regular file" in result.stdout
 
     def test_appends_to_existing_uppercase_log(self, tmp_path):
         log = tmp_path / "RUN.LOG"
@@ -178,3 +203,87 @@ class TestImgTaggerCli:
         assert "Resetting tags for 4 images" in result.stdout
         for p in paths:
             assert not img_tagger.is_already_processed(p)
+
+
+class TestOpenLog:
+    """setup_logging() opens the log once, so a swap after _log_path_error() can't redirect appends."""
+
+    def test_symlink_swapped_in_after_validation_is_refused(self, tmp_path):
+        target = tmp_path / "profile"
+        target.write_text("original\n", encoding="utf-8")
+        log = tmp_path / "run.log"
+        assert img_tagger._log_path_error(str(log)) is None  # validated while it doesn't exist yet
+        try:
+            log.symlink_to(target)
+        except OSError as error:
+            pytest.skip(f"Symlink creation unavailable: {error}")
+        with pytest.raises(OSError):
+            img_tagger.setup_logging(str(log))
+        assert target.read_text(encoding="utf-8") == "original\n"
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX FIFOs")
+    def test_fifo_is_refused_without_blocking(self, tmp_path):
+        log = tmp_path / "pipe.log"
+        os.mkfifo(log)
+        with pytest.raises(OSError):
+            img_tagger.setup_logging(str(log))
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file ownership")
+    def test_log_owned_by_another_user_is_refused(self, tmp_path, monkeypatch):
+        log = tmp_path / "run.log"
+        log.write_text("someone else's\n", encoding="utf-8")
+        monkeypatch.setattr(img_tagger.os, "geteuid", lambda: log.stat().st_uid + 1)
+        with pytest.raises(OSError, match="belong"):
+            img_tagger.setup_logging(str(log))
+        assert log.read_text(encoding="utf-8") == "someone else's\n"
+
+    def test_main_reports_unopenable_log(self, capsys, tmp_path, monkeypatch):
+        def refuse(path):
+            raise OSError(1, "The log file must belong to the current user", str(path))
+
+        monkeypatch.setattr(img_tagger, "_open_log", refuse)
+        code, out = call_main(capsys, str(tmp_path), "--log", str(tmp_path / "run.log"))
+        assert code == 1
+        assert "Could not open the log file" in out
+
+
+class TestMaxPixels:
+    @pytest.mark.parametrize("value", ["-1", "nan"])
+    def test_rejects_negative_or_nan(self, capsys, tmp_path, value):
+        code, out = call_main(capsys, str(tmp_path), "--max-pixels", value)
+        assert code == 1
+        assert "Max pixels must be zero or a positive number" in out
+
+    @pytest.mark.parametrize(
+        ("value", "expected"), [(None, img_tagger.DEFAULT_MAX_MEGAPIXELS), ("0", 0.0), ("2.5", 2.5)]
+    )
+    def test_reaches_the_backend_call(self, tmp_path, monkeypatch, no_quit_listener, value, expected):
+        make_image(tmp_path / "a.png")
+        budgets = []
+
+        def fake_get_tags(client, model, img_path, prompt, max_megapixels):
+            budgets.append(max_megapixels)
+            return ", ".join(SAMPLE_TAGS)
+
+        monkeypatch.setattr(img_tagger, "_create_client", lambda *args: FakeOpenAIClient())
+        monkeypatch.setattr(img_tagger, "get_tags_ollama", fake_get_tags)
+        args = [str(tmp_path)] + (["--max-pixels", value] if value else [])
+        assert img_tagger.main(args) == 0
+        assert budgets == [expected]
+
+
+def test_log_stream_tolerates_undecodable_file_names(tmp_path):
+    log = tmp_path / "run.log"
+    stream = img_tagger._open_log(log)
+    try:
+        stream.write("Processing caf\udce9.jpg\n")  # how a Latin-1 name arrives on POSIX (surrogateescape)
+    finally:
+        stream.close()
+    assert log.read_text(encoding="utf-8") == r"Processing caf\udce9.jpg" + "\n"  # escaped, not dropped
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_new_log_is_private(tmp_path):
+    log = tmp_path / "run.log"
+    img_tagger._open_log(log).close()
+    assert log.stat().st_mode & 0o077 == 0

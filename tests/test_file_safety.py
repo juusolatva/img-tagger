@@ -1,5 +1,6 @@
 """Regression tests for image disclosure and redirected temporary-file writes."""
 
+import errno
 import os
 import stat
 import struct
@@ -134,7 +135,7 @@ def test_ollama_receives_snapshot_even_if_path_changes_during_request(tmp_path):
             return super().chat(model, messages)
 
     client = ReplacingClient()
-    img_tagger.get_tags_ollama(client, "m", image, "p")
+    img_tagger.get_tags_ollama(client, "m", image, "p", max_megapixels=0)
     assert client.calls[0]["messages"][0]["images"] == [expected]
 
 
@@ -455,3 +456,60 @@ def test_reads_do_not_capture_permissions(tmp_path, monkeypatch):
     monkeypatch.setattr(img_tagger, "_file_attributes", no_attributes)
     assert img_tagger.get_image_format(image) == "PNG"
     assert not img_tagger.is_already_processed(image)
+
+
+def other_group_or_skip() -> int:
+    """A group of this user other than the one new files get, so the temporary's group differs."""
+    groups = [group for group in os.getgroups() if group != os.getegid()]
+    if not groups:
+        pytest.skip("needs a user with a secondary group")
+    return groups[0]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX owning group")
+@pytest.mark.parametrize("clear", [False, True])
+@pytest.mark.parametrize("extension", ["png", "gif"])
+def test_keeps_the_source_group_instead_of_the_temporary_one(tmp_path, clear, extension):
+    image = tmp_path / f"a.{extension}"
+    (make_gif if extension == "gif" else make_image)(image)
+    group = other_group_or_skip()
+    os.chown(image, -1, group)
+    image.chmod(0o640)
+    if clear:
+        img_tagger.clear_tags(image)
+    else:
+        img_tagger.tag_image(str(image), SAMPLE_TAGS)
+    assert image.stat().st_gid == group
+    assert stat.S_IMODE(image.stat().st_mode) == 0o640
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX owning group")
+def test_unkeepable_group_drops_group_access(tmp_path, monkeypatch, capsys):
+    image = make_image(tmp_path / "a.png")
+    os.chown(image, -1, other_group_or_skip())
+    image.chmod(0o640)
+
+    def not_a_member(fd, uid, gid):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(img_tagger.os, "fchown", not_a_member)
+    img_tagger.tag_image(str(image), SAMPLE_TAGS)
+    assert stat.S_IMODE(image.stat().st_mode) == 0o600
+    assert "removed its group permissions" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX owning group")
+@pytest.mark.parametrize("error", [errno.EINVAL, errno.EOPNOTSUPP, errno.ENOSYS])
+def test_group_refused_by_filesystem_drops_group_access(tmp_path, monkeypatch, capsys, error):
+    image = make_image(tmp_path / "a.png")
+    os.chown(image, -1, other_group_or_skip())
+    image.chmod(0o640)
+
+    def refuse(fd, uid, gid):
+        raise OSError(error, os.strerror(error))
+
+    monkeypatch.setattr(img_tagger.os, "fchown", refuse)
+    img_tagger.tag_image(str(image), SAMPLE_TAGS)
+    assert img_tagger.is_already_processed(image)
+    assert stat.S_IMODE(image.stat().st_mode) == 0o600
+    assert "removed its group permissions" in capsys.readouterr().out

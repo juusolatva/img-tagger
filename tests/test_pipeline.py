@@ -271,19 +271,6 @@ class TestProcessDirectory:
         assert "No valid images found" in capsys.readouterr().out
         assert fake_ollama.instances == []
 
-    def test_missing_ollama_library(self, tmp_path, monkeypatch, capsys):
-        monkeypatch.setattr(img_tagger, "OllamaClient", None)
-        make_image(tmp_path / "a.jpg")
-        self._run(tmp_path)
-        assert "'ollama' library not found" in capsys.readouterr().out
-        assert not img_tagger.is_already_processed(tmp_path / "a.jpg")
-
-    def test_missing_openai_library(self, tmp_path, monkeypatch, capsys):
-        monkeypatch.setattr(img_tagger, "OpenAI", None)
-        make_image(tmp_path / "a.jpg")
-        self._run(tmp_path, backend="lm-studio")
-        assert "'openai' library not found" in capsys.readouterr().out
-
     def test_quit_cancels_queued_images(self, tmp_path, fake_ollama, monkeypatch, capsys):
         # Simulate 'Q' being pressed before any work starts: nothing should reach the model.
         monkeypatch.setattr(img_tagger, "listen_for_quit", lambda stop_event: stop_event.set())

@@ -2,6 +2,10 @@
 target-version = "py313"
 line-length = 120
 
+[tool.ruff.lint]
+# On top of the defaults: every broad `except Exception` needs a reason (BLE) and unused noqa comments fail (RUF100)
+extend-select = ["BLE", "RUF100"]
+
 [tool.coverage.run]
 source = ["."]
 omit = ["tests/*"]
