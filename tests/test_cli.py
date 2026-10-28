@@ -113,6 +113,7 @@ class TestImgTaggerCli:
             "--model",
             "--workers",
             "--timeout",
+            "--max-pixels",
             "--log",
             "--clear",
         ]:
@@ -244,3 +245,28 @@ class TestOpenLog:
         code, out = call_main(capsys, str(tmp_path), "--log", str(tmp_path / "run.log"))
         assert code == 1
         assert "Could not open the log file" in out
+
+
+class TestMaxPixels:
+    @pytest.mark.parametrize("value", ["-1", "nan"])
+    def test_rejects_negative_or_nan(self, capsys, tmp_path, value):
+        code, out = call_main(capsys, str(tmp_path), "--max-pixels", value)
+        assert code == 1
+        assert "Max pixels must be zero or a positive number" in out
+
+    @pytest.mark.parametrize(
+        ("value", "expected"), [(None, img_tagger.DEFAULT_MAX_MEGAPIXELS), ("0", 0.0), ("2.5", 2.5)]
+    )
+    def test_reaches_the_backend_call(self, tmp_path, monkeypatch, no_quit_listener, value, expected):
+        make_image(tmp_path / "a.png")
+        budgets = []
+
+        def fake_get_tags(client, model, img_path, prompt, max_megapixels):
+            budgets.append(max_megapixels)
+            return ", ".join(SAMPLE_TAGS)
+
+        monkeypatch.setattr(img_tagger, "_create_client", lambda *args: FakeOpenAIClient())
+        monkeypatch.setattr(img_tagger, "get_tags_ollama", fake_get_tags)
+        args = [str(tmp_path)] + (["--max-pixels", value] if value else [])
+        assert img_tagger.main(args) == 0
+        assert budgets == [expected]

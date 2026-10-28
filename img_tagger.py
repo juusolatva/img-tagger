@@ -35,7 +35,7 @@ from typing import Any, BinaryIO, TextIO
 import pyexiv2
 from ollama import Client as OllamaClient
 from openai import OpenAI
-from PIL import Image, ImageSequence
+from PIL import Image, ImageOps, ImageSequence
 from tqdm import tqdm
 
 try:
@@ -68,6 +68,11 @@ DEFAULT_TIMEOUT = 600.0
 # Ollama naming; LM Studio ids differ (e.g. qwen/qwen3-vl-8b), so pass --model there
 DEFAULT_MODEL = "qwen3-vl:8b"
 DEFAULT_HOSTS = {"ollama": "http://localhost:11434", "lm-studio": "http://localhost:1234"}
+# Pixel budget (megapixels) for the copy sent to the model. Measured with Qwen3-VL 4B: ~1 MP still
+# reads small diagram labels, Ollama enlarges anything smaller to ~1,200 tokens anyway, and a 12 MP
+# photo took 6x longer than its 1 MP copy for the same tags.
+DEFAULT_MAX_MEGAPIXELS = 1.0
+MODEL_JPEG_QUALITY = 90
 
 DEFAULT_PROMPT = (
     "Analyze this image, which could be an internet meme, screenshot, artwork, or photograph. "
@@ -972,7 +977,51 @@ def clear_tags(image_path: Path | str) -> None:
         print(f"  Failed to clear {p.name}: {e}")
 
 
-def get_tags_ollama(client: Any, model: str, img_path: Path, prompt: str) -> str:
+def _model_image(source: bytes, max_megapixels: float = DEFAULT_MAX_MEGAPIXELS) -> tuple[bytes, str]:
+    """
+    Prepares the copy of an image that is sent to the model; the file itself is never changed.
+
+    With a pixel budget, the first frame is decoded, turned upright by its EXIF orientation,
+    scaled down (never up, aspect ratio kept) to at most max_megapixels and re-encoded without
+    metadata: PNG for PNG/GIF sources and anything with transparency (lossless, keeps text
+    sharp), JPEG otherwise. With max_megapixels 0 the original bytes are sent unchanged.
+
+    Returns:
+        The bytes to send and their MIME type.
+    """
+
+    if not max_megapixels:
+        return source, MIME_TYPES.get(get_image_format(source) or "", DEFAULT_MIME_TYPE)
+
+    budget = max_megapixels * 1_000_000
+    with _open_pillow(source) as img:
+        lossless = img.format in {"PNG", "GIF"}
+        if img.format == "JPEG" and img.width * img.height > budget:
+            # Let libjpeg decode at a reduced scale (still at least the target size): much faster for big photos
+            scale = math.sqrt(budget / (img.width * img.height))
+            img.draft("RGB", (math.ceil(img.width * scale), math.ceil(img.height * scale)))
+        frame = ImageOps.exif_transpose(img)  # a copy of the first frame, upright
+
+    if frame.mode in {"I;16", "I;16B", "I;16L"}:
+        frame = frame.convert("I").point(lambda value: value / 256).convert("L")  # 16-bit PNG: keep the range
+    alpha = frame.mode in {"RGBA", "LA", "PA"} or (frame.mode == "P" and "transparency" in frame.info)
+    frame = frame.convert("RGBA" if alpha else "RGB")
+    if frame.width * frame.height > budget:
+        scale = math.sqrt(budget / (frame.width * frame.height))
+        size = (max(1, int(frame.width * scale)), max(1, int(frame.height * scale)))
+        frame = frame.resize(size, Image.Resampling.LANCZOS)
+
+    output = io.BytesIO()
+    if lossless or alpha:
+        frame.save(output, format="PNG")
+        return output.getvalue(), MIME_TYPES["PNG"]
+    frame.save(output, format="JPEG", quality=MODEL_JPEG_QUALITY)
+    return output.getvalue(), MIME_TYPES["JPEG"]
+
+
+def get_tags_ollama(
+    client: Any, model: str, img_path: Path, prompt: str, max_megapixels: float = DEFAULT_MAX_MEGAPIXELS
+) -> str:
     """
     Sends an image and prompt to an Ollama server for tag generation.
 
@@ -981,22 +1030,26 @@ def get_tags_ollama(client: Any, model: str, img_path: Path, prompt: str) -> str
         model: The identifier for the model to use (e.g., 'qwen3-vl:8b').
         img_path: The path to the image file.
         prompt: The prompt instructions for generating tags.
+        max_megapixels: Pixel budget for the copy sent (see _model_image(); 0 sends the original).
 
     Returns:
         A string containing the generated tags from the model response.
     """
 
     logger.debug(f"Requesting tags from Ollama ({model}) for {img_path}")
+    data, _ = _model_image(_read_image_bytes(img_path), max_megapixels)
     response = client.chat(
         model=model,
-        messages=[{"role": "user", "content": prompt, "images": [_read_image_bytes(img_path)]}],
+        messages=[{"role": "user", "content": prompt, "images": [data]}],
     )
     content = response.message.content
     logger.debug(f"Raw Ollama response for {img_path}: {content}")
     return content
 
 
-def get_tags_lm_studio(client: Any, model: str, img_path: Path, prompt: str) -> str:
+def get_tags_lm_studio(
+    client: Any, model: str, img_path: Path, prompt: str, max_megapixels: float = DEFAULT_MAX_MEGAPIXELS
+) -> str:
     """
     Encodes the image to base64 and sends a request to an LM Studio server.
 
@@ -1005,19 +1058,15 @@ def get_tags_lm_studio(client: Any, model: str, img_path: Path, prompt: str) -> 
         model: The model identifier to use.
         img_path: The path to the image file.
         prompt: The text prompt for generating tags.
+        max_megapixels: Pixel budget for the copy sent (see _model_image(); 0 sends the original).
 
     Returns:
         A string containing the generated tags from the response content.
     """
 
     logger.debug(f"Requesting tags from LM Studio ({model}) for {img_path}")
-    source = _read_image_bytes(img_path)
-    fmt = get_image_format(source)
-    if fmt is None:
-        logger.error(f"Pillow could not determine the format for {img_path}")
-    mime_type = MIME_TYPES.get(fmt or "", DEFAULT_MIME_TYPE)
-
-    base64_image = base64.b64encode(source).decode("utf-8")
+    data, mime_type = _model_image(_read_image_bytes(img_path), max_megapixels)
+    base64_image = base64.b64encode(data).decode("utf-8")
 
     response = client.chat.completions.create(
         model=model,
@@ -1249,6 +1298,7 @@ def process_single_image(
     model: str,
     prompt: str,
     stop_event: threading.Event,
+    max_megapixels: float = DEFAULT_MAX_MEGAPIXELS,
 ) -> tuple[str, str, str, float]:
     """Handles the full pipeline for a single image: validation -> AI -> tagging.
 
@@ -1259,6 +1309,7 @@ def process_single_image(
         model: The model identifier to use.
         prompt: The prompt instructions for tag generation.
         stop_event: A threading.Event to monitor for user cancellation.
+        max_megapixels: Pixel budget for the copy sent to the model (0 sends the original).
 
     Returns:
         A tuple containing (status, filename, message, duration).
@@ -1286,9 +1337,9 @@ def process_single_image(
     start = time.monotonic()  # Start timing the actual processing
     try:
         if backend == "ollama":
-            raw_output = get_tags_ollama(client, model, img_path, prompt)
+            raw_output = get_tags_ollama(client, model, img_path, prompt, max_megapixels)
         else:
-            raw_output = get_tags_lm_studio(client, model, img_path, prompt)
+            raw_output = get_tags_lm_studio(client, model, img_path, prompt, max_megapixels)
 
         # Parse model output robustly (handles JSON, bullets, intro text, or comma-separated)
         parsed_tags = parse_model_output(raw_output)
@@ -1406,6 +1457,7 @@ def _run_tasks(
     prompt: str,
     max_workers: int,
     stop_event: threading.Event,
+    max_megapixels: float = DEFAULT_MAX_MEGAPIXELS,
 ) -> _RunStats:
     """Tags image_files concurrently with a progress bar and returns the totals."""
 
@@ -1420,6 +1472,7 @@ def _run_tasks(
                 model,
                 prompt,
                 stop_event,
+                max_megapixels,
             ): img_path
             for img_path in image_files
         }
@@ -1519,6 +1572,7 @@ def process_directory(
     max_workers: int = 1,
     clear: bool = False,
     timeout: float = DEFAULT_TIMEOUT,
+    max_megapixels: float = DEFAULT_MAX_MEGAPIXELS,
 ) -> None:
     """
     Orchestrates the image tagging process (or clearing when clear=True) for a directory.
@@ -1536,6 +1590,7 @@ def process_directory(
         max_workers: The maximum number of concurrent threads (the CLI allows 1-4).
         clear: If True, clears metadata and comments instead of tagging.
         timeout: Seconds to wait for each model reply before that image fails.
+        max_megapixels: Pixel budget for the copy of each image sent to the model (0 sends the original).
     """
 
     if clear:
@@ -1552,7 +1607,7 @@ def process_directory(
     print(f"Found {len(image_files)} images to process. Starting...\n")
     logger.info(
         f"Tagging {len(image_files)} images in {directory} (recursive={recursive}) via {backend} at {host}: "
-        f"model={model}, workers={max_workers}, timeout={timeout:g}s"
+        f"model={model}, workers={max_workers}, timeout={timeout:g}s, max_pixels={max_megapixels:g} MP"
     )
 
     prompt = _load_prompt()
@@ -1569,7 +1624,7 @@ def process_directory(
     try:
         print(f"Starting concurrent processing (max_workers={max_workers}).")
         print("Press 'q' at any time to stop and see the current report.\n")
-        stats = _run_tasks(image_files, client, backend, model, prompt, max_workers, stop_event)
+        stats = _run_tasks(image_files, client, backend, model, prompt, max_workers, stop_event, max_megapixels)
     except Exception as e:
         print(f"An unexpected error occurred during processing: {e}")
         raise
@@ -1621,6 +1676,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TIMEOUT,
         help=f"seconds to wait for each model reply before the image fails (default {DEFAULT_TIMEOUT:g})",
     )
+    parser.add_argument(
+        "--max-pixels",
+        type=float,
+        default=DEFAULT_MAX_MEGAPIXELS,
+        metavar="MEGAPIXELS",
+        help=(
+            "scale the copy sent to the model down to at most this many megapixels "
+            f"(default {DEFAULT_MAX_MEGAPIXELS:g}; 0 sends the original file); the files are not changed"
+        ),
+    )
     parser.add_argument("--log", help="enable logging and append to this .log file (e.g., --log logs/run.log)")
     parser.add_argument(
         "--clear",
@@ -1640,6 +1705,8 @@ def _argument_error(args: argparse.Namespace) -> str | None:
         return f"Workers must be between 1 and 4, got {args.workers}"
     if math.isnan(args.timeout) or args.timeout <= 0:
         return f"Timeout must be a positive number of seconds, got {args.timeout:g}"
+    if math.isnan(args.max_pixels) or args.max_pixels < 0:
+        return f"Max pixels must be zero or a positive number of megapixels, got {args.max_pixels:g}"
     return None
 
 
@@ -1684,6 +1751,7 @@ def main(argv: list[str] | None = None) -> int:
         args.workers,
         clear=args.clear,
         timeout=args.timeout,
+        max_megapixels=args.max_pixels,
     )
     return 0
 

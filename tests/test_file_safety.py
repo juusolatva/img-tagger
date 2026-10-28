@@ -134,7 +134,7 @@ def test_ollama_receives_snapshot_even_if_path_changes_during_request(tmp_path):
             return super().chat(model, messages)
 
     client = ReplacingClient()
-    img_tagger.get_tags_ollama(client, "m", image, "p")
+    img_tagger.get_tags_ollama(client, "m", image, "p", max_megapixels=0)
     assert client.calls[0]["messages"][0]["images"] == [expected]
 
 

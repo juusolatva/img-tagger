@@ -190,6 +190,7 @@ python img_tagger.py "C:\Users\you\Pictures\My memes"
 | `--model` | `qwen3-vl:8b` | The model to use. The default is Ollama's name for it, so with LM Studio pass LM Studio's id (e.g. `qwen/qwen3-vl-8b`). |
 | `--workers` | `1` | How many images to process at the same time, from 1 to 4. |
 | `--timeout` | `600` | Seconds to wait for the model's answer to one image, including loading the model, before that image is marked failed. Must be a positive number. Raise it for slow hardware. |
+| `--max-pixels` | `1` | Largest size, in megapixels, of the copy sent to the model; bigger images are scaled down (keeping their shape) before sending. `0` sends the original file. Your files are never changed. See [Choosing a model and performance](#choosing-a-model-and-performance). |
 | `--log` | off | Append a detailed log to this file, e.g. `--log logs/run.log`. Missing folders are created; a relative path is relative to the current directory. The name must end in `.log` (any letter case), and an existing path must be a regular file of yours, not a symlink, folder or someone else's file. The file is opened once and kept open, so it can't be swapped for a link during the run. |
 | `--clear` | off | Remove metadata from the images instead of tagging them. See [Clearing tags](#clearing-tags). |
 | `-h`, `--help` | | Show the options and exit. |
@@ -210,7 +211,7 @@ python img_tagger.py "C:\Users\you\Pictures\My memes"
 | Code | When |
 |---|---|
 | `0` | The run finished, even if some images failed. Also after pressing `Q`, when no images were found, and when the backend's Python library is missing (an error is printed). |
-| `1` | The folder doesn't exist, `--workers` is outside 1 to 4, `--timeout` is zero, negative or `nan`, `--log` doesn't name a regular `.log` file, or `prompt.txt` exists but can't be read. Also when the script stops with a Python traceback, e.g. a required package such as `pyexiv2` is missing or the `--log` file can't be created. |
+| `1` | The folder doesn't exist, `--workers` is outside 1 to 4, `--timeout` is zero, negative or `nan`, `--max-pixels` is negative or `nan`, `--log` doesn't name a regular `.log` file, or `prompt.txt` exists but can't be read. Also when the script stops with a Python traceback, e.g. a required package such as `pyexiv2` is missing or the `--log` file can't be created. |
 | `2` | An invalid option, e.g. an unknown `--backend` or a non-number for `--workers` or `--timeout`. |
 
 ### Examples
@@ -476,7 +477,8 @@ A file whose metadata had to be repaired shows `Sanitized and cleared (Pillow) f
 - The **first image** is slower because the server loads the model then.
 - `--timeout` (600 seconds by default) is how long to wait for **one** image's complete answer, including loading the model. An image that runs out of time is marked failed and retried on the next run. With LM Studio, a request that timed out is not resent.
 - `--workers` sends up to 4 images at once, which matches the default number of parallel requests in both Ollama and LM Studio. If the server handles fewer requests at a time, the extra ones wait their turn on the server, and that wait may count towards `--timeout`.
-- Each image is sent **whole and unchanged**: it isn't resized or converted. Very large files make large requests (about a third larger than the file, because of base64 encoding).
+- **Images are scaled down before sending** to at most 1 megapixel by default (`--max-pixels`); smaller images are sent at their own size, never enlarged. Measured with Qwen3 VL 4B, a 12-megapixel photo took 29 s as is and 5 s at 1 megapixel with the same tags, and small text in diagrams was still read at 1 megapixel but not at 0.5. Ollama enlarges anything below about 1 megapixel anyway, so going lower saves nothing there; LM Studio keeps getting faster. Raise it (e.g. `--max-pixels 2`) for screenshots or scans with very small text.
+- **What is sent** is a new copy: the first frame, turned upright by its EXIF orientation, as PNG (for PNG and GIF files and anything with transparency) or JPEG (quality 90), with **no metadata**, so camera details and GPS location don't reach the server. With `--max-pixels 0` the original file is sent whole instead (about a third larger in the request because of base64 encoding).
 
 
 ---
@@ -535,8 +537,8 @@ A file whose metadata had to be repaired shows `Sanitized and cleared (Pillow) f
 
 ## Known issues and limitations
 
-- **Animated images**: the whole file is sent to the model, and the servers only look at the first frame. With animated GIFs this has been seen on both Ollama and LM Studio (a white first frame gave `blank, white`); animated WebPs and PNGs most likely behave the same. The animation itself is kept in the file.
-- **Image orientation**: images are sent as they are, without applying the EXIF orientation, so depending on the server, rotated photos may look sideways to the model.
+- **Animated images**: only the first frame is sent to the model (with `--max-pixels 0` the whole file is sent, and the servers also only look at the first frame), so an animation whose first frame is blank gets tags like `blank, white`. The animation itself is kept in the file.
+- **Image orientation** with `--max-pixels 0`: the original file is sent without applying its EXIF orientation, so depending on the server, rotated photos may look sideways to the model. The default scaled copy is turned upright first.
 - **GIF re-encoding**: tagging or clearing a GIF re-encodes the whole file with Pillow. Frames, frame durations and the loop setting are kept, but custom application extensions (other than looping) and GIF XMP data are dropped, and the pixels or file size may change slightly.
 - **Repaired images**: images with corrupted metadata are re-saved with Pillow, which can re-encode them and drop other metadata. See [Repairing corrupted metadata](#repairing-corrupted-metadata).
 - **IPTC keywords** are left as they are, and existing XMP keywords are replaced. See [What happens to existing metadata](#what-happens-to-existing-metadata).
