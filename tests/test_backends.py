@@ -25,14 +25,6 @@ class TestGetTagsOllama:
             }
         ]
 
-    def test_accepts_dict_style_response(self, tmp_path):
-        class DictClient:
-            def chat(self, model, messages):
-                return {"message": {"content": "from a dict"}}
-
-        image = make_image(tmp_path / "a.jpg")
-        assert img_tagger.get_tags_ollama(DictClient(), "m", image, "p") == "from a dict"
-
 
 class TestGetTagsLmStudio:
     @pytest.mark.parametrize(

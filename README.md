@@ -484,11 +484,8 @@ A file whose metadata had to be repaired shows `Sanitized and cleared (Pillow) f
 
 ## Troubleshooting
 
-**`ModuleNotFoundError: No module named 'pyexiv2'`** (or `'PIL'` or `'tqdm'`)
+**`ModuleNotFoundError: No module named 'pyexiv2'`** (or `'PIL'`, `'tqdm'`, `'ollama'` or `'openai'`)
 - The dependencies aren't installed in the Python you ran. Activate your virtual environment if you made one, and run `python -m pip install -r requirements.txt`.
-
-**`Error: 'ollama' library not found.`** (or `'openai'`)
-- Same cause: install the dependencies with `python -m pip install -r requirements.txt`, in the same Python environment you run the script with.
 
 **`Failed to connect to Ollama. Please check that Ollama is downloaded, running and accessible.`** for every image
 - Start Ollama, or check the address you passed with `--host` (and remember that `http://<ip>` without a port means port 80). For a server on another machine, see [Using a server on another machine](#using-a-server-on-another-machine).

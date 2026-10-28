@@ -33,6 +33,8 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 import pyexiv2
+from ollama import Client as OllamaClient
+from openai import OpenAI
 from PIL import Image, ImageSequence
 from tqdm import tqdm
 
@@ -46,15 +48,6 @@ try:
 except ImportError:
     termios = None
     tty = None
-
-try:
-    from ollama import Client as OllamaClient
-except ImportError:
-    OllamaClient = None
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
 
 logger = logging.getLogger("img_tagger")
 # Without --log, records stop here instead of reaching Python's last-resort stderr handler,
@@ -948,7 +941,7 @@ def get_tags_ollama(client: Any, model: str, img_path: Path, prompt: str) -> str
         model=model,
         messages=[{"role": "user", "content": prompt, "images": [_read_image_bytes(img_path)]}],
     )
-    content = response.message.content if hasattr(response, "message") else response["message"]["content"]
+    content = response.message.content
     logger.debug(f"Raw Ollama response for {img_path}: {content}")
     return content
 
@@ -1346,18 +1339,11 @@ def _create_client(backend: str, host: str, timeout: float = DEFAULT_TIMEOUT) ->
         timeout: Seconds to wait for a model reply before the request fails.
 
     Returns:
-        The client, or None (after printing an error) if its library is not installed.
+        The ollama Client or the LM Studio OpenAI client.
     """
 
     if backend == "ollama":
-        if OllamaClient is None:
-            print("Error: 'ollama' library not found. Please install it using 'pip install ollama'.")
-            return None
         return OllamaClient(host=host, timeout=timeout)
-
-    if OpenAI is None:
-        print("Error: 'openai' library not found. Please install it using 'pip install openai'.")
-        return None
     # No retries: a timed-out request would be resent to a server still busy with it.
     return OpenAI(base_url=f"{host}/v1", api_key="lm-studio", timeout=timeout, max_retries=0)
 
@@ -1522,8 +1508,6 @@ def process_directory(
     prompt = _load_prompt()
     logger.debug(f"Prompt: {prompt}")
     client = _create_client(backend, host, timeout)
-    if client is None:
-        return
 
     start_time = time.monotonic()
 
