@@ -1240,7 +1240,7 @@ def process_single_image(
         logger.info(f"Cancelled before start: {img_path.name}")
         return "CANCELLED", img_path.name, "Cancelled by user", 0
 
-    start = time.time()  # Start timing the actual processing
+    start = time.monotonic()  # Start timing the actual processing
     try:
         if backend == "ollama":
             raw_output = get_tags_ollama(client, model, img_path, prompt)
@@ -1252,27 +1252,27 @@ def process_single_image(
 
         if not parsed_tags:
             logger.warning(
-                f"Failed to extract valid tags from model response for {img_path.name} after {time.time() - start:.1f}s"
+                f"Failed to extract valid tags from model response for {img_path.name} after {time.monotonic() - start:.1f}s"
             )
             return (
                 "FAILED",
                 img_path.name,
                 "Invalid or insufficient tags returned from model",
-                time.time() - start,
+                time.monotonic() - start,
             )
 
         tag_image(str(img_path), parsed_tags, fmt=fmt)
-        logger.info(f"Tagged {img_path.name} in {time.time() - start:.1f}s with {parsed_tags}")
+        logger.info(f"Tagged {img_path.name} in {time.monotonic() - start:.1f}s with {parsed_tags}")
         return (
             "SUCCESS",
             img_path.name,
             f"Generated Tags: {parsed_tags}",
-            time.time() - start,
+            time.monotonic() - start,
         )
 
     except Exception as e:
-        logger.exception(f"Error processing {img_path.name} after {time.time() - start:.1f}s")
-        return "FAILED", img_path.name, str(e), time.time() - start
+        logger.exception(f"Error processing {img_path.name} after {time.monotonic() - start:.1f}s")
+        return "FAILED", img_path.name, str(e), time.monotonic() - start
 
 
 @dataclass
@@ -1525,7 +1525,7 @@ def process_directory(
     if client is None:
         return
 
-    start_time = time.time()
+    start_time = time.monotonic()
 
     # Concurrency and quitting
     stop_event = threading.Event()
@@ -1545,7 +1545,7 @@ def process_directory(
         stop_event.set()
         quit_thread.join(timeout=2)
 
-    total_seconds = time.time() - start_time
+    total_seconds = time.monotonic() - start_time
     _print_report(stats, total_seconds)
     logger.info(
         f"Finished in {total_seconds:.1f}s: {stats.success} tagged, {stats.skipped} skipped, {stats.failed} failed"
