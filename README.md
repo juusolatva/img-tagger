@@ -50,7 +50,7 @@ The tags are standard EXIF and XMP fields (a comment for GIFs), so they stay wit
 | `pyexiv2` | Reading and writing EXIF and XMP metadata, and clearing EXIF, XMP and IPTC with `--clear` |
 | `tqdm` | The progress bar |
 
-`pyexiv2` ships with the exiv2 library built in, so you **don't need exiftool or a separate exiv2 install**. Both backend libraries are installed, but only the one for the backend you use is needed at run time.
+`pyexiv2` ships with the exiv2 library built in, so you **don't need exiftool or a separate exiv2 install**. Install all the packages in `requirements.txt`: both backend clients are imported when the script starts, even with `--clear`. Clearing metadata needs no running model server.
 
 It has been run on Windows 11 and is tested on Linux and Windows in CI. It has not been tried on macOS.
 
@@ -190,8 +190,8 @@ python img_tagger.py "C:\Users\you\Pictures\My memes"
 | `--model` | `qwen3-vl:8b` | The model to use. The default is Ollama's name for it, so with LM Studio pass LM Studio's id (e.g. `qwen/qwen3-vl-8b`). |
 | `--workers` | `1` | How many images to process at the same time, from 1 to 4. |
 | `--timeout` | `600` | Seconds to wait for the model's answer to one image, including loading the model, before that image is marked failed. Must be a positive number. Raise it for slow hardware. |
-| `--max-pixels` | `1` | Largest size, in megapixels, of the copy sent to the model; bigger images are scaled down (keeping their shape) before sending. `0` sends the original file. Your files are never changed. See [Choosing a model and performance](#choosing-a-model-and-performance). |
-| `--log` | off | Append a detailed log to this file, e.g. `--log logs/run.log`. Missing folders are created; a relative path is relative to the current directory. The name must end in `.log` (any letter case), and an existing path must be a regular file of yours, not a symlink, folder or someone else's file. The file is opened once and kept open, so it can't be swapped for a link during the run. On Linux and macOS a new log is readable only by you. |
+| `--max-pixels` | `1` | Largest size, in megapixels, of the copy sent to the model; bigger images are scaled down (keeping their shape) before sending. Must be nonnegative; `nan` is rejected. `0` sends the original file, as does a failure to prepare the copy. Resizing affects only the outgoing copy; tagging still writes metadata to your files. See [Choosing a model and performance](#choosing-a-model-and-performance). |
+| `--log` | off | Append a detailed log to this file, e.g. `--log logs/run.log`. Missing folders are created; a relative path is relative to the current directory. The name must end in `.log` (any letter case), and an existing path must be a regular file, not a symlink or folder. On Linux and macOS it must also belong to you, and a new log is readable only by you. The file is opened once and kept open, so swapping its name for a link can't redirect the writes. |
 | `--clear` | off | Remove metadata from the images instead of tagging them. See [Clearing tags](#clearing-tags). |
 | `-h`, `--help` | | Show the options and exit. |
 
@@ -210,9 +210,9 @@ python img_tagger.py "C:\Users\you\Pictures\My memes"
 
 | Code | When |
 |---|---|
-| `0` | The run finished, even if some images failed. Also after pressing `Q`, when no images were found, and when the backend's Python library is missing (an error is printed). |
-| `1` | The folder doesn't exist, `--workers` is outside 1 to 4, `--timeout` is zero, negative or `nan`, `--max-pixels` is negative or `nan`, `--log` doesn't name a regular `.log` file, or `prompt.txt` exists but can't be read. Also when the script stops with a Python traceback, e.g. a required package such as `pyexiv2` is missing or the `--log` file can't be created. |
-| `2` | An invalid option, e.g. an unknown `--backend` or a non-number for `--workers` or `--timeout`. |
+| `0` | The run finished, even if some images failed. Also after pressing `Q` or when no images were found. |
+| `1` | The folder doesn't exist, `--workers` is outside 1 to 4, `--timeout` is zero, negative or `nan`, `--max-pixels` is negative or `nan`, `--log` fails validation or can't be opened, or `prompt.txt` exists but can't be read. Log-open failures print `Error: Could not open the log file ...` without a traceback. Unhandled exceptions also exit with 1 and a traceback, e.g. a missing required package or an unsafe image directory. |
+| `2` | An invalid option, e.g. an unknown `--backend` or a non-number for `--workers`, `--timeout` or `--max-pixels`. |
 
 ### Examples
 
@@ -298,9 +298,9 @@ IPTC keywords are not updated, so apps that read IPTC keywords may still show th
 - **JPEG, WebP and PNG**: only the metadata is edited; the image data is not re-encoded. Animated WebPs keep their frames, frame durations and loop count.
 - **GIF**: the whole file is re-encoded through Pillow. Each frame keeps its duration (100 ms if it had none) and the loop setting is kept (a GIF that plays once still plays once). Consecutive identical frames are merged into one frame with their combined duration, so playback looks the same. Pillow keeps all of a GIF's frames in memory while writing it, so a very large animated GIF can need a lot of RAM. See [Known issues](#known-issues-and-limitations) for the side effects.
 - Each image is read through guarded file access. Output is written to an open temporary `tmpXXXX.tmp` file **in the same folder**, edited through that file handle and then moved over the original. If the original is locked (e.g. open in another program), the move is retried up to 10 times, half a second apart. The temporary file is removed afterwards.
-- File mode permissions and, on Linux and macOS, the file's group are kept (if you aren't a member of that group, its group permissions are removed instead, with a warning). Linux extended attributes and POSIX ACLs are preserved through the opened file handles; inherited temporary-file ACL grants are removed. On Windows the image's NTFS permissions (its DACL, including whether it inherits from the folder) are given to the temporary file when it is created, before anything is written to it, and the read-only attribute is kept. Timestamps are not copied, and on Windows the file's owner becomes your account.
+- File mode permissions and, on Linux and macOS, the file's group are kept. If the group can't be preserved (because of your permissions or a filesystem restriction), its group permissions are removed instead, with a warning. Linux extended attributes and POSIX ACLs are preserved through the opened file handles; inherited temporary-file ACL grants are removed. On Windows the image's NTFS permissions (its DACL, including whether it inherits from the folder) are given to the temporary file when it is created, before anything is written to it, and the read-only attribute is kept. Timestamps are not copied, and on Windows the file's owner becomes your account.
 - On POSIX, parent directories are opened without following symlinks, and replacement uses pinned directory descriptors. This protects against other-user directory substitution subject to the directory ownership/write restrictions above; it does not isolate another process running as your own account or root.
-- On Windows, every folder above an image is held open while the image is read or written, so it can't be renamed or swapped for a junction meanwhile (while that happens, renaming those folders fails with "in use"). Symlinks, junctions and other reparse points are refused. Nobody else can open the temporary file, and it replaces the original through its open handle. Tested on local NTFS drives only; see [Known issues](#known-issues-and-limitations) for USB sticks and network folders.
+- On Windows, folders above an image are held open while the image is read or written, so they can't be renamed or swapped for junctions meanwhile (renaming those folders fails with "in use"). A folder that grants neither traverse nor list access is checked for reparse points but can't be pinned this way. Symlinks, junctions and other reparse points are refused. Nobody else can open the temporary file, and it replaces the original through its open handle. Tested on local NTFS drives only; see [Known issues](#known-issues-and-limitations) for USB sticks and network folders.
 
 ### Repairing corrupted metadata
 
@@ -372,6 +372,7 @@ Some problems are always shown on screen as `  Warning: ...` lines, with or with
 - `Could not read the metadata of <name> (...); treating it as not yet tagged`
 - `Could not read the GIF comment of <name> (...); treating it as not yet tagged`
 - the [corrupted metadata](#repairing-corrupted-metadata) warning
+- `Could not keep group <group> on <name> (...); removed its group permissions instead`
 
 ### The final report
 
@@ -400,7 +401,7 @@ Some problems are always shown on screen as `  Warning: ...` lines, with or with
 `--log FILE` appends a detailed UTF-8 log, which is the first place to look when something goes wrong. Each line has a timestamp, level and thread name. It contains:
 
 - the Python version and operating system
-- the run settings: folder, recursion, backend, host, model, workers and timeout
+- the run settings: folder, recursion, backend, host, model, workers, timeout and image pixel budget
 - which prompt file was used, and the full prompt
 - for each image: when it started, the request to the model, **the model's raw reply**, and the tags and time taken, or the error with a full traceback
 - the HTTP requests made to the backend
@@ -478,7 +479,7 @@ A file whose metadata had to be repaired shows `Sanitized and cleared (Pillow) f
 - `--timeout` (600 seconds by default) is how long to wait for **one** image's complete answer, including loading the model. An image that runs out of time is marked failed and retried on the next run. With LM Studio, a request that timed out is not resent.
 - `--workers` sends up to 4 images at once, which matches the default number of parallel requests in both Ollama and LM Studio. If the server handles fewer requests at a time, the extra ones wait their turn on the server, and that wait may count towards `--timeout`.
 - **Images are scaled down before sending** to at most 1 megapixel by default (`--max-pixels`); smaller images are sent at their own size, never enlarged. Measured with Qwen3 VL 4B, a 12-megapixel photo took 29 s as is and 5 s at 1 megapixel with the same tags, and small text in diagrams was still read at 1 megapixel but not at 0.5. Ollama enlarges anything below about 1 megapixel anyway, so going lower saves nothing there; LM Studio keeps getting faster. Raise it (e.g. `--max-pixels 2`) for screenshots or scans with very small text.
-- **What is sent** is a new copy: the first frame, turned upright by its EXIF orientation, as PNG (for PNG and GIF files and anything with transparency) or JPEG (quality 90), with **no metadata**, so camera details and GPS location don't reach the server. With `--max-pixels 0` the original file is sent whole instead (about a third larger in the request because of base64 encoding).
+- **What is sent** is normally a new copy: the first frame, turned upright by its EXIF orientation, as PNG (for PNG and GIF files and anything with transparency) or JPEG (quality 90), with **no metadata**. With `--max-pixels 0`, or if the copy can't be prepared (e.g. a truncated image Pillow identifies but can't decode), the original file is sent whole instead, **including any metadata such as camera details and GPS location**. The fallback is recorded only in the log. Both backends base64-encode the outgoing bytes, making the request data about a third larger.
 
 
 ---
@@ -538,7 +539,7 @@ A file whose metadata had to be repaired shows `Sanitized and cleared (Pillow) f
 ## Known issues and limitations
 
 - **Animated images**: only the first frame is sent to the model (with `--max-pixels 0` the whole file is sent, and the servers also only look at the first frame), so an animation whose first frame is blank gets tags like `blank, white`. The animation itself is kept in the file.
-- **Image orientation** with `--max-pixels 0`: the original file is sent without applying its EXIF orientation, so depending on the server, rotated photos may look sideways to the model. The default scaled copy is turned upright first.
+- **Sending original images**: `--max-pixels 0` and a failure to prepare a scaled copy both send the original bytes, including metadata and without applying EXIF orientation. Depending on the server, rotated photos may look sideways to the model. The default scaled copy is turned upright first; see [Choosing a model and performance](#choosing-a-model-and-performance).
 - **GIF re-encoding**: tagging or clearing a GIF re-encodes the whole file with Pillow. Frames, frame durations and the loop setting are kept, but custom application extensions (other than looping) and GIF XMP data are dropped, and the pixels or file size may change slightly.
 - **Repaired images**: images with corrupted metadata are re-saved with Pillow, which can re-encode them and drop other metadata. See [Repairing corrupted metadata](#repairing-corrupted-metadata).
 - **IPTC keywords** are left as they are, and existing XMP keywords are replaced. See [What happens to existing metadata](#what-happens-to-existing-metadata).
@@ -595,7 +596,9 @@ python -m pytest -m integration --run-integration -s --tagger-backend lm-studio 
 
 Each image is its own test. It is copied to a temporary folder first, so the originals are not modified, and cleared there if it was already tagged. Each test prints a line like `[SUCCESS] cat.jpg (12.3s) -> Generated Tags: [...]` so you can review the tags by eye, and fails if the image wasn't tagged. The tests use the same client settings as a real run: the default 600-second timeout, and with LM Studio a timed-out request is not resent.
 
-Notes for coding agents and contributors are in [AGENTS.md](AGENTS.md).
+### Repository guidance
+
+[AGENTS.md](AGENTS.md) holds the repository's development commands, architecture, file-safety rules and maintenance notes. [CLAUDE.md](CLAUDE.md) imports that same guidance. Keep it and this README up to date when changing behavior or workflows; no additional agent tooling or memory files are required.
 
 
 ---
@@ -606,9 +609,9 @@ Notes for coding agents and contributors are in [AGENTS.md](AGENTS.md).
 Every push to `main` and every pull request runs [GitHub Actions](.github/workflows/ci.yml), and you can also start it by hand:
 
 - **Ruff** lint and format checks, using the Ruff version pinned in `requirements-dev.txt`
-- the offline **tests** with coverage on Python 3.13 and 3.14 (on Linux)
-- a **SonarQube Cloud** scan, which uses the coverage report from the Python 3.14 job (needs `SONAR_TOKEN` as a repository secret and as a Dependabot secret; pull requests from forks get no secrets, so there the scan is skipped with a warning)
-- an [**OSV-Scanner**](.github/workflows/osv-scanner.yml) dependency vulnerability scan (`requirements-dev.lock` and `requirements*.txt`), which also runs on a weekly schedule; on pull requests it checks only for newly introduced vulnerabilities and skips the SARIF upload on fork PRs
+- the offline **tests** with coverage on Python 3.13 and 3.14 on Linux, plus Python 3.14 on Windows
+- a **SonarQube Cloud** scan, which combines the Linux and Windows coverage reports from the Python 3.14 jobs (needs `SONAR_TOKEN` as a repository secret and as a Dependabot secret; pull requests from forks get no secrets, so there the scan is skipped with a warning)
+- an [**OSV-Scanner**](.github/workflows/osv-scanner.yml) dependency vulnerability scan (`requirements-dev.lock` and `requirements*.txt`), which also runs on a weekly schedule and manual dispatch; on pull requests and merge groups it checks only for newly introduced vulnerabilities and skips the SARIF upload on fork PRs
 
 To run the same checks locally, use `ruff check .`, `ruff format --check .` and `python -m pytest --cov`.
 
