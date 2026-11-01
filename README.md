@@ -203,7 +203,7 @@ python img_tagger.py "C:\Users\you\Pictures\My memes"
 - Everything else (`.jfif`, `.tif`, `.heic`, `.avif`, `.bmp`, ...) is silently ignored and not counted.
 - Image symlinks and symlinked parent directories are refused; choose the real image directory. POSIX also refuses image directories writable by another user/group or owned by someone other than the current user or root. Shared ancestors such as `/tmp` are allowed because directory handles stay pinned. Paths containing `..` are refused.
 - Each file is opened with Pillow first, and img tagger goes by the image's real format, not its extension (a PNG named `.gif` is tagged like a PNG).
-  - A file with an image extension that isn't a valid image fails with `Skipping unsupported or corrupted file`.
+  - A file with an image extension that isn't a valid image fails with `Unreadable image (unsupported or corrupted file)`.
   - A valid image in a format img tagger can't tag (e.g. a BMP named `.jpg`, or an MPO, see [Known issues](#known-issues-and-limitations)) fails with `Unsupported file format: <format>`.
   - Neither is sent to the model.
 - If the folder has no matching files, it prints `No valid images found in '<folder>'.` If your images are in subfolders, add `-r`.
@@ -357,7 +357,7 @@ The "Found" count includes images that are already tagged. A progress bar labell
 ```
   [✓] cat.jpg -> Generated Tags: ['meme', 'cat', 'funny', 'digital_art', 'reaction', 'text']
   [-] dog.png -> Skipped: Already Tagged
-  [!] notimage.jpg -> Skipping unsupported or corrupted file
+  [!] notimage.jpg -> Unreadable image (unsupported or corrupted file)
   [!] blurry.webp -> Invalid or insufficient tags returned from model
   [!] party.gif -> <error message>
 ```
@@ -389,7 +389,7 @@ Some problems are always shown on screen as `  Warning: ...` lines, with or with
  Average processing time: <seconds> seconds
 
 --- Failed files details ---
- * notimage.jpg -> Skipping unsupported or corrupted file
+ * notimage.jpg -> Unreadable image (unsupported or corrupted file)
 ==================================================
 ```
 
@@ -466,7 +466,7 @@ Resetting tags for 3 images...
 Done.
 ```
 
-A file whose metadata had to be repaired shows `Sanitized and cleared (Pillow) for: <name>`. The exit code is 0 even if some files failed.
+A file whose metadata had to be repaired shows `Repaired and cleared (Pillow) for: <name>`. The exit code is 0 even if some files failed.
 
 
 ---
@@ -517,7 +517,7 @@ A file whose metadata had to be repaired shows `Sanitized and cleared (Pillow) f
 **`Invalid or insufficient tags returned from model`**
 - The reply didn't contain at least 6 usable tags. Run with `--log` to see the raw reply. Try another model, or check your changes to `prompt.txt`.
 
-**`Skipping unsupported or corrupted file`**
+**`Unreadable image (unsupported or corrupted file)`**
 - The file has an image extension but Pillow can't open it as an image.
 
 **`Unsupported file format: MPO`** (or another format, e.g. `BMP` or `TIFF`)
