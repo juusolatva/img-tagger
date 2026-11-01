@@ -71,7 +71,7 @@ class TestProcessSingleImage:
         status, _, message, _ = run_single(bogus, client=client)
 
         assert status == "FAILED"
-        assert "unsupported or corrupted" in message
+        assert message == "Unreadable image (unsupported or corrupted file)"
         assert client.calls == []
 
     def test_unsupported_format_fails_without_calling_model(self, tmp_path):

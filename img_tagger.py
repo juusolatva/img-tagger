@@ -937,11 +937,11 @@ def _clear_standard(source: bytes, output: BinaryIO, fmt: str | None = None) -> 
     except RuntimeError as error:
         if not _is_corrupt_metadata_error(error):
             raise
-        logger.warning(f"Corrupted metadata ({error}); sanitizing image snapshot before clearing")
+        logger.warning(f"Corrupted metadata ({error}); repairing image snapshot before clearing")
         output.seek(0)
         output.truncate()
         _sanitize_with_pillow(source, output, fmt)
-        return "Sanitized and cleared (Pillow)"
+        return "Repaired and cleared (Pillow)"
 
 
 def _clear_gif(source: bytes, output: BinaryIO) -> str:
@@ -1338,11 +1338,11 @@ def process_single_image(
     logger.info(f"Processing {img_path.name}")
     fmt = get_image_format(img_path)
     if fmt is None:
-        logger.warning(f"Skipping invalid/unsupported file: {img_path.name}")
-        return "FAILED", img_path.name, "Skipping unsupported or corrupted file", 0
+        logger.warning(f"Failed: unreadable image {img_path.name}")
+        return "FAILED", img_path.name, "Unreadable image (unsupported or corrupted file)", 0
     if fmt not in TAGGABLE_FORMATS:
         # e.g. a BMP named .jpg or an MPO (multi-picture) JPEG: fail before asking the model
-        logger.warning(f"Skipping {img_path.name}: unsupported format {fmt}")
+        logger.warning(f"Failed: {img_path.name} has unsupported format {fmt}")
         return "FAILED", img_path.name, f"Unsupported file format: {fmt}", 0
 
     # Skip check
