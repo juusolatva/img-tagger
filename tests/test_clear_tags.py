@@ -137,7 +137,7 @@ def test_auto_heals_corrupt_metadata_via_pillow(tmp_path, monkeypatch, capsys, e
     monkeypatch.setattr(img_tagger.pyexiv2, "ImageData", corrupt)
     img_tagger.clear_tags(path)
 
-    assert "Sanitized and cleared (Pillow)" in capsys.readouterr().out
+    assert "Repaired and cleared (Pillow)" in capsys.readouterr().out
     with Image.open(path) as img:
         assert img.format == "JPEG"
     assert leftover_temp_files(tmp_path) == []
@@ -165,7 +165,7 @@ def test_auto_heal_keeps_animation(tmp_path, monkeypatch, capsys, ext):
     monkeypatch.setattr(img_tagger.pyexiv2, "ImageData", corrupt)
     img_tagger.clear_tags(path)
 
-    assert "Sanitized and cleared (Pillow)" in capsys.readouterr().out
+    assert "Repaired and cleared (Pillow)" in capsys.readouterr().out
     assert animation_info(path) == {
         "n_frames": 3,
         "durations": [40, 250, 90],
