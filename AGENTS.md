@@ -11,6 +11,12 @@ Keep repository guidance here and user instructions in `README.md` up to date wi
 - **Git workflow**: commits are allowed; prefer working on a branch and opening a pull request rather than pushing directly to `main`.
 - Requires **Python 3.13+**.
 
+## Domain Language
+- [GLOSSARY.md](GLOSSARY.md) defines the project's domain terms. Keep it aligned with the domain; implementation details belong here or in `README.md`.
+- `_find_images()` returns **image candidates** whose contents still need validation. A **source image** is the file being edited; the **model image** is the representation sent for **tag generation**. **Tagging** includes writing the accepted tags and processing marker.
+- Worker outcomes map to **tagged** (`SUCCESS`), **skipped** (`SKIPPED`), **failed** (`FAILED`) and **cancelled** (`CANCELLED`). The report's existing `Processed images` label counts only images tagged during the current run. A recognized marker causes a skip without validating the stored tags or their origin.
+- **Metadata clearing** removes EXIF/XMP/IPTC or the GIF comment, including unrelated metadata. It preserves other comments/text chunks, so a marker in a preserved PNG text chunk can still cause a skip afterwards. **Metadata repair** is the glossary term for the auto-healing/sanitization fallback.
+
 ## Build/Lint/Test Commands
 Ruff (lint + format) is configured in `pyproject.toml`; CI fails on any Ruff finding or unformatted file. SonarQube Cloud (project `juusolatva_img_tagger`) runs in CI; keep functions under its cognitive-complexity limit of 15 by extracting `_private` helpers.
 - Dependencies: `python3 -m pip install -r requirements.txt`; dev deps (pytest, pytest-cov, Ruff): `python3 -m pip install -r requirements-dev.txt`. Both backend clients are imported at module load, so install all runtime dependencies even for `--clear`; clearing needs no running model server.

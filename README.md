@@ -13,6 +13,8 @@ img tagger itself uses no cloud service: the images only go to the model server 
 
 The tags are standard EXIF and XMP fields (a comment for GIFs), so they stay with the file when you copy or move it. The accuracy of the tags depends on the model.
 
+See the [glossary](GLOSSARY.md) for the project's terminology.
+
 **Contents:** [Features](#features) · [Requirements](#requirements) · [Installation](#installation) · [Setting up a model backend](#setting-up-a-model-backend) · [Usage](#usage) · [What gets written to your images](#what-gets-written-to-your-images) · [Customising the prompt](#customising-the-prompt) · [Output](#output) · [Stopping early](#stopping-early) · [Clearing tags](#clearing-tags) · [Choosing a model and performance](#choosing-a-model-and-performance) · [Troubleshooting](#troubleshooting) · [Known issues and limitations](#known-issues-and-limitations) · [Running tests](#running-tests) · [Continuous integration](#continuous-integration) · [License](#license)
 
 ## Features
@@ -236,7 +238,7 @@ Use Ollama on another machine with a smaller model, and give slow hardware more 
 python img_tagger.py ~/Pictures/memes --host http://192.168.1.50:11434 --model qwen3-vl:4b-instruct --timeout 1200
 ```
 
-Clear all metadata from a folder and its subfolders (read [Clearing tags](#clearing-tags) first):
+Clear EXIF, XMP and IPTC metadata, or GIF comments, from a folder and its subfolders (read [Clearing tags](#clearing-tags) first):
 
 ```bash
 python img_tagger.py ~/Pictures/memes -r --clear
@@ -273,11 +275,11 @@ Which apps display which of these fields hasn't been checked. The tags are also 
 
 ### Already tagged images are skipped
 
-The `[PROCESSED BY AI]` marker tells img tagger that an image is done. For JPEG, WebP and PNG it looks for the marker in every EXIF and XMP value and in any text metadata Pillow can read (such as PNG text chunks); for GIFs, in the comment. Images that have it are skipped without contacting the model.
+The `[PROCESSED BY AI]` marker is the signal for treating an image as already tagged. For JPEG, WebP and PNG it looks for the marker in every EXIF and XMP value and in any text metadata Pillow can read (such as PNG text chunks); for GIFs, in the comment. Readable images in supported formats that have it are skipped without contacting the model. A marker added by another tool also causes a skip; the existing tags are not validated.
 
-Images that fail get no marker, so running the same command again retries only the failed ones and quickly skips the rest.
+A failed tagging attempt adds no marker, so running the same command again retries unmarked images and quickly skips marked ones.
 
-There is no option to force re-tagging. To tag images again, either move them into a folder of their own and run [`--clear`](#clearing-tags) on that folder (it works on whole folders only and removes **all** metadata, not just the tags), or use a metadata editor to remove the marker from both `Exif.Photo.UserComment` and `Xmp.dc.description` (for a GIF, from its comment).
+There is no option to force re-tagging. To tag images again, remove the marker from every metadata value in which it appears. For tags written by img tagger, that means both `Exif.Photo.UserComment` and `Xmp.dc.description` (for a GIF, its comment). Alternatively, move the images into a folder of their own and run [`--clear`](#clearing-tags) there; it works on whole folders only and removes unrelated EXIF, XMP and IPTC metadata too. A marker in a preserved PNG text chunk survives `--clear` and needs to be removed with a metadata editor.
 
 ### What happens to existing metadata
 
@@ -391,7 +393,7 @@ Some problems are always shown on screen as `  Warning: ...` lines, with or with
 ==================================================
 ```
 
-- **Processed** means successfully tagged.
+- **Processed images** counts images successfully **tagged during this run**. Skipped images are counted separately, even though they carry the processing marker.
 - **Average processing time** is shown only when at least one image was tagged. It covers the successful images only, from sending the request to the model until the tags are written.
 - **Total time elapsed** starts once the prompt and the backend client are set up.
 - **Failed files details** lists each failed image with the reason.
@@ -418,7 +420,7 @@ The log contains file paths (as you typed the folder, plus the full path of `pro
 Press `Q` (or `q`, no Enter needed) while images are being tagged:
 
 - Images that are already being processed finish normally (or fail once `--timeout` runs out).
-- The images still in the queue are not sent to the model, and they are not shown in the output or counted in the report. Queued images are still checked quickly, though, so ones that are already tagged or aren't valid images may still show up as skipped or failed.
+- Queued images still undergo format and marker checks. Already tagged images are skipped and invalid or unsupported images fail. The remaining images are **cancelled** before tag generation; they are not sent to the model, shown in the output or counted in the report.
 - The report is printed and the script exits normally.
 
 The message `[!] Stop signal received (Q pressed). Finishing currently running tasks...` appears when the next image finishes, which on slow hardware can take a while.
@@ -446,6 +448,7 @@ python img_tagger.py path/to/images --clear
 
 - It was made for resetting images so they can be tagged again, e.g. when testing models or prompts.
 - **Kept**: the JPEG comment, and PNG text chunks and DPI.
+- A processing marker in a preserved PNG text chunk still causes the image to be skipped on the next tagging run; remove that marker with a metadata editor to tag the image again.
 - **GIFs**: the comment is emptied, and every GIF is re-encoded the same way as when tagging, tagged or not (see [How the files are changed](#how-the-files-are-changed)).
 - Like tagging, it goes by the image's real format, so a mislabeled file is cleared the way it was tagged.
 - Files with corrupted metadata are re-saved with Pillow instead, with the same side effects as [when tagging](#repairing-corrupted-metadata).
