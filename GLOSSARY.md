@@ -1,10 +1,14 @@
-# Image Tagging
+# Image Tagging Glossary
 
 img tagger describes images with model-generated tags stored in the images' own metadata. This glossary names the images, tagging results and metadata operations in that workflow.
 
 ## Language
 
 ### Images and tags
+
+**Supported image format**:
+An image format that img tagger can inspect and write metadata to (JPEG, WebP, PNG and GIF); other formats, such as BMP, TIFF or MPO, cannot be tagged.
+_Avoid_: Valid image format (formats like BMP are valid image formats, but unsupported)
 
 **Image candidate**:
 A file selected for consideration because its extension is associated with a supported image format; its contents may still be invalid or in an unsupported format.
@@ -16,7 +20,11 @@ _Avoid_: Original (when it could also mean the copy sent to the model)
 
 **Model image**:
 The representation of a source image sent to the model for tag generation, which may be a prepared copy of its first frame or the unchanged source contents.
-_Avoid_: Resized original, thumbnail
+_Avoid_: Resized original, thumbnail (the representation may be full-sized, unscaled source contents)
+
+**Prompt**:
+The text instructions supplied to the model to guide tag generation, describing the expectations for tag language, formatting and subject emphasis.
+_Avoid_: System prompt (it may be passed as a user instruction or template depending on the backend)
 
 **Tag**:
 A descriptive keyword or phrase associated with an image, such as a subject, image type, mood or visible text; its language and wording depend on the prompt and model reply.
@@ -36,7 +44,7 @@ _Avoid_: Tag generation (when the metadata write is also meant)
 
 **Processing marker**:
 The text `[PROCESSED BY AI]` used to recognize an image as already tagged, regardless of the tags it contains or where the marker originated.
-_Avoid_: Tag, proof of successful tagging
+_Avoid_: Tag, proof of successful tagging (indicates prior processing, not tag validity)
 
 ### Tagging outcomes
 
@@ -64,4 +72,4 @@ _Avoid_: Undo tagging, reset tags, remove all metadata
 
 **Metadata repair**:
 Re-creation of an image with readable metadata after corrupted metadata prevents an edit, with possible changes to image encoding and loss of existing metadata.
-_Avoid_: Auto-healing, sanitization
+_Avoid_: Auto-healing, sanitization (implementation terms)
