@@ -626,6 +626,8 @@ uv pip compile requirements-dev.txt --universal --python-version 3.13 --generate
 
 This keeps the versions already in the lock where they still fit. To update the locked versions, add `--upgrade` (or `-P <package>` for a single package).
 
+All GitHub Actions and reusable workflows are pinned to full commit SHAs, with version comments kept alongside them.
+
 [Dependabot](.github/dependabot.yml) opens pull requests to update the GitHub Actions used in CI; the schedule, grouping and cooldown are set in that file. It is told to ignore the Python packages, security updates included, because it can't regenerate this lock.
 
 The minimum versions in `requirements.txt` have not been tested as minimums; CI only tests the locked versions.
