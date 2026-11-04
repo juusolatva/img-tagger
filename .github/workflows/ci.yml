@@ -52,7 +52,7 @@ jobs:
       # Dependabot bumps requirements*.txt but can't regenerate the lock, so fail when they disagree.
       - name: Check requirements-dev.lock is up to date
         run: |
-          python -m pip install uv==0.13.5
+          python -m pip install --only-binary :all: uv==0.13.5
           cp requirements-dev.lock "$RUNNER_TEMP/relocked.lock"
           uv pip compile requirements-dev.txt --universal --python-version 3.13 --generate-hashes --no-header -o "$RUNNER_TEMP/relocked.lock"
           diff -u requirements-dev.lock "$RUNNER_TEMP/relocked.lock" || {
