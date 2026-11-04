@@ -612,6 +612,7 @@ Each image is its own test. It is copied to a temporary folder first, so the ori
 Every push to `main` and every pull request runs [GitHub Actions](.github/workflows/ci.yml), and you can also start it by hand:
 
 - **Ruff** lint and format checks, using the Ruff version pinned in `requirements-dev.txt`
+- a **lockfile** check that `requirements-dev.lock` matches `requirements*.txt` (regenerated with uv and compared)
 - the offline **tests** with coverage on Python 3.13 and 3.14 on Linux, plus Python 3.14 on Windows
 - a **SonarQube Cloud** scan, which combines the Linux and Windows coverage reports from the Python 3.14 jobs (needs `SONAR_TOKEN` as a repository secret and as a Dependabot secret; pull requests from forks get no secrets, so there the scan is skipped with a warning)
 - an [**OSV-Scanner**](.github/workflows/osv-scanner.yml) dependency vulnerability scan (`requirements-dev.lock` and `requirements*.txt`), which also runs on a weekly schedule and manual dispatch; on pull requests and merge groups it checks only for newly introduced vulnerabilities and skips the SARIF upload on fork PRs
@@ -628,7 +629,7 @@ This keeps the versions already in the lock where they still fit. To update the 
 
 All GitHub Actions and reusable workflows are pinned to full commit SHAs, with version comments kept alongside them.
 
-[Dependabot](.github/dependabot.yml) opens pull requests to update the GitHub Actions used in CI; the schedule, grouping and cooldown are set in that file. It is told to ignore the Python packages, security updates included, because it can't regenerate this lock.
+[Dependabot](.github/dependabot.yml) opens pull requests to update the GitHub Actions used in CI and the Python packages; the schedule, grouping and cooldown are set in that file. For Python it only edits `requirements*.txt`, not the lock, so the lockfile check fails on its pull requests until you regenerate the lock (command above) and push it to the PR branch.
 
 The minimum versions in `requirements.txt` have not been tested as minimums; CI only tests the locked versions.
 

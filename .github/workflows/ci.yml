@@ -36,6 +36,30 @@ jobs:
           version-file: requirements-dev.txt
           args: format --check --diff
 
+  lock:
+    name: Lockfile
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      # Dependabot bumps requirements*.txt but can't regenerate the lock, so fail when they disagree.
+      - name: Check requirements-dev.lock is up to date
+        run: |
+          python -m pip install uv==0.13.5
+          cp requirements-dev.lock "$RUNNER_TEMP/relocked.lock"
+          uv pip compile requirements-dev.txt --universal --python-version 3.13 --generate-hashes --no-header -o "$RUNNER_TEMP/relocked.lock"
+          diff -u requirements-dev.lock "$RUNNER_TEMP/relocked.lock" || {
+            echo "::error file=requirements-dev.lock::Lock is out of date; regenerate it as described in AGENTS.md"
+            exit 1
+          }
+
   test:
     name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
