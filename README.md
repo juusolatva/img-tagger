@@ -13,8 +13,6 @@ img tagger itself uses no cloud service: the images only go to the model server 
 
 The tags are standard EXIF and XMP fields (a comment for GIFs), so they stay with the file when you copy or move it. The accuracy of the tags depends on the model.
 
-See the [glossary](GLOSSARY.md) for the project's terminology.
-
 **Contents:** [Features](#features) · [Requirements](#requirements) · [Installation](#installation) · [Setting up a model backend](#setting-up-a-model-backend) · [Usage](#usage) · [What gets written to your images](#what-gets-written-to-your-images) · [Customising the prompt](#customising-the-prompt) · [Output](#output) · [Stopping early](#stopping-early) · [Clearing tags](#clearing-tags) · [Choosing a model and performance](#choosing-a-model-and-performance) · [Troubleshooting](#troubleshooting) · [Known issues and limitations](#known-issues-and-limitations) · [Running tests](#running-tests) · [Continuous integration](#continuous-integration) · [License](#license)
 
 ## Features
