@@ -359,3 +359,20 @@ def test_new_log_is_private(tmp_path):
     log = tmp_path / "run.log"
     img_tagger._open_log(log).close()
     assert log.stat().st_mode & 0o077 == 0
+
+
+def test_log_keeps_a_more_verbose_root_level_and_filters_other_debug(tmp_path, restore_logging):
+    import logging
+
+    logging.getLogger().setLevel(logging.DEBUG)  # an embedding application's own setting
+    log = tmp_path / "run.log"
+    img_tagger.setup_logging(str(log))
+    logging.getLogger("other.library").debug("noise")
+    logging.getLogger("other.library").info("request line")
+    img_tagger.logger.debug("our detail")
+
+    assert logging.getLogger().level == logging.DEBUG
+    text = log.read_text(encoding="utf-8")
+    assert "noise" not in text
+    assert "request line" in text
+    assert "our detail" in text

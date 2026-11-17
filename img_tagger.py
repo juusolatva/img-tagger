@@ -112,9 +112,13 @@ def setup_logging(log_path: str | None) -> None:
     for old in [h for h in root.handlers if isinstance(h, _LogHandler)]:
         root.removeHandler(old)
         old.close()
+    # INFO for other libraries keeps httpx's request lines but drops Pillow's per-chunk DEBUG noise. As a
+    # filter on our handler, not the root level, which is only raised to INFO, never lowered from a more
+    # verbose level an embedding application set for its own handlers.
+    handler.addFilter(lambda record: record.levelno >= logging.INFO or record.name.startswith(logger.name))
     root.addHandler(handler)
-    # INFO for other libraries keeps httpx's request lines but drops Pillow's per-chunk DEBUG noise
-    root.setLevel(logging.INFO)
+    if root.getEffectiveLevel() > logging.INFO:
+        root.setLevel(logging.INFO)
     logger.setLevel(logging.DEBUG)
     logger.info(f"Logging started (Python {platform.python_version()} on {platform.system()})")
 
@@ -659,10 +663,15 @@ def _open_pillow(path: Path | str | bytes) -> Image.Image:
     return Image.open(io.BytesIO(data))
 
 
-def _check_replacement(path: Path, parent_fd: int | None, expected: os.stat_result) -> None:
-    """Refuse replacing a directory entry that no longer names the opened file."""
+def _check_replacement(
+    path: Path,
+    parent_fd: int | None,
+    expected: os.stat_result,
+    same: Callable[[os.stat_result, os.stat_result], bool] = os.path.samestat,
+) -> None:
+    """Refuse replacing a directory entry that no longer names the opened file (by same(), default identity)."""
     current = os.stat(path.name if parent_fd is not None else path, dir_fd=parent_fd, follow_symlinks=False)
-    if not os.path.samestat(current, expected):
+    if not same(current, expected):
         raise _UnsafeImagePath(f"File changed during processing: {path.name}")
 
 
@@ -678,15 +687,16 @@ def _image_edit(image_path: Path | str, expected: os.stat_result | None = None) 
         if expected is not None and not _same_version(original, expected):
             raise _UnsafeImagePath(f"File changed during processing: {path.name}")
         fd, temporary = _create_image_temp(path.parent, parent_fd, attributes.get(_Win.SECURITY_KEY))
-        expected = os.fstat(fd)
+        temp_stat = os.fstat(fd)
         try:
             with os.fdopen(fd, "w+b") as output:
                 try:
                     yield data, output
                     output.flush()
                     _apply_permissions(output, original, attributes, path.name)
-                    _check_replacement(temporary, parent_fd, expected)
-                    _check_replacement(path, parent_fd, original)
+                    _check_replacement(temporary, parent_fd, temp_stat)
+                    # Unchanged, not just the same file: an edit by another program meanwhile must not be overwritten
+                    _check_replacement(path, parent_fd, original, _same_version)
                     # Windows renames the still-open temporary through its handle
                     source_fd = output.fileno() if parent_fd is None else None
                     robust_replace(temporary, path, parent_fd=parent_fd, source_fd=source_fd)
@@ -1054,7 +1064,8 @@ def _model_image(source: bytes, max_megapixels: float = DEFAULT_MAX_MEGAPIXELS) 
         return _original_image(source)
     try:
         return _scaled_image(source, max_megapixels)
-    except Exception as error:  # noqa: BLE001 - Pillow raises arbitrary errors (struct.error, zlib.error, ...)
+    # Pillow raises errors outside OSError too, e.g. struct.error or zlib.error
+    except Exception as error:  # noqa: BLE001 - any failure falls back to the original
         # e.g. a truncated JPEG: verify() doesn't decode JPEG pixels, but servers decode leniently
         logger.warning(f"Could not prepare a scaled copy ({error}); sending the original file instead")
         return _original_image(source)
@@ -1179,6 +1190,22 @@ def get_tags_lm_studio(
     return content or ""
 
 
+def _json_list(raw_output: str) -> list | None:
+    """The reply as a JSON list: the whole reply, else its first-to-last bracketed segment (None if neither)."""
+    candidates = [raw_output]
+    start, end = raw_output.find("["), raw_output.rfind("]")
+    if start != -1 and end > start:
+        candidates.append(raw_output[start : end + 1])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(parsed, list):
+            return parsed
+    return None
+
+
 def parse_model_output(raw_output: str | None) -> list[str] | None:
     """Parse model output and extract tags robustly with normalization.
 
@@ -1200,34 +1227,19 @@ def parse_model_output(raw_output: str | None) -> list[str] | None:
     if "</think>" in raw_output:
         raw_output = raw_output.rsplit("</think>", 1)[1]
 
-    # Pattern 1: JSON array ["tag1", "tag2"] - most reliable
-    parsed = None
-
-    # Fast path: whole output is JSON
-    try:
-        parsed = json.loads(raw_output)
-    except (ValueError, RecursionError):
-        parsed = None
-
-    # Fallback: find first bracketed segment and parse that
-    if not isinstance(parsed, list):
-        start = raw_output.find("[")
-        end = raw_output.rfind("]")
-        if start != -1 and end != -1 and end > start:
-            candidate = raw_output[start : end + 1]
-            try:
-                parsed = json.loads(candidate)
-            except (ValueError, RecursionError):
-                parsed = None
-
-    if isinstance(parsed, list):
+    # Pattern 1: JSON array ["tag1", "tag2"] - most reliable. A list with strings is the model's answer, even
+    # with too few tags: splitting its text on commas would turn '[true' or 'd]' into tags. A list without
+    # strings (e.g. an incidental [1] in prose) falls through to the text patterns.
+    parsed = _json_list(raw_output)
+    if parsed is not None:
         # bool is an int subclass, but true/false are not tags
         json_tags = [
             str(x).strip().lower() for x in parsed if isinstance(x, (str, int, float)) and not isinstance(x, bool)
         ]
         normalized = normalize_tags(json_tags)
-        if normalized:
+        if normalized or any(isinstance(x, str) for x in parsed):
             return normalized
+
     # Pattern 2: Bullet points at line start (minimum 6 items expected); hyphens inside tags are not bullets.
     # A Markdown "*" bullet needs a space after it, so a bold "**Tags:**" line is not one.
     bullets = re.findall(r"^[ \t]*(?:[-•★●]|\*(?=[ \t]))[ \t]*(\S.*)", raw_output, re.MULTILINE)
@@ -1883,7 +1895,7 @@ def main(argv: list[str] | None = None) -> int:
             max_megapixels=args.max_pixels,
         )
     except _UnsafeImagePath as e:  # the folder itself (per-image problems are reported per image)
-        logger.error(f"Refused the image folder: {e}")
+        logger.exception("Refused the image folder")
         print(f"Error: {e}")
         return 1
     return 0

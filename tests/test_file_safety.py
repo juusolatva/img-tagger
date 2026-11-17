@@ -553,3 +553,16 @@ class TestGroupWritableFolder:
         folder.chmod(0o775)
         img_tagger.clear_tags(image)
         assert "must not be writable by its group" in capsys.readouterr().out
+
+
+def test_edit_by_another_program_during_the_write_is_not_overwritten(tmp_path):
+    image = make_image(tmp_path / "a.png")
+    newer = make_image(tmp_path / "newer.png", size=(30, 30)).read_bytes()
+    with (
+        pytest.raises(img_tagger._UnsafeImagePath, match="changed during processing"),
+        img_tagger._image_edit(image) as (source, output),
+    ):
+        output.write(source)
+        image.write_bytes(newer)  # same file, new content, before the commit
+    assert image.read_bytes() == newer
+    assert [p.name for p in tmp_path.iterdir() if p.suffix == ".tmp"] == []
