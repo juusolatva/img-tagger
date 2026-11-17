@@ -458,12 +458,26 @@ def test_reads_do_not_capture_permissions(tmp_path, monkeypatch):
     assert not img_tagger.is_already_processed(image)
 
 
-def other_group_or_skip() -> int:
-    """A group of this user other than the one new files get, so the temporary's group differs."""
-    groups = [group for group in os.getgroups() if group != os.getegid()]
-    if not groups:
-        pytest.skip("needs a user with a secondary group")
-    return groups[0]
+def other_group_or_skip(directory: Path) -> int:
+    """
+    A group of this user other than the one new files get, so the temporary's group differs. Only
+    groups a file in directory can really be given count: in containers and user namespaces an
+    unmapped supplementary group shows up as the overflow gid and chown() fails with EINVAL.
+    """
+    probe = directory / "group-probe"
+    probe.touch()
+    try:
+        for group in os.getgroups():
+            if group == os.getegid():
+                continue
+            try:
+                os.chown(probe, -1, group)
+            except OSError:
+                continue
+            return group
+    finally:
+        probe.unlink()
+    pytest.skip("needs a user with a secondary group that files can be given")
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX owning group")
@@ -472,7 +486,7 @@ def other_group_or_skip() -> int:
 def test_keeps_the_source_group_instead_of_the_temporary_one(tmp_path, clear, extension):
     image = tmp_path / f"a.{extension}"
     (make_gif if extension == "gif" else make_image)(image)
-    group = other_group_or_skip()
+    group = other_group_or_skip(tmp_path)
     os.chown(image, -1, group)
     image.chmod(0o640)
     if clear:
@@ -486,7 +500,7 @@ def test_keeps_the_source_group_instead_of_the_temporary_one(tmp_path, clear, ex
 @pytest.mark.skipif(os.name == "nt", reason="POSIX owning group")
 def test_unkeepable_group_drops_group_access(tmp_path, monkeypatch, capsys):
     image = make_image(tmp_path / "a.png")
-    os.chown(image, -1, other_group_or_skip())
+    os.chown(image, -1, other_group_or_skip(tmp_path))
     image.chmod(0o640)
 
     def not_a_member(fd, uid, gid):
@@ -502,7 +516,7 @@ def test_unkeepable_group_drops_group_access(tmp_path, monkeypatch, capsys):
 @pytest.mark.parametrize("error", [errno.EINVAL, errno.EOPNOTSUPP, errno.ENOSYS])
 def test_group_refused_by_filesystem_drops_group_access(tmp_path, monkeypatch, capsys, error):
     image = make_image(tmp_path / "a.png")
-    os.chown(image, -1, other_group_or_skip())
+    os.chown(image, -1, other_group_or_skip(tmp_path))
     image.chmod(0o640)
 
     def refuse(fd, uid, gid):
@@ -513,3 +527,51 @@ def test_group_refused_by_filesystem_drops_group_access(tmp_path, monkeypatch, c
     assert img_tagger.is_already_processed(image)
     assert stat.S_IMODE(image.stat().st_mode) == 0o600
     assert "removed its group permissions" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX folder permissions")
+class TestGroupWritableFolder:
+    """A folder its group may write (mkdir under umask 0002) is refused with the real reason, per image."""
+
+    def test_tagging_fails_that_image_with_the_reason(self, tmp_path):
+        folder = tmp_path / "shared"
+        folder.mkdir(mode=0o775)
+        folder.chmod(0o775)
+        client = FakeOllamaClient()
+        status, _, message, _ = img_tagger.process_single_image(
+            make_image(folder / "a.png"), client, "ollama", "m", "p", threading.Event()
+        )
+        assert status == "FAILED"
+        assert "must not be writable by its group or other users" in message
+        assert str(folder) in message
+        assert client.calls == []
+
+    def test_clearing_reports_the_reason(self, tmp_path, capsys):
+        folder = tmp_path / "shared"
+        folder.mkdir()
+        image = make_image(folder / "a.png")
+        folder.chmod(0o775)
+        img_tagger.clear_tags(image)
+        assert "must not be writable by its group" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("change", ["mtime", "size"])
+def test_edit_by_another_program_during_the_write_is_not_overwritten(tmp_path, change):
+    """Each _same_version() check on its own: same size with a new mtime, or a new size with the old mtime."""
+    image = make_image(tmp_path / "a.png")
+    before = image.stat()
+    original = image.read_bytes()
+    newer = bytes(reversed(original)) if change == "mtime" else original + b"appended"
+    # set explicitly, so a coarse filesystem timestamp can't hide the change or leak one into the size case
+    mtime_ns = before.st_mtime_ns + 1_000_000_000 if change == "mtime" else before.st_mtime_ns
+
+    def edit_while_another_program_writes():
+        with img_tagger._image_edit(image) as (source, output):
+            output.write(source)
+            image.write_bytes(newer)  # same file, before the commit
+            os.utime(image, ns=(before.st_atime_ns, mtime_ns))
+
+    with pytest.raises(img_tagger._UnsafeImagePath, match="changed during processing"):
+        edit_while_another_program_writes()
+    assert image.read_bytes() == newer
+    assert [p.name for p in tmp_path.iterdir() if p.suffix == ".tmp"] == []

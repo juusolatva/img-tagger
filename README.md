@@ -189,8 +189,8 @@ python img_tagger.py "C:\Users\you\Pictures\My memes"
 | `--host` | `http://localhost:11434` for Ollama, `http://localhost:1234` for LM Studio | Address of the model server. See [Using a server on another machine](#using-a-server-on-another-machine). |
 | `--model` | `qwen3-vl:8b` | The model to use. The default is Ollama's name for it, so with LM Studio pass LM Studio's id (e.g. `qwen/qwen3-vl-8b`). |
 | `--workers` | `1` | How many images to process at the same time, from 1 to 4. |
-| `--timeout` | `600` | Seconds to wait for the model's answer to one image, including loading the model, before that image is marked failed. Must be a positive number. Raise it for slow hardware. |
-| `--max-pixels` | `1` | Largest size, in megapixels, of the copy sent to the model; bigger images are scaled down (keeping their shape) before sending. Must be nonnegative; `nan` is rejected. `0` sends the original file, as does a failure to prepare the copy. Resizing affects only the outgoing copy; tagging still writes metadata to your files. See [Choosing a model and performance](#choosing-a-model-and-performance). |
+| `--timeout` | `600` | Seconds to wait for the model's answer to one image, including loading the model, before that image is marked failed. Must be a positive, finite number (`nan` and `inf` are rejected). Raise it for slow hardware. |
+| `--max-pixels` | `1` | Largest size, in megapixels, of the copy sent to the model; bigger images are scaled down (keeping their shape) before sending. Must be nonnegative and finite; `nan` and `inf` are rejected. `0` sends the original file, as does a failure to prepare the copy. Resizing affects only the outgoing copy; tagging still writes metadata to your files. See [Choosing a model and performance](#choosing-a-model-and-performance). |
 | `--log` | off | Append a detailed log to this file, e.g. `--log logs/run.log`. Missing folders are created; a relative path is relative to the current directory. The name must end in `.log` (any letter case), and an existing path must be a regular file, not a symlink or folder. On Linux and macOS it must also belong to you, and a new log is readable only by you. The file is opened once and kept open, so swapping its name for a link can't redirect the writes. |
 | `--clear` | off | Remove metadata from the images instead of tagging them. See [Clearing tags](#clearing-tags). |
 | `-h`, `--help` | | Show the options and exit. |
@@ -199,7 +199,9 @@ python img_tagger.py "C:\Users\you\Pictures\My memes"
 
 - Files ending in `.jpg`, `.jpeg`, `.png`, `.webp` or `.gif`, in any letter case (`photo.JPG` counts). Hidden files such as `.hidden.jpg` are included.
 - Everything else (`.jfif`, `.tif`, `.heic`, `.avif`, `.bmp`, ...) is silently ignored and not counted.
-- Image symlinks and symlinked parent directories are refused; choose the real image directory. POSIX also refuses image directories writable by another user/group or owned by someone other than the current user or root. Shared ancestors such as `/tmp` are allowed because directory handles stay pinned. Paths containing `..` are refused.
+- Image symlinks and symlinked parent directories are refused; choose the real image directory. Shared ancestors such as `/tmp` are allowed because directory handles stay pinned.
+- On Linux and macOS, the folder holding an image must belong to you (or root) and must not be writable by its group or other users. Folders created with `umask 0002` (the default on Ubuntu and some other distributions) are mode `775` and therefore refused; `chmod go-w <folder>` fixes that. If the folder you pass is refused, img tagger prints `Error: Image folder must not be writable by its group or other users (chmod go-w): <folder>` and exits with code 1. With `-r`, images in a refused subfolder fail one by one with that reason, and the rest of the run continues.
+- A path starting with `..` (e.g. `../memes`) works. A `..` later in the path (e.g. `photos/../memes`) is refused with `Error: Image paths must not contain '..'`, because it could lead through a link to a different folder.
 - Each file is opened with Pillow first, and img tagger goes by the image's real format, not its extension (a PNG named `.gif` is tagged like a PNG).
   - A file with an image extension that isn't a valid image fails with `Unreadable image (unsupported or corrupted file)`.
   - A valid image in a format img tagger can't tag (e.g. a BMP named `.jpg`, or an MPO, see [Known issues](#known-issues-and-limitations)) fails with `Unsupported file format: <format>`.
@@ -211,7 +213,7 @@ python img_tagger.py "C:\Users\you\Pictures\My memes"
 | Code | When |
 |---|---|
 | `0` | The run finished, even if some images failed. Also after pressing `Q` or when no images were found. |
-| `1` | The folder doesn't exist, `--workers` is outside 1 to 4, `--timeout` is zero, negative or `nan`, `--max-pixels` is negative or `nan`, `--log` fails validation or can't be opened, or `prompt.txt` exists but can't be read. Log-open failures print `Error: Could not open the log file ...` without a traceback. Unhandled exceptions also exit with 1 and a traceback, e.g. a missing required package or an unsafe image directory. |
+| `1` | The folder doesn't exist, `--workers` is outside 1 to 4, `--timeout` is zero, negative, `nan` or `inf`, `--max-pixels` is negative, `nan` or `inf`, `--log` fails validation or can't be opened, the folder itself is refused (see [Which files are processed](#which-files-are-processed)), or `prompt.txt` exists but can't be read. These print `Error: ...` without a traceback; invalid options are reported before any log file is created. Unhandled exceptions also exit with 1 and a traceback, e.g. a missing required package. |
 | `2` | An invalid option, e.g. an unknown `--backend` or a non-number for `--workers`, `--timeout` or `--max-pixels`. |
 
 ### Examples
@@ -448,7 +450,7 @@ python img_tagger.py path/to/images --clear
 - **Kept**: the JPEG comment, and PNG text chunks and DPI.
 - A processing marker in a preserved PNG text chunk still causes the image to be skipped on the next tagging run; remove that marker with a metadata editor to tag the image again.
 - **GIFs**: the comment is emptied, and every GIF is re-encoded the same way as when tagging, tagged or not (see [How the files are changed](#how-the-files-are-changed)).
-- Like tagging, it goes by the image's real format, so a mislabeled file is cleared the way it was tagged.
+- Like tagging, it goes by the image's real format, so a mislabeled file is cleared the way it was tagged. Files that aren't valid images or are in a format img tagger can't tag (e.g. a BMP named `.jpg`) are left unchanged and reported as `Failed to clear <name>: Unreadable image` or `... Unsupported file format: <format>`.
 - Files with corrupted metadata are re-saved with Pillow instead, with the same side effects as [when tagging](#repairing-corrupted-metadata).
 - No model server is needed. `--backend`, `--host`, `--model` and `--timeout` are ignored (`--timeout` must still be valid), and `prompt.txt` isn't read.
 - `-r`, `--workers` and `--log` work as usual.
@@ -518,10 +520,16 @@ A file whose metadata had to be repaired shows `Repaired and cleared (Pillow) fo
 **`Unreadable image (unsupported or corrupted file)`**
 - The file has an image extension but Pillow can't open it as an image.
 
+**`Could not read image: Image folder must not be writable by its group or other users (chmod go-w): <folder>`**
+- The image's folder is writable by its group or by everyone, e.g. because it was created with `umask 0002`. Run `chmod go-w <folder>` if nobody else should be able to change files in it. Other reasons after `Could not read image:` include a symlinked folder, a folder owned by another user, or missing read permission.
+
+**`Tagging failed for ...: File changed during processing: <name>`**
+- The image was replaced or edited while the model was working on it, so the tags would describe the old picture. Nothing was written; run again to tag the new version.
+
 **`Unsupported file format: MPO`** (or another format, e.g. `BMP` or `TIFF`)
 - The file has a `.jpg`, `.jpeg`, `.png`, `.webp` or `.gif` extension, but its real format is something else. For MPO see [Known issues](#known-issues-and-limitations); otherwise convert the file to a supported format.
 
-**`[WinError 5] Access is denied: '...\tmpXXXX.tmp'`** or **`Failed to replace ... after retries.`** on Windows
+**`[WinError 5] Access is denied: '...\tmpXXXX.tmp'`** or **`Failed to replace ... after retries: <reason>`** on Windows
 - Another program kept the image locked for the 5 seconds img tagger waited. Close the other program and run again. Read-only images are replaced (and stay read-only) on NTFS; on other drives (FAT32/exFAT, some network shares) a read-only image can fail this way, so clear its read-only attribute first.
 
 **`Error: The folder '<folder>' could not be located.`**

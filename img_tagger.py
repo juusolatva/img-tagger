@@ -104,14 +104,37 @@ def setup_logging(log_path: str | None) -> None:
     # Create parent directory if it doesn't exist
     path_obj.parent.mkdir(parents=True, exist_ok=True)
 
-    logging.basicConfig(
-        handlers=[logging.StreamHandler(_open_log(path_obj))],
-        # INFO for other libraries keeps httpx's request lines but drops Pillow's per-chunk DEBUG noise
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(threadName)s %(name)s: %(message)s",
-    )
+    handler = _LogHandler(_open_log(path_obj))
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(threadName)s %(name)s: %(message)s"))
+    # Not basicConfig(): it silently ignores the handler (leaking the open log) when the root logger
+    # already has one, e.g. pytest's or an embedding application's. Only an earlier log of ours is replaced.
+    root = logging.getLogger()
+    for old in [h for h in root.handlers if isinstance(h, _LogHandler)]:
+        root.removeHandler(old)
+        old.close()
+    # INFO for other libraries keeps httpx's request lines but drops Pillow's per-chunk DEBUG noise. As a
+    # filter on our handler, not the root level, which is only raised to INFO, never lowered from a more
+    # verbose level an embedding application set for its own handlers.
+    handler.addFilter(lambda record: record.levelno >= logging.INFO or record.name.startswith(logger.name))
+    root.addHandler(handler)
+    if root.getEffectiveLevel() > logging.INFO:
+        root.setLevel(logging.INFO)
     logger.setLevel(logging.DEBUG)
     logger.info(f"Logging started (Python {platform.python_version()} on {platform.system()})")
+
+
+class _LogHandler(logging.StreamHandler):
+    """The --log handler; unlike a plain StreamHandler, closing it also closes the log file."""
+
+    def close(self) -> None:
+        self.acquire()
+        try:
+            if not self.stream.closed:
+                self.flush()
+                self.stream.close()
+        finally:
+            self.release()
+            super().close()
 
 
 def _open_log(path: Path) -> TextIO:
@@ -263,12 +286,14 @@ class _UnsafeImagePath(OSError):
     """An image path cannot be used without crossing a filesystem trust boundary."""
 
 
-def _check_directory(info: os.stat_result) -> None:
+def _check_directory(info: os.stat_result, folder: Path | None = None) -> None:
     """Reject directories another POSIX user can replace entries in."""
+    where = f": {folder}" if folder else ""
     if info.st_uid not in {0, os.geteuid()}:
-        raise _UnsafeImagePath("Image directory must belong to this user or root")
+        raise _UnsafeImagePath(f"Image folder must belong to this user or root{where}")
     if info.st_mode & 0o022:
-        raise _UnsafeImagePath("Image directories must not be writable by other users")
+        # Also with umask 0002 (user-private groups): the check can't tell a private group from a shared one
+        raise _UnsafeImagePath(f"Image folder must not be writable by its group or other users (chmod go-w){where}")
 
 
 class _Win:
@@ -532,7 +557,7 @@ def _image_parent(path: Path) -> Generator[tuple[Path, int | None]]:
         for part in path.parent.parts[1:]:
             fd = os.open(part, flags, dir_fd=fd)
             stack.callback(os.close, fd)
-        _check_directory(os.fstat(fd))
+        _check_directory(os.fstat(fd), path.parent)
         yield path, fd
 
 
@@ -608,10 +633,28 @@ def _source_bytes(
         return source.read(), info, _file_attributes(source.fileno()) if permissions else {}
 
 
-def _read_image_bytes(path: Path | str) -> bytes:
-    """Read a guarded source snapshot instead of delegating pathname reads to libraries."""
+def _read_image_snapshot(path: Path | str) -> tuple[bytes, os.stat_result]:
+    """
+    Read a guarded source snapshot instead of delegating pathname reads to libraries, with the
+    stat of the file it came from (see _same_version()).
+    """
     with _image_parent(Path(path)) as (image, parent_fd):
-        return _source_bytes(image, parent_fd)[0]
+        data, info, _ = _source_bytes(image, parent_fd)
+        return data, info
+
+
+def _read_image_bytes(path: Path | str) -> bytes:
+    """The bytes of _read_image_snapshot()."""
+    return _read_image_snapshot(path)[0]
+
+
+def _same_version(current: os.stat_result, expected: os.stat_result) -> bool:
+    """Whether current is the same, unmodified file as expected (same file identity, size and mtime)."""
+    return (
+        os.path.samestat(current, expected)
+        and current.st_size == expected.st_size
+        and current.st_mtime_ns == expected.st_mtime_ns
+    )
 
 
 def _open_pillow(path: Path | str | bytes) -> Image.Image:
@@ -620,28 +663,40 @@ def _open_pillow(path: Path | str | bytes) -> Image.Image:
     return Image.open(io.BytesIO(data))
 
 
-def _check_replacement(path: Path, parent_fd: int | None, expected: os.stat_result) -> None:
-    """Refuse replacing a directory entry that no longer names the opened file."""
+def _check_replacement(
+    path: Path,
+    parent_fd: int | None,
+    expected: os.stat_result,
+    same: Callable[[os.stat_result, os.stat_result], bool] = os.path.samestat,
+) -> None:
+    """Refuse replacing a directory entry that no longer names the opened file (by same(), default identity)."""
     current = os.stat(path.name if parent_fd is not None else path, dir_fd=parent_fd, follow_symlinks=False)
-    if not os.path.samestat(current, expected):
+    if not same(current, expected):
         raise _UnsafeImagePath(f"File changed during processing: {path.name}")
 
 
 @contextlib.contextmanager
-def _image_edit(image_path: Path | str) -> Generator[tuple[bytes, BinaryIO]]:
-    """Keep source permissions, parent identity and temporary descriptor bound to an edit."""
+def _image_edit(image_path: Path | str, expected: os.stat_result | None = None) -> Generator[tuple[bytes, BinaryIO]]:
+    """
+    Keep source permissions, parent identity and temporary descriptor bound to an edit. With expected
+    (the stat of an earlier snapshot, e.g. the one sent to the model), refuse a file that has since
+    been replaced or modified.
+    """
     with _image_parent(Path(image_path)) as (path, parent_fd):
         data, original, attributes = _source_bytes(path, parent_fd, permissions=True)
+        if expected is not None and not _same_version(original, expected):
+            raise _UnsafeImagePath(f"File changed during processing: {path.name}")
         fd, temporary = _create_image_temp(path.parent, parent_fd, attributes.get(_Win.SECURITY_KEY))
-        expected = os.fstat(fd)
+        temp_stat = os.fstat(fd)
         try:
             with os.fdopen(fd, "w+b") as output:
                 try:
                     yield data, output
                     output.flush()
                     _apply_permissions(output, original, attributes, path.name)
-                    _check_replacement(temporary, parent_fd, expected)
-                    _check_replacement(path, parent_fd, original)
+                    _check_replacement(temporary, parent_fd, temp_stat)
+                    # Unchanged, not just the same file: an edit by another program meanwhile must not be overwritten
+                    _check_replacement(path, parent_fd, original, _same_version)
                     # Windows renames the still-open temporary through its handle
                     source_fd = output.fileno() if parent_fd is None else None
                     robust_replace(temporary, path, parent_fd=parent_fd, source_fd=source_fd)
@@ -690,7 +745,9 @@ def get_image_format(img_path: Path | bytes) -> str | None:
         # Re-open because verify() closes/clears the file handle in some versions
         with _open_pillow(data) as img:
             return img.format
-    except Exception:  # noqa: BLE001 - Pillow raises arbitrary errors on malformed files
+    except Exception as error:  # noqa: BLE001 - Pillow raises arbitrary errors on malformed files
+        label = "image data" if isinstance(img_path, bytes) else Path(img_path).name
+        logger.debug(f"Could not identify {label} as an image: {error!r}")
         return None
 
 
@@ -709,6 +766,7 @@ def robust_replace(src: Path, dst: Path, *, parent_fd: int | None = None, source
     With parent_fd both names are relative to that POSIX directory; with source_fd (Windows) src is
     renamed through that open descriptor.
     """
+    last_error: OSError | None = None
     for _ in range(10):
         try:
             if source_fd is not None:
@@ -718,9 +776,10 @@ def robust_replace(src: Path, dst: Path, *, parent_fd: int | None = None, source
             else:
                 os.replace(src.name, dst.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
             return
-        except OSError:
+        except OSError as error:
+            last_error = error
             time.sleep(0.5)
-    raise OSError(f"Failed to replace {src} with {dst} after retries.")
+    raise OSError(f"Failed to replace {src} with {dst} after retries: {last_error}") from last_error
 
 
 def _sanitize_with_pillow(src, dst, fmt=None) -> None:
@@ -782,7 +841,7 @@ def _modify_with_pyexiv2(output: BinaryIO, edit: Callable[[Any], None]) -> None:
     output.truncate()
 
 
-def write_metadata(image_path: str, tags_list: list[str]) -> None:
+def write_metadata(image_path: str, tags_list: list[str], expected: os.stat_result | None = None) -> None:
     """
     Writes tags to image metadata (JPEG, WebP, PNG) using pyexiv2.
 
@@ -793,6 +852,7 @@ def write_metadata(image_path: str, tags_list: list[str]) -> None:
     Args:
         image_path: The path to the target image file.
         tags_list: A list of strings representing the tags to embed.
+        expected: The stat of the snapshot the tags describe; a file changed since then is refused.
     """
 
     marker = PROCESSED_MARKER
@@ -807,7 +867,7 @@ def write_metadata(image_path: str, tags_list: list[str]) -> None:
             }
         )
 
-    with _image_edit(image_path) as (source, output):
+    with _image_edit(image_path, expected) as (source, output):
         output.write(source)
         with metadata_lock:
             try:
@@ -850,16 +910,17 @@ def _gif_loop_kwargs(img: Image.Image) -> dict[str, int]:
     return {"loop": img.info["loop"]} if "loop" in img.info else {}
 
 
-def write_gif_tags(image_path: str, tags_list: list[str]) -> None:
+def write_gif_tags(image_path: str, tags_list: list[str], expected: os.stat_result | None = None) -> None:
     """
     Writes tags to GIF images using comments, keeping frames, durations and loop count.
 
     Args:
         image_path: The path to the GIF file.
         tags_list: A list of strings representing the tags to embed.
+        expected: The stat of the snapshot the tags describe; a file changed since then is refused.
     """
 
-    with _image_edit(image_path) as (source, output):
+    with _image_edit(image_path, expected) as (source, output):
         _save_gif(source, output, f"{', '.join(tags_list)} {PROCESSED_MARKER}")
 
 
@@ -885,7 +946,9 @@ def _save_gif(source: bytes, output: BinaryIO, comment: str) -> None:
             first.close()
 
 
-def tag_image(image_path: str, tags_list: list[str], fmt: str | None = None) -> None:
+def tag_image(
+    image_path: str, tags_list: list[str], fmt: str | None = None, expected: os.stat_result | None = None
+) -> None:
     """
     Embeds a list of tags into an image's metadata.
 
@@ -896,6 +959,8 @@ def tag_image(image_path: str, tags_list: list[str], fmt: str | None = None) -> 
         image_path: The filesystem path to the image file.
         tags_list: A list of strings representing the tags to embed.
         fmt: The image format (e.g., 'JPEG'). If None, it will be determined from the file.
+        expected: The stat of the snapshot the tags describe (_read_image_snapshot()); if the file
+            was replaced or modified since then, tagging fails instead of mislabeling the new content.
     """
 
     img_path = Path(image_path)
@@ -907,9 +972,9 @@ def tag_image(image_path: str, tags_list: list[str], fmt: str | None = None) -> 
 
     try:
         if fmt in PYEXIV2_FORMATS:
-            write_metadata(image_path, tags_list)
+            write_metadata(image_path, tags_list, expected)
         elif fmt == "GIF":
-            write_gif_tags(image_path, tags_list)
+            write_gif_tags(image_path, tags_list, expected)
         else:
             raise ValueError(f"Unsupported file format: {fmt}")
     except Exception as e:
@@ -969,8 +1034,10 @@ def clear_tags(image_path: Path | str) -> None:
             fmt = get_image_format(source)
             if _is_gif(p, fmt):
                 message = _clear_gif(source, output)
-            else:
+            elif fmt in PYEXIV2_FORMATS:
                 message = _clear_standard(source, output, fmt)
+            else:
+                raise ValueError(f"Unsupported file format: {fmt}" if fmt else "Unreadable image")
         separator = ": " if fmt == "GIF" else " for: "
         logger.info(f"{message}{separator}{p.name}")
         print(f"  {message}{separator}{p.name}")
@@ -997,7 +1064,8 @@ def _model_image(source: bytes, max_megapixels: float = DEFAULT_MAX_MEGAPIXELS) 
         return _original_image(source)
     try:
         return _scaled_image(source, max_megapixels)
-    except (OSError, ValueError, SyntaxError, EOFError) as error:
+    # Pillow raises errors outside OSError too, e.g. struct.error or zlib.error
+    except Exception as error:  # noqa: BLE001 - any failure falls back to the original
         # e.g. a truncated JPEG: verify() doesn't decode JPEG pixels, but servers decode leniently
         logger.warning(f"Could not prepare a scaled copy ({error}); sending the original file instead")
         return _original_image(source)
@@ -1040,7 +1108,13 @@ def _scaled_image(source: bytes, max_megapixels: float) -> tuple[bytes, str]:
 
 
 def get_tags_ollama(
-    client: Any, model: str, img_path: Path, prompt: str, max_megapixels: float = DEFAULT_MAX_MEGAPIXELS
+    client: Any,
+    model: str,
+    img_path: Path,
+    prompt: str,
+    max_megapixels: float = DEFAULT_MAX_MEGAPIXELS,
+    *,
+    data: bytes | None = None,
 ) -> str:
     """
     Sends an image and prompt to an Ollama server for tag generation.
@@ -1051,24 +1125,31 @@ def get_tags_ollama(
         img_path: The path to the image file.
         prompt: The prompt instructions for generating tags.
         max_megapixels: Pixel budget for the copy sent (see _model_image(); 0 sends the original).
+        data: An already read snapshot of the image (_read_image_snapshot()); read from img_path if None.
 
     Returns:
         A string containing the generated tags from the model response.
     """
 
     logger.debug(f"Requesting tags from Ollama ({model}) for {img_path}")
-    data, _ = _model_image(_read_image_bytes(img_path), max_megapixels)
+    data, _ = _model_image(_read_image_bytes(img_path) if data is None else data, max_megapixels)
     response = client.chat(
         model=model,
         messages=[{"role": "user", "content": prompt, "images": [data]}],
     )
     content = response.message.content
     logger.debug(f"Raw Ollama response for {img_path}: {content}")
-    return content
+    return content or ""
 
 
 def get_tags_lm_studio(
-    client: Any, model: str, img_path: Path, prompt: str, max_megapixels: float = DEFAULT_MAX_MEGAPIXELS
+    client: Any,
+    model: str,
+    img_path: Path,
+    prompt: str,
+    max_megapixels: float = DEFAULT_MAX_MEGAPIXELS,
+    *,
+    data: bytes | None = None,
 ) -> str:
     """
     Encodes the image to base64 and sends a request to an LM Studio server.
@@ -1079,13 +1160,14 @@ def get_tags_lm_studio(
         img_path: The path to the image file.
         prompt: The text prompt for generating tags.
         max_megapixels: Pixel budget for the copy sent (see _model_image(); 0 sends the original).
+        data: An already read snapshot of the image (_read_image_snapshot()); read from img_path if None.
 
     Returns:
         A string containing the generated tags from the response content.
     """
 
     logger.debug(f"Requesting tags from LM Studio ({model}) for {img_path}")
-    data, mime_type = _model_image(_read_image_bytes(img_path), max_megapixels)
+    data, mime_type = _model_image(_read_image_bytes(img_path) if data is None else data, max_megapixels)
     base64_image = base64.b64encode(data).decode("utf-8")
 
     response = client.chat.completions.create(
@@ -1105,10 +1187,26 @@ def get_tags_lm_studio(
     )
     content = response.choices[0].message.content
     logger.debug(f"Raw LM Studio response for {img_path}: {content}")
-    return content
+    return content or ""
 
 
-def parse_model_output(raw_output: str) -> list[str] | None:
+def _json_list(raw_output: str) -> list | None:
+    """The reply as a JSON list: the whole reply, else its first-to-last bracketed segment (None if neither)."""
+    candidates = [raw_output]
+    start, end = raw_output.find("["), raw_output.rfind("]")
+    if start != -1 and end > start:
+        candidates.append(raw_output[start : end + 1])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(parsed, list):
+            return parsed
+    return None
+
+
+def parse_model_output(raw_output: str | None) -> list[str] | None:
     """Parse model output and extract tags robustly with normalization.
 
     Tries multiple patterns (JSON, bullet points, intro text, comma-separated)
@@ -1116,50 +1214,42 @@ def parse_model_output(raw_output: str) -> list[str] | None:
     insufficient tags are extracted.
 
     Args:
-        raw_output: The raw string output from the LLM.
+        raw_output: The raw string output from the LLM (None when the reply had no content).
 
     Returns:
         A list of normalized tags, or None if no valid tags could be extracted.
     """
 
+    if not raw_output:
+        return None
+
     # Thinking models (e.g. qwen3, deepseek-r1) may emit <think>...</think> reasoning before the answer
     if "</think>" in raw_output:
         raw_output = raw_output.rsplit("</think>", 1)[1]
 
-    # Pattern 1: JSON array ["tag1", "tag2"] - most reliable
-    parsed = None
-
-    # Fast path: whole output is JSON
-    try:
-        parsed = json.loads(raw_output)
-    except (ValueError, RecursionError):
-        parsed = None
-
-    # Fallback: find first bracketed segment and parse that
-    if not isinstance(parsed, list):
-        start = raw_output.find("[")
-        end = raw_output.rfind("]")
-        if start != -1 and end != -1 and end > start:
-            candidate = raw_output[start : end + 1]
-            try:
-                parsed = json.loads(candidate)
-            except (ValueError, RecursionError):
-                parsed = None
-
-    if isinstance(parsed, list):
-        json_tags = [str(x).strip().lower() for x in parsed if isinstance(x, (str, int, float))]
+    # Pattern 1: JSON array ["tag1", "tag2"] - most reliable. A list with strings is the model's answer, even
+    # with too few tags: splitting its text on commas would turn '[true' or 'd]' into tags. A list without
+    # strings (e.g. an incidental [1] in prose) falls through to the text patterns.
+    parsed = _json_list(raw_output)
+    if parsed is not None:
+        # bool is an int subclass, but true/false are not tags
+        json_tags = [
+            str(x).strip().lower() for x in parsed if isinstance(x, (str, int, float)) and not isinstance(x, bool)
+        ]
         normalized = normalize_tags(json_tags)
-        if normalized:
+        if normalized or any(isinstance(x, str) for x in parsed):
             return normalized
-    # Pattern 2: Bullet points at line start (minimum 6 items expected); hyphens inside tags are not bullets
-    bullets = re.findall(r"^[ \t]*[-•★●][ \t]*(\S.*)", raw_output, re.MULTILINE)
+
+    # Pattern 2: Bullet points at line start (minimum 6 items expected); hyphens inside tags are not bullets.
+    # A Markdown "*" bullet needs a space after it, so a bold "**Tags:**" line is not one.
+    bullets = re.findall(r"^[ \t]*(?:[-•★●]|\*(?=[ \t]))[ \t]*(\S.*)", raw_output, re.MULTILINE)
     if len(bullets) >= 6:
-        return normalize_tags([t.strip().strip('"').lower() for b in bullets for t in b.split(",")])
+        return normalize_tags([t.strip().strip("\"'").lower() for b in bullets for t in b.split(",")])
 
     # Pattern 3: Numbered lists like "1. tag" (minimum 6 items expected)
     numbered = re.findall(r"(?<!\d)\d+\.\s+(.+)", raw_output)
     if len(numbered) >= 6:
-        return normalize_tags([t.strip().strip('"').lower() for n in numbered for t in n.split(",")])
+        return normalize_tags([t.strip().strip("\"'").lower() for n in numbered for t in n.split(",")])
 
     # Pattern 4: "Here are the tags:" style intro text extraction. Needs a colon later on the same line
     # ("tags for this image:") or a dash right after, so a list item like "text tags" doesn't count.
@@ -1237,7 +1327,7 @@ def _contains_marker(value: object) -> bool:
     return bool(value) and PROCESSED_MARKER in str(value)
 
 
-def _pyexiv2_has_marker(p: Path) -> bool:
+def _pyexiv2_has_marker(p: Path, data: bytes | None = None) -> bool:
     """
     Checks every EXIF and XMP value for the processed marker.
 
@@ -1247,7 +1337,8 @@ def _pyexiv2_has_marker(p: Path) -> bool:
 
     values = []
     # Hand pyexiv2 the bytes, not the path: on Windows it can't open non-ASCII paths like 'ö'
-    data = _read_image_bytes(p)
+    if data is None:
+        data = _read_image_bytes(p)
     with metadata_lock, pyexiv2.ImageData(data) as img:
         # Read EXIF and XMP independently so one failing doesn't kill both
         for kind, read in (("EXIF", img.read_exif), ("XMP", img.read_xmp)):
@@ -1258,7 +1349,7 @@ def _pyexiv2_has_marker(p: Path) -> bool:
     return any(_contains_marker(v) for v in values)
 
 
-def _pillow_has_marker(p: Path) -> bool:
+def _pillow_has_marker(p: Path, data: bytes | None = None) -> bool:
     """
     Checks Pillow's text metadata (e.g. PNG text chunks) for the processed marker.
 
@@ -1266,11 +1357,11 @@ def _pillow_has_marker(p: Path) -> bool:
         Exception: If Pillow cannot open the file.
     """
 
-    with _open_pillow(p) as img:
+    with _open_pillow(p if data is None else data) as img:
         return any(isinstance(v, str) and PROCESSED_MARKER in v for v in img.info.values())
 
 
-def is_already_processed(img_path: Path, fmt: str | None = None) -> bool:
+def is_already_processed(img_path: Path, fmt: str | None = None, data: bytes | None = None) -> bool:
     """Checks if the image already contains the AI processed marker.
 
     Like tag_image(), it goes by the real format, not the extension: a PNG named
@@ -1279,6 +1370,7 @@ def is_already_processed(img_path: Path, fmt: str | None = None) -> bool:
     Args:
         img_path: The path to the image file to check.
         fmt: The format from get_image_format(); looked up if None.
+        data: An already read snapshot of the image; read from img_path if None.
 
     Returns:
         True if the marker is found in metadata or comments, False otherwise.
@@ -1288,9 +1380,10 @@ def is_already_processed(img_path: Path, fmt: str | None = None) -> bool:
     if p.suffix.lower() not in IMAGE_EXTENSIONS:
         return False
 
-    if _is_gif(p, fmt or get_image_format(p)):
+    source = p if data is None else data
+    if _is_gif(p, fmt or get_image_format(source)):
         try:
-            with _open_pillow(p) as img:
+            with _open_pillow(source) as img:
                 return _contains_marker(img.info.get("comment"))
         except Exception as e:  # noqa: BLE001
             _warn(f"Could not read the GIF comment of {p.name} ({e}); treating it as not yet tagged")
@@ -1298,14 +1391,14 @@ def is_already_processed(img_path: Path, fmt: str | None = None) -> bool:
 
     # 1. Primary metadata inspection using pyexiv2
     try:
-        if _pyexiv2_has_marker(p):
+        if _pyexiv2_has_marker(p, data):
             return True
     except Exception as e:  # noqa: BLE001 - unreadable metadata means "not processed"
         _warn(f"pyexiv2 could not read the metadata of {p.name} ({e}); checking it with Pillow instead")
 
     # 2. Fully isolated fallback check using Pillow
     try:
-        return _pillow_has_marker(p)
+        return _pillow_has_marker(p, data)
     except Exception as e:  # noqa: BLE001
         _warn(f"Could not read the metadata of {p.name} ({e}); treating it as not yet tagged")
     return False
@@ -1336,7 +1429,14 @@ def process_single_image(
     """
 
     logger.info(f"Processing {img_path.name}")
-    fmt = get_image_format(img_path)
+    # One guarded read serves the format and skip checks and the model; tag_image() then refuses
+    # a file that no longer matches it (replaced or modified while the model was working)
+    try:
+        data, snapshot = _read_image_snapshot(img_path)
+    except OSError as e:  # e.g. a folder writable by others, a symlinked folder or no read permission
+        logger.warning(f"Failed: could not read {img_path.name}: {e}")
+        return "FAILED", img_path.name, f"Could not read image: {e}", 0
+    fmt = get_image_format(data)
     if fmt is None:
         logger.warning(f"Failed: unreadable image {img_path.name}")
         return "FAILED", img_path.name, "Unreadable image (unsupported or corrupted file)", 0
@@ -1346,7 +1446,7 @@ def process_single_image(
         return "FAILED", img_path.name, f"Unsupported file format: {fmt}", 0
 
     # Skip check
-    if is_already_processed(img_path, fmt):
+    if is_already_processed(img_path, fmt, data):
         logger.info(f"Skipping already processed image: {img_path.name}")
         return "SKIPPED", img_path.name, "Skipped: Already Tagged", 0
 
@@ -1356,10 +1456,8 @@ def process_single_image(
 
     start = time.monotonic()  # Start timing the actual processing
     try:
-        if backend == "ollama":
-            raw_output = get_tags_ollama(client, model, img_path, prompt, max_megapixels)
-        else:
-            raw_output = get_tags_lm_studio(client, model, img_path, prompt, max_megapixels)
+        get_tags = get_tags_ollama if backend == "ollama" else get_tags_lm_studio
+        raw_output = get_tags(client, model, img_path, prompt, max_megapixels, data=data)
 
         # Parse model output robustly (handles JSON, bullets, intro text, or comma-separated)
         parsed_tags = parse_model_output(raw_output)
@@ -1375,7 +1473,7 @@ def process_single_image(
                 time.monotonic() - start,
             )
 
-        tag_image(str(img_path), parsed_tags, fmt=fmt)
+        tag_image(str(img_path), parsed_tags, fmt=fmt, expected=snapshot)
         logger.info(f"Tagged {img_path.name} in {time.monotonic() - start:.1f}s with {parsed_tags}")
         return (
             "SUCCESS",
@@ -1418,10 +1516,29 @@ class _RunStats:
             self.failed_log.append((name, message))
 
 
+def _without_leading_parent_refs(path: Path) -> Path:
+    """
+    Resolves leading '..' parts ('../memes') against the working directory, which os.getcwd()
+    returns without links on POSIX (and Windows resolves '..' by name anyway), so this names the
+    same folder the shell meant. A '..' after another part could follow a link back out of it, so
+    _image_parent() still refuses that.
+    """
+    parts = path.parts
+    count = 0
+    while count < len(parts) and parts[count] == "..":
+        count += 1
+    if not count:
+        return path
+    base = Path(os.getcwd())
+    for _ in range(count):
+        base = base.parent
+    return base.joinpath(*parts[count:])
+
+
 def _find_images(directory: str, recursive: bool) -> list[Path]:
     """Lists files in directory (optionally recursive) with a supported image extension."""
 
-    base_path = Path(directory)
+    base_path = _without_leading_parent_refs(Path(directory))
     with _image_parent(base_path / ".image-directory-check"):
         files = base_path.rglob("*") if recursive else base_path.iterdir()
         # Reads revalidate ancestors and the opened leaf; this filter only avoids existing links.
@@ -1515,6 +1632,7 @@ def _run_tasks(
                 logger.exception(f"Unexpected error for {img_path}")
                 tqdm.write(f"  [!] {img_path} -> Unexpected Error: {e}")
                 stats.failed += 1
+                stats.failed_log.append((img_path.name, f"Unexpected Error: {e}"))
 
     return stats
 
@@ -1723,9 +1841,10 @@ def _argument_error(args: argparse.Namespace) -> str | None:
     # Max 4 workers as it's the default limit for both ollama and LM Studio.
     if not 1 <= args.workers <= 4:
         return f"Workers must be between 1 and 4, got {args.workers}"
-    if math.isnan(args.timeout) or args.timeout <= 0:
+    # isfinite also rejects nan (nan <= 0 is false) and inf (the HTTP clients' sockets overflow on it)
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
         return f"Timeout must be a positive number of seconds, got {args.timeout:g}"
-    if math.isnan(args.max_pixels) or args.max_pixels < 0:
+    if not math.isfinite(args.max_pixels) or args.max_pixels < 0:
         return f"Max pixels must be zero or a positive number of megapixels, got {args.max_pixels:g}"
     return None
 
@@ -1738,7 +1857,7 @@ def main(argv: list[str] | None = None) -> int:
         argv: The arguments without the program name; defaults to sys.argv[1:].
 
     Returns:
-        The exit code: 0, or 1 for invalid arguments.
+        The exit code: 0, or 1 for invalid arguments, an unopenable log or an unsafe image folder.
     """
 
     args = _build_parser().parse_args(argv)
@@ -1752,27 +1871,33 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: {log_error}.")
         return 1
 
+    # Before the log is opened, so an invalid run creates no log file or folders
+    if error := _argument_error(args):
+        print(f"Error: {error}")
+        return 1
+
     try:
         setup_logging(args.log)
     except OSError as e:
         print(f"Error: Could not open the log file '{args.log}': {e}")
         return 1
 
-    if error := _argument_error(args):
-        print(f"Error: {error}")
+    try:
+        process_directory(
+            args.directory,
+            args.recursive,
+            args.backend,
+            args.host,
+            args.model,
+            args.workers,
+            clear=args.clear,
+            timeout=args.timeout,
+            max_megapixels=args.max_pixels,
+        )
+    except _UnsafeImagePath as e:  # the folder itself (per-image problems are reported per image)
+        logger.exception("Refused the image folder")
+        print(f"Error: {e}")
         return 1
-
-    process_directory(
-        args.directory,
-        args.recursive,
-        args.backend,
-        args.host,
-        args.model,
-        args.workers,
-        clear=args.clear,
-        timeout=args.timeout,
-        max_megapixels=args.max_pixels,
-    )
     return 0
 
 

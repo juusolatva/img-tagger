@@ -6,6 +6,8 @@ The opt-in integration tests (see test_integration.py) are the only ones that
 need a live Ollama / LM Studio backend and real images in test_images/.
 """
 
+import os
+from collections.abc import Iterator
 from pathlib import Path
 from typing import ClassVar
 
@@ -149,6 +151,20 @@ def gif_info(path: Path) -> dict:
 
 def leftover_temp_files(directory: Path) -> list[Path]:
     return list(directory.glob("*.tmp"))
+
+
+@pytest.fixture(autouse=True)
+def _umask_022() -> Iterator[None]:
+    """
+    Folders the tests create must pass _check_directory() under any umask: with 0002 (user-private
+    groups, e.g. Ubuntu) or 0000, mkdir() would make them group/other writable and every image refused.
+    pytest's own tmp_path is always 0o700. Subprocesses inherit the umask too.
+    """
+    previous = os.umask(0o022)
+    try:
+        yield
+    finally:
+        os.umask(previous)
 
 
 @pytest.fixture(params=["jpg", "png", "webp"])

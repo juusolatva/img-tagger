@@ -54,6 +54,11 @@ class TestGetImageFormat:
     def test_missing_file_returns_none(self, tmp_path):
         assert img_tagger.get_image_format(tmp_path / "missing.png") is None
 
+    def test_unreadable_reason_is_logged(self, tmp_path, caplog):
+        with caplog.at_level("DEBUG", logger="img_tagger"):
+            assert img_tagger.get_image_format(tmp_path / "missing.png") is None
+        assert "Could not identify missing.png as an image" in caplog.text
+
 
 # --- write_metadata (JPEG / PNG / WebP) -----------------------------------
 
@@ -427,6 +432,7 @@ class TestRobustReplace:
             raise PermissionError("file is locked")
 
         monkeypatch.setattr(Path, "replace", always_locked)
-        with pytest.raises(OSError, match="after retries"):
+        with pytest.raises(OSError, match="after retries: file is locked") as error:
             img_tagger.robust_replace(tmp_path / "a", tmp_path / "b")
         assert len(calls) == 10
+        assert isinstance(error.value.__cause__, PermissionError)

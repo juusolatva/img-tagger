@@ -2,6 +2,8 @@
 
 import base64
 import io
+import struct
+import zlib
 
 import pytest
 from conftest import FakeOllamaClient, FakeOpenAIClient, _Obj, make_animated, make_gif, make_image
@@ -192,3 +194,42 @@ class TestModelImageFallback:
         truncated = full[: len(full) // 2]
         assert img_tagger.get_image_format(truncated) == "JPEG"  # passes the pipeline's format check
         assert img_tagger._model_image(truncated) == (truncated, "image/jpeg")
+
+
+class TestMissingContent:
+    def test_ollama_none_content_becomes_empty(self, tmp_path):
+        client = FakeOllamaClient()
+        client.reply = None
+        assert img_tagger.get_tags_ollama(client, "m", make_image(tmp_path / "a.png"), "p") == ""
+
+    def test_lm_studio_none_content_becomes_empty(self, tmp_path):
+        client = FakeOpenAIClient()
+        client.reply = None
+        assert img_tagger.get_tags_lm_studio(client, "m", make_image(tmp_path / "a.png"), "p") == ""
+
+
+class TestModelImageAnyPillowError:
+    @pytest.mark.parametrize("error", [struct.error("bad EXIF"), zlib.error("bad"), TypeError("x")])
+    def test_errors_outside_oserror_fall_back_to_the_original(self, tmp_path, monkeypatch, error):
+        source = make_image(tmp_path / "a.png").read_bytes()
+
+        def broken(*args):
+            raise error
+
+        monkeypatch.setattr(img_tagger, "_scaled_image", broken)
+        assert img_tagger._model_image(source) == (source, "image/png")
+
+
+class TestSnapshotArgument:
+    @pytest.mark.parametrize("backend", ["ollama", "lm-studio"])
+    def test_given_snapshot_is_sent_without_reading_the_path(self, tmp_path, backend):
+        data = make_image(tmp_path / "a.png").read_bytes()
+        missing = tmp_path / "gone.png"
+        if backend == "ollama":
+            client = FakeOllamaClient()
+            img_tagger.get_tags_ollama(client, "m", missing, "p", 0, data=data)
+            assert sent_ollama_image(client) == data
+        else:
+            client = FakeOpenAIClient()
+            img_tagger.get_tags_lm_studio(client, "m", missing, "p", 0, data=data)
+            assert sent_lm_studio_image(client) == ("image/png", data)

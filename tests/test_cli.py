@@ -45,7 +45,7 @@ class TestMain:
         assert code == 1
         assert "Workers must be between 1 and 4" in out
 
-    @pytest.mark.parametrize("timeout", ["0", "-5", "nan"])
+    @pytest.mark.parametrize("timeout", ["0", "-5", "nan", "inf"])
     def test_rejects_non_positive_timeout(self, capsys, tmp_path, timeout):
         code, out = call_main(capsys, str(tmp_path), "--timeout", timeout)
         assert code == 1
@@ -205,6 +205,78 @@ class TestImgTaggerCli:
             assert not img_tagger.is_already_processed(p)
 
 
+class TestFolderPaths:
+    def test_leading_parent_reference_works(self, capsys, tmp_path, monkeypatch):
+        images = tmp_path / "images"
+        images.mkdir()
+        make_image(images / "a.png")
+        (tmp_path / "work").mkdir()
+        monkeypatch.chdir(tmp_path / "work")
+        code, out = call_main(capsys, "../images", "--clear")
+        assert code == 0
+        assert "Resetting tags for 1 images" in out
+
+    def test_inner_parent_reference_is_an_error_not_a_traceback(self, capsys, tmp_path):
+        (tmp_path / "a").mkdir()
+        (tmp_path / "images").mkdir()
+        code, out = call_main(capsys, str(tmp_path / "a" / ".." / "images"), "--clear")
+        assert code == 1
+        assert "Error: Image paths must not contain '..'" in out
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX folder permissions")
+    @pytest.mark.parametrize("clear", [False, True])
+    def test_group_writable_folder_is_an_error_not_a_traceback(self, capsys, tmp_path, clear):
+        folder = tmp_path / "shared"
+        folder.mkdir()
+        make_image(folder / "a.png")
+        folder.chmod(0o775)
+        code, out = call_main(capsys, str(folder), *(["--clear"] if clear else []))
+        assert code == 1
+        assert f"Error: Image folder must not be writable by its group or other users (chmod go-w): {folder}" in out
+
+
+@pytest.fixture
+def restore_logging():
+    """Undo setup_logging() for in-process tests: remove our handler and the levels it set."""
+    import logging
+
+    root = logging.getLogger()
+    level = root.level
+    yield
+    for handler in [h for h in root.handlers if isinstance(h, img_tagger._LogHandler)]:
+        root.removeHandler(handler)
+        handler.close()
+    root.setLevel(level)
+    img_tagger.logger.setLevel(logging.NOTSET)
+
+
+class TestSetupLogging:
+    def test_invalid_arguments_create_no_log(self, capsys, tmp_path):
+        log = tmp_path / "logs" / "run.log"
+        code, out = call_main(capsys, str(tmp_path), "--workers", "9", "--log", str(log))
+        assert code == 1
+        assert "Workers must be between 1 and 4" in out
+        assert not log.parent.exists()
+
+    def test_logs_beside_existing_root_handlers_and_replaces_an_earlier_log(self, tmp_path, restore_logging):
+        import logging
+
+        assert logging.getLogger().handlers  # pytest's capture handlers: basicConfig() would do nothing
+        first, second = tmp_path / "first.log", tmp_path / "second.log"
+        img_tagger.setup_logging(str(first))
+        handler = next(h for h in logging.getLogger().handlers if isinstance(h, img_tagger._LogHandler))
+        img_tagger.logger.info("one")
+        img_tagger.setup_logging(str(second))
+        img_tagger.logger.info("two")
+
+        assert handler.stream.closed  # the replaced log is closed, not leaked
+        handler.close()  # closing again (e.g. logging.shutdown()) is harmless
+        assert sum(isinstance(h, img_tagger._LogHandler) for h in logging.getLogger().handlers) == 1
+        assert "one" in first.read_text(encoding="utf-8")
+        assert "two" not in first.read_text(encoding="utf-8")
+        assert "two" in second.read_text(encoding="utf-8")
+
+
 class TestOpenLog:
     """setup_logging() opens the log once, so a swap after _log_path_error() can't redirect appends."""
 
@@ -248,7 +320,7 @@ class TestOpenLog:
 
 
 class TestMaxPixels:
-    @pytest.mark.parametrize("value", ["-1", "nan"])
+    @pytest.mark.parametrize("value", ["-1", "nan", "inf"])
     def test_rejects_negative_or_nan(self, capsys, tmp_path, value):
         code, out = call_main(capsys, str(tmp_path), "--max-pixels", value)
         assert code == 1
@@ -261,7 +333,7 @@ class TestMaxPixels:
         make_image(tmp_path / "a.png")
         budgets = []
 
-        def fake_get_tags(client, model, img_path, prompt, max_megapixels):
+        def fake_get_tags(client, model, img_path, prompt, max_megapixels, data=None):
             budgets.append(max_megapixels)
             return ", ".join(SAMPLE_TAGS)
 
@@ -287,3 +359,20 @@ def test_new_log_is_private(tmp_path):
     log = tmp_path / "run.log"
     img_tagger._open_log(log).close()
     assert log.stat().st_mode & 0o077 == 0
+
+
+def test_log_keeps_a_more_verbose_root_level_and_filters_other_debug(tmp_path, restore_logging):
+    import logging
+
+    logging.getLogger().setLevel(logging.DEBUG)  # an embedding application's own setting
+    log = tmp_path / "run.log"
+    img_tagger.setup_logging(str(log))
+    logging.getLogger("other.library").debug("noise")
+    logging.getLogger("other.library").info("request line")
+    img_tagger.logger.debug("our detail")
+
+    assert logging.getLogger().level == logging.DEBUG
+    text = log.read_text(encoding="utf-8")
+    assert "noise" not in text
+    assert "request line" in text
+    assert "our detail" in text
