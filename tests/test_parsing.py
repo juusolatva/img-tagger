@@ -236,3 +236,29 @@ class TestParseModelOutputRegressions:
             "wholesome",
             "pet",
         ]
+
+
+class TestParseModelOutputEdgeCases:
+    @pytest.mark.parametrize("raw", [None, ""])
+    def test_missing_content_returns_none(self, raw):
+        # e.g. a reasoning model that hit max_tokens before closing </think>
+        assert parse_model_output(raw) is None
+
+    def test_markdown_star_bullets(self):
+        raw = "* cat\n* dog\n* sky\n* red\n* blue\n* tree"
+        assert parse_model_output(raw) == ["cat", "dog", "sky", "red", "blue", "tree"]
+
+    def test_bold_heading_is_not_a_bullet(self):
+        raw = "**Tags:**\n* cat\n* dog\n* sky\n* red\n* blue\n* tree"
+        assert parse_model_output(raw) == ["cat", "dog", "sky", "red", "blue", "tree"]
+
+    @pytest.mark.parametrize("prefix", ["- ", "{n}. "])
+    @pytest.mark.parametrize("quote", ["'", '"'])
+    def test_quotes_are_stripped_from_list_items(self, prefix, quote):
+        tags = ["meme", "cat", "dog", "sky", "red", "blue"]
+        raw = "\n".join(f"{prefix.format(n=n)}{quote}{tag}{quote}" for n, tag in enumerate(tags, 1))
+        assert parse_model_output(raw) == tags
+
+    def test_json_booleans_are_not_tags(self):
+        raw = '[true, false, "a", "b", "c", "d", "e", "f"]'
+        assert parse_model_output(raw) == ["a", "b", "c", "d", "e", "f"]

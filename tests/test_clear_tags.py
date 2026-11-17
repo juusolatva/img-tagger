@@ -187,3 +187,21 @@ def test_unrelated_pyexiv2_error_leaves_file_untouched(tmp_path, monkeypatch, ca
     assert "Failed to clear a.png" in capsys.readouterr().out
     assert path.read_bytes() == original
     assert leftover_temp_files(tmp_path) == []
+
+
+def test_unsupported_format_is_refused_unchanged(tmp_path, capsys):
+    path = tmp_path / "really_a_bmp.jpg"
+    Image.new("RGB", (4, 4)).save(path, format="BMP")
+    original = path.read_bytes()
+    img_tagger.clear_tags(path)
+    assert "Unsupported file format: BMP" in capsys.readouterr().out
+    assert path.read_bytes() == original
+    assert leftover_temp_files(tmp_path) == []
+
+
+def test_unreadable_image_is_refused_unchanged(tmp_path, capsys):
+    path = tmp_path / "bogus.png"
+    path.write_bytes(b"not an image")
+    img_tagger.clear_tags(path)
+    assert "Failed to clear bogus.png: Unreadable image" in capsys.readouterr().out
+    assert path.read_bytes() == b"not an image"

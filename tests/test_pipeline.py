@@ -12,6 +12,7 @@ from conftest import (
     FakeOllamaClient,
     FakeOpenAIClient,
     gif_info,
+    leftover_temp_files,
     make_gif,
     make_image,
     read_metadata,
@@ -521,3 +522,57 @@ class TestClearDirectory:
     def test_clear_directory_nonexistent(self, tmp_path, capsys):
         img_tagger.clear_directory(str(tmp_path / "does_not_exist"))
         assert "not a valid directory" in capsys.readouterr().out
+
+
+class TestSnapshotPipeline:
+    def test_reads_the_image_once_before_the_edit(self, static_image, monkeypatch):
+        reads = []
+        real = img_tagger._source_bytes
+
+        def counting(*args, **kwargs):
+            reads.append(kwargs.get("permissions", False))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(img_tagger, "_source_bytes", counting)
+        status, *_ = run_single(static_image)
+        assert status == "SUCCESS"
+        assert reads == [False, True]  # the snapshot, then the edit
+
+    @pytest.mark.parametrize("how", ["replaced", "modified"])
+    def test_file_changed_during_the_model_call_is_not_tagged(self, tmp_path, how):
+        image = make_image(tmp_path / "a.png")
+
+        class ChangingClient(FakeOllamaClient):
+            def chat(self, model, messages):
+                other = make_image(tmp_path / "other.png", size=(20, 20))
+                if how == "replaced":
+                    os.replace(other, image)
+                else:
+                    image.write_bytes(other.read_bytes())  # same inode, new content
+                    other.unlink()
+                return super().chat(model, messages)
+
+        status, _, message, _ = run_single(image, client=ChangingClient())
+        assert status == "FAILED"
+        assert "changed during processing" in message
+        assert not img_tagger.is_already_processed(image)
+        assert leftover_temp_files(tmp_path) == []
+
+    def test_unreadable_image_reports_the_reason(self, tmp_path):
+        client = FakeOllamaClient()
+        status, _, message, _ = run_single(tmp_path / "missing.png", client=client)
+        assert status == "FAILED"
+        assert message.startswith("Could not read image:")
+        assert client.calls == []
+
+
+def test_unexpected_task_error_is_listed_in_the_report(tmp_path, monkeypatch, capsys):
+    image = make_image(tmp_path / "a.png")
+
+    def explode(*args):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(img_tagger, "process_single_image", explode)
+    stats = img_tagger._run_tasks([image], None, "ollama", "m", "p", 1, threading.Event())
+    assert stats.failed == 1
+    assert stats.failed_log == [("a.png", "Unexpected Error: boom")]
