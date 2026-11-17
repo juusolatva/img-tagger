@@ -555,14 +555,21 @@ class TestGroupWritableFolder:
         assert "must not be writable by its group" in capsys.readouterr().out
 
 
-def test_edit_by_another_program_during_the_write_is_not_overwritten(tmp_path):
+@pytest.mark.parametrize("change", ["mtime", "size"])
+def test_edit_by_another_program_during_the_write_is_not_overwritten(tmp_path, change):
+    """Each _same_version() check on its own: same size with a new mtime, or a new size with the old mtime."""
     image = make_image(tmp_path / "a.png")
-    newer = make_image(tmp_path / "newer.png", size=(30, 30)).read_bytes()
+    before = image.stat()
+    original = image.read_bytes()
+    newer = bytes(reversed(original)) if change == "mtime" else original + b"appended"
+    # set explicitly, so a coarse filesystem timestamp can't hide the change or leak one into the size case
+    mtime_ns = before.st_mtime_ns + 1_000_000_000 if change == "mtime" else before.st_mtime_ns
 
     def edit_while_another_program_writes():
         with img_tagger._image_edit(image) as (source, output):
             output.write(source)
-            image.write_bytes(newer)  # same file, new content, before the commit
+            image.write_bytes(newer)  # same file, before the commit
+            os.utime(image, ns=(before.st_atime_ns, mtime_ns))
 
     with pytest.raises(img_tagger._UnsafeImagePath, match="changed during processing"):
         edit_while_another_program_writes()
