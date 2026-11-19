@@ -352,7 +352,7 @@ Starting concurrent processing (max_workers=1).
 Press 'q' at any time to stop and see the current report.
 ```
 
-Before the first image, img tagger asks the server for its model list (waiting at most 10 seconds, or `--timeout` if that is shorter). If the server can't be reached, or it doesn't list the model you chose, nothing is processed: it prints `Error: ...` with the reason and the available models, and exits with code 1. See [Troubleshooting](#troubleshooting).
+Before the first image, img tagger asks the server for its model list (waiting at most 10 seconds, or `--timeout` if that is shorter). If the server can't be reached, or it doesn't list the model you chose, nothing is processed: it prints `Error: ...` with the reason and the available models, and exits with code 1. This happens even if every image is already tagged and none would need the model. See [Troubleshooting](#troubleshooting).
 
 The "Found" count includes images that are already tagged. A progress bar labelled `Processing images` follows, and a line is printed for each image as it finishes:
 
