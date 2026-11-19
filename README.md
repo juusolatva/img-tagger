@@ -156,7 +156,7 @@ LM Studio needs the full address with `http://` and the port, and **without** `/
 python img_tagger.py path/to/images --backend lm-studio --host http://192.168.1.50:1234 --model qwen/qwen3-vl-8b
 ```
 
-Without `http://`, every image fails with just `Connection error.`
+Without `http://`, the run stops before the first image with `Could not reach the LM Studio server at ...: Connection error.`
 
 
 ---
@@ -213,7 +213,7 @@ python img_tagger.py "C:\Users\you\Pictures\My memes"
 | Code | When |
 |---|---|
 | `0` | The run finished, even if some images failed. Also after pressing `Q` or when no images were found. |
-| `1` | The folder doesn't exist, `--workers` is outside 1 to 4, `--timeout` is zero, negative, `nan` or `inf`, `--max-pixels` is negative, `nan` or `inf`, `--log` fails validation or can't be opened, the folder itself is refused (see [Which files are processed](#which-files-are-processed)), or `prompt.txt` exists but can't be read. These print `Error: ...` without a traceback; invalid options are reported before any log file is created. Unhandled exceptions also exit with 1 and a traceback, e.g. a missing required package. |
+| `1` | The folder doesn't exist, `--workers` is outside 1 to 4, `--timeout` is zero, negative, `nan` or `inf`, `--max-pixels` is negative, `nan` or `inf`, `--log` fails validation or can't be opened, the folder itself is refused (see [Which files are processed](#which-files-are-processed)), the model server can't be reached or doesn't have the model (not checked with `--clear`), or `prompt.txt` exists but can't be read. These print `Error: ...` without a traceback; invalid options are reported before any log file is created. Unhandled exceptions also exit with 1 and a traceback, e.g. a missing required package. |
 | `2` | An invalid option, e.g. an unknown `--backend` or a non-number for `--workers`, `--timeout` or `--max-pixels`. |
 
 ### Examples
@@ -352,6 +352,8 @@ Starting concurrent processing (max_workers=1).
 Press 'q' at any time to stop and see the current report.
 ```
 
+Before the first image, img tagger asks the server for its model list (waiting at most 10 seconds, or `--timeout` if that is shorter). If the server can't be reached, or it doesn't list the model you chose, nothing is processed: it prints `Error: ...` with the reason and the available models, and exits with code 1. This happens even if every image is already tagged and none would need the model. See [Troubleshooting](#troubleshooting).
+
 The "Found" count includes images that are already tagged. A progress bar labelled `Processing images` follows, and a line is printed for each image as it finishes:
 
 ```
@@ -395,7 +397,7 @@ Some problems are always shown on screen as `  Warning: ...` lines, with or with
 
 - **Processed images** counts images successfully **tagged during this run**. Skipped images are counted separately, even though they carry the processing marker.
 - **Average processing time** is shown only when at least one image was tagged. It covers the successful images only, from sending the request to the model until the tags are written.
-- **Total time elapsed** starts once the prompt and the backend client are set up.
+- **Total time elapsed** starts once the prompt is loaded, the server is checked and the backend client is set up.
 - **Failed files details** lists each failed image with the reason.
 
 ### Log file
@@ -405,6 +407,7 @@ Some problems are always shown on screen as `  Warning: ...` lines, with or with
 - the Python version and operating system
 - the run settings: folder, recursion, backend, host, model, workers, timeout and image pixel budget
 - which prompt file was used, and the full prompt
+- the result of the server check (with a traceback if the server couldn't be reached)
 - for each image: when it started, the request to the model, **the model's raw reply**, and the tags and time taken, or the error with a full traceback
 - the HTTP requests made to the backend
 - a summary at the end: how many were tagged, skipped and failed, and the total time
@@ -493,17 +496,22 @@ A file whose metadata had to be repaired shows `Repaired and cleared (Pillow) fo
 **`ModuleNotFoundError: No module named 'pyexiv2'`** (or `'PIL'`, `'tqdm'`, `'ollama'` or `'openai'`)
 - The dependencies aren't installed in the Python you ran. Activate your virtual environment if you made one, and run `python -m pip install -r requirements.txt`.
 
-**`Failed to connect to Ollama. Please check that Ollama is downloaded, running and accessible.`** for every image
+**`Error: Could not reach the Ollama server at ...: Failed to connect to Ollama. ...`**
 - Start Ollama, or check the address you passed with `--host` (and remember that `http://<ip>` without a port means port 80). For a server on another machine, see [Using a server on another machine](#using-a-server-on-another-machine).
-- img tagger doesn't check the server before starting, so each image fails on its own. Press `Q` to stop.
 
-**`Connection error.`** for every image (LM Studio)
+**`Error: Could not reach the LM Studio server at ...: Connection error.`**
 - Make sure LM Studio's server is running and the port is right.
 - `--host` must start with `http://`, e.g. `http://localhost:1234`, and must not end in `/v1`.
 - Run with `--log` to see the real cause.
 
+**`Error: Could not reach the ... server at ...: timed out`** (or `Request timed out.`)
+- The server didn't answer within 10 seconds (or `--timeout`, if that is shorter). Usually the address points at a machine that is off or behind a firewall.
+
+**`Error: The ... server at ... has no model '<name>'. Available models: ...`**
+- Check `--model` against the listed models. With Ollama the model must be pulled (`ollama pull <name>`); a name without a tag means `:latest`. With LM Studio use LM Studio's model id (e.g. `qwen/qwen3-vl-8b`), not the Ollama name `qwen3-vl:8b` that is the default. If LM Studio lists no models, download one, or load it if just-in-time model loading is turned off.
+
 **Every image fails with an error about the model**
-- Check `--model`. With Ollama the model must be pulled (`ollama pull <name>`). With LM Studio use LM Studio's model id from <http://localhost:1234/v1/models>, not the Ollama name.
+- The server check only confirms that the model is listed. Run with `--log` to see the server's error; for a model without vision support see the next entry.
 
 **`... does not support image inputs`** (LM Studio)
 - The model's vision projector (`mmproj-*.gguf`) isn't downloaded. Download it in LM Studio, or use another vision model.
@@ -555,7 +563,6 @@ A file whose metadata had to be repaired shows `Repaired and cleared (Pillow) fo
 - **No forced re-tagging**: tagged images are always skipped. See [Already tagged images are skipped](#already-tagged-images-are-skipped).
 - **MPO JPEGs are not supported**: JPEGs that hold several embedded images (some cameras and phones save these) are reported by Pillow as `MPO` and fail with `Unsupported file format: MPO`, without contacting the model.
 - **Windows USB sticks and network folders are untested**: the Windows file handling (copying the image's permissions, replacing it through the open file handle) has only been tried on local NTFS drives. FAT32/exFAT drives and network shares handle permissions and renames differently; if they behave unexpectedly, every image there may fail with a permissions or replace error, so try a few copies first.
-- **No upfront server check**: if the server is down or the model is wrong, every image fails separately.
 - **Ctrl+C** doesn't stop a run cleanly. Use `Q`.
 
 

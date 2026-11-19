@@ -5,6 +5,7 @@ import io
 import struct
 import zlib
 
+import conftest
 import pytest
 from conftest import FakeOllamaClient, FakeOpenAIClient, _Obj, make_animated, make_gif, make_image
 from PIL import Image
@@ -233,3 +234,109 @@ class TestSnapshotArgument:
             client = FakeOpenAIClient()
             img_tagger.get_tags_lm_studio(client, "m", missing, "p", 0, data=data)
             assert sent_lm_studio_image(client) == ("image/png", data)
+
+
+class TestCheckServer:
+    """_check_server(): fail before any image if the server is down or lacks the model."""
+
+    @pytest.fixture
+    def models(self, monkeypatch, fake_ollama, fake_openai):
+        """Sets what the fake servers list."""
+
+        def set_models(*names):
+            monkeypatch.setattr(conftest, "FAKE_MODELS", list(names))
+
+        return set_models
+
+    @pytest.mark.parametrize(
+        ("backend", "listed", "model"),
+        [
+            ("ollama", "qwen3-vl:8b", "qwen3-vl:8b"),
+            ("ollama", "llava:latest", "llava"),  # Ollama's implicit default tag
+            ("ollama", "user/llava:latest", "user/llava"),
+            ("lm-studio", "qwen/qwen3-vl-8b", "qwen/qwen3-vl-8b"),
+            ("lm-studio", "qwen/qwen3-vl-8b@q4_k_m", "qwen/qwen3-vl-8b"),  # extra quantization
+        ],
+    )
+    def test_listed_model_passes(self, models, backend, listed, model):
+        models("other:1b", listed)
+        img_tagger._check_server(backend, "http://fake:1", model)
+
+    @pytest.mark.parametrize(
+        ("backend", "listed", "model"),
+        [
+            ("ollama", "qwen3-vl:4b", "qwen3-vl:8b"),  # another tag of the same model
+            ("ollama", "llava:13b", "llava"),  # only :latest is implied
+            ("lm-studio", "qwen3-vl:8b-other", "qwen3-vl:8b"),
+        ],
+    )
+    def test_similar_name_is_not_a_match(self, models, backend, listed, model):
+        models(listed)
+        with pytest.raises(img_tagger._ServerCheckError, match="has no model"):
+            img_tagger._check_server(backend, "http://fake:1", model)
+
+    def test_missing_ollama_model_suggests_pull(self, models):
+        models("b:1b", "a:1b")
+        with pytest.raises(img_tagger._ServerCheckError) as exc:
+            img_tagger._check_server("ollama", "http://fake:1", "qwen3-vl:8b")
+        message = str(exc.value)
+        assert "Ollama server at http://fake:1 has no model 'qwen3-vl:8b'" in message
+        assert "Available models: a:1b, b:1b." in message
+        assert "ollama pull qwen3-vl:8b" in message
+
+    def test_ollama_name_on_lm_studio_explains_id_format(self, models):
+        models("qwen/qwen3-vl-8b")
+        with pytest.raises(img_tagger._ServerCheckError) as exc:
+            img_tagger._check_server("lm-studio", "http://fake:1", img_tagger.DEFAULT_MODEL)
+        assert "LM Studio model ids differ from Ollama names" in str(exc.value)
+
+    @pytest.mark.parametrize("backend", ["ollama", "lm-studio"])
+    def test_available_models_skip_blank_names_and_repeats(self, models, backend):
+        models("b:1b", "", None, "a:1b", "b:1b")
+        with pytest.raises(img_tagger._ServerCheckError, match=r"Available models: a:1b, b:1b\."):
+            img_tagger._check_server(backend, "http://fake:1", "x")
+
+    def test_no_models_listed(self, models):
+        models()
+        with pytest.raises(img_tagger._ServerCheckError, match="Available models: none"):
+            img_tagger._check_server("lm-studio", "http://fake:1", "x")
+
+    @pytest.mark.parametrize("backend", ["ollama", "lm-studio"])
+    def test_unreachable_server(self, monkeypatch, backend):
+        def refuse():
+            raise ConnectionError("connection refused")
+
+        class DownClient:  # both SDK shapes: Ollama's client.list(), LM Studio's client.models.list()
+            list = staticmethod(refuse)
+            models = _Obj(list=refuse)
+
+        monkeypatch.setattr(img_tagger, "_create_client", lambda *args: DownClient())
+        with pytest.raises(img_tagger._ServerCheckError, match="Could not reach the .* server at http://fake:1") as exc:
+            img_tagger._check_server(backend, "http://fake:1", "x")
+        assert isinstance(exc.value.__cause__, ConnectionError)
+
+    @pytest.mark.parametrize(("timeout", "expected"), [(600, img_tagger.SERVER_CHECK_TIMEOUT), (3, 3)])
+    def test_check_uses_short_timeout(self, monkeypatch, timeout, expected):
+        timeouts = []
+
+        def fake_client(backend, host, client_timeout):
+            timeouts.append(client_timeout)
+            return FakeOllamaClient()
+
+        monkeypatch.setattr(img_tagger, "_create_client", fake_client)
+        img_tagger._check_server("ollama", "http://fake:1", "test-model", timeout)
+        assert timeouts == [expected]
+
+    def test_main_stops_before_any_image(self, models, tmp_path, capsys, no_quit_listener):
+        models("other:1b")
+        image = make_image(tmp_path / "a.png")
+        assert img_tagger.main([str(tmp_path), "--host", "http://fake:1"]) == 1
+        assert "Error: The Ollama server at http://fake:1 has no model" in capsys.readouterr().out
+        assert all(client.calls == [] for client in FakeOllamaClient.instances)
+        assert not img_tagger.is_already_processed(image)
+
+    def test_clear_needs_no_server(self, models, tmp_path):
+        models()
+        make_image(tmp_path / "a.png")
+        assert img_tagger.main([str(tmp_path), "--clear"]) == 0
+        assert FakeOllamaClient.instances == []
