@@ -1597,7 +1597,7 @@ def _available_models(client: Any, backend: str) -> list[str]:
 
     if backend == "ollama":
         return [m.model for m in client.list().models if m.model]
-    return [m.id for m in client.models.list()]
+    return [m.id for m in client.models.list() if m.id]
 
 
 def _model_matches(name: str, model: str, backend: str) -> bool:
@@ -1629,7 +1629,7 @@ def _check_server(backend: str, host: str, model: str, timeout: float = DEFAULT_
     if any(_model_matches(name, model, backend) for name in models):
         logger.info(f"Server check passed: {host} offers {model}")
         return
-    available = ", ".join(sorted(models)) or "none"
+    available = ", ".join(sorted(set(models))) or "none"
     if backend == "ollama":
         hint = f"Download it with: ollama pull {model}"
     else:

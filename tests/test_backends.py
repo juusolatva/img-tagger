@@ -290,6 +290,12 @@ class TestCheckServer:
             img_tagger._check_server("lm-studio", "http://fake:1", img_tagger.DEFAULT_MODEL)
         assert "LM Studio model ids differ from Ollama names" in str(exc.value)
 
+    @pytest.mark.parametrize("backend", ["ollama", "lm-studio"])
+    def test_available_models_skip_blank_names_and_repeats(self, models, backend):
+        models("b:1b", "", None, "a:1b", "b:1b")
+        with pytest.raises(img_tagger._ServerCheckError, match=r"Available models: a:1b, b:1b\."):
+            img_tagger._check_server(backend, "http://fake:1", "x")
+
     def test_no_models_listed(self, models):
         models()
         with pytest.raises(img_tagger._ServerCheckError, match="Available models: none"):
