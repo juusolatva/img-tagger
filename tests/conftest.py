@@ -17,6 +17,8 @@ from PIL import Image, ImageSequence
 
 MARKER = "[PROCESSED BY AI]"
 SAMPLE_TAGS = ["photo", "sunset", "beach", "ocean", "sky", "clouds"]
+# What the fake servers list for _check_server(): the tests' model and the CLI default
+FAKE_MODELS = ["test-model", "qwen3-vl:8b"]
 
 # extension -> Pillow format name
 STATIC_FORMATS = {"jpg": "JPEG", "jpeg": "JPEG", "png": "PNG", "webp": "WEBP"}
@@ -205,6 +207,9 @@ class FakeOllamaClient:
         self.calls.append({"model": model, "messages": messages})
         return _Obj(message=_Obj(content=self.reply))
 
+    def list(self):
+        return _Obj(models=[_Obj(model=name) for name in FAKE_MODELS])
+
 
 class FakeOpenAIClient:
     """Stand-in for openai.OpenAI exposing chat.completions.create()."""
@@ -225,6 +230,7 @@ class FakeOpenAIClient:
         self.max_retries = max_retries
         self.calls: list[dict] = []
         self.chat = _Obj(completions=_Obj(create=self._create))
+        self.models = _Obj(list=lambda: [_Obj(id=name) for name in FAKE_MODELS])
         FakeOpenAIClient.instances.append(self)
 
     def _create(self, model, messages):

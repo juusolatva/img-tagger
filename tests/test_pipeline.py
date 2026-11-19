@@ -176,7 +176,7 @@ class TestProcessDirectory:
         out = capsys.readouterr().out
         assert "Processed images: 0" in out
         assert "Skipped images: 4" in out
-        assert fake_ollama.instances[0].calls == []
+        assert fake_ollama.instances[-1].calls == []
 
     def test_failures_are_listed_in_report(self, tmp_path, fake_ollama, capsys):
         make_image(tmp_path / "good.jpg")
@@ -193,7 +193,7 @@ class TestProcessDirectory:
         make_image(tmp_path / "a.jpg")
         self._run(tmp_path)
 
-        client = fake_ollama.instances[0]
+        client = fake_ollama.instances[-1]
         assert client.host == "http://fake:1"
         assert client.timeout == img_tagger.DEFAULT_TIMEOUT
         assert client.calls[0]["model"] == "test-model"
@@ -202,7 +202,7 @@ class TestProcessDirectory:
         make_image(tmp_path / "a.jpg")
         self._run(tmp_path, backend="lm-studio")
 
-        client = fake_openai.instances[0]
+        client = fake_openai.instances[-1]
         assert client.base_url == "http://fake:1/v1"
         assert client.api_key == "lm-studio"
         assert client.timeout == img_tagger.DEFAULT_TIMEOUT
@@ -215,14 +215,14 @@ class TestProcessDirectory:
         self._run(tmp_path, backend=backend, timeout=42)
 
         fake = fake_ollama if backend == "ollama" else fake_openai
-        assert fake.instances[0].timeout == 42
+        assert fake.instances[-1].timeout == 42
 
     def test_uses_prompt_txt(self, tmp_path, fake_ollama, capsys):
         make_image(tmp_path / "a.jpg")
         self._run(tmp_path)
 
         expected = (img_tagger.Path(img_tagger.__file__).parent / "prompt.txt").read_text(encoding="utf-8").strip()
-        assert fake_ollama.instances[0].calls[0]["messages"][0]["content"] == expected
+        assert fake_ollama.instances[-1].calls[0]["messages"][0]["content"] == expected
 
     def test_falls_back_to_default_prompt(self, tmp_path, fake_ollama, monkeypatch, capsys):
         script_dir = tmp_path / "script"
@@ -235,7 +235,7 @@ class TestProcessDirectory:
         self._run(images)
 
         assert "Falling back to default" in capsys.readouterr().out
-        assert fake_ollama.instances[0].calls[0]["messages"][0]["content"] == img_tagger.DEFAULT_PROMPT
+        assert fake_ollama.instances[-1].calls[0]["messages"][0]["content"] == img_tagger.DEFAULT_PROMPT
 
     def test_custom_prompt_file_is_stripped(self, tmp_path, fake_ollama, monkeypatch, capsys):
         script_dir = tmp_path / "script"
@@ -248,7 +248,7 @@ class TestProcessDirectory:
 
         self._run(images)
 
-        assert fake_ollama.instances[0].calls[0]["messages"][0]["content"] == "my custom prompt"
+        assert fake_ollama.instances[-1].calls[0]["messages"][0]["content"] == "my custom prompt"
 
     def test_unreadable_prompt_file_exits(self, tmp_path, fake_ollama, monkeypatch, capsys):
         script_dir = tmp_path / "script"
@@ -283,7 +283,7 @@ class TestProcessDirectory:
         out = capsys.readouterr().out
         assert "Processed images: 0" in out
         assert "Failed images: 0" in out
-        assert fake_ollama.instances[0].calls == []
+        assert fake_ollama.instances[-1].calls == []
 
     def test_quit_listener_is_stopped_after_a_normal_run(self, tmp_path, fake_ollama, monkeypatch, capsys):
         # A listener still waiting for 'Q' must be told to stop rather than waited out

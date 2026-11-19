@@ -65,6 +65,8 @@ PYEXIV2_FORMATS = TAGGABLE_FORMATS - {"GIF"}
 MIME_TYPES = {"JPEG": DEFAULT_MIME_TYPE, "PNG": "image/png", "WEBP": "image/webp", "GIF": "image/gif"}
 # Seconds to wait for one model reply; covers model loading and slow (thinking/CPU) generation.
 DEFAULT_TIMEOUT = 600.0
+# Upper limit for the model list request made before any image is touched (lower if --timeout is lower)
+SERVER_CHECK_TIMEOUT = 10.0
 # Ollama naming; LM Studio ids differ (e.g. qwen/qwen3-vl-8b), so pass --model there
 DEFAULT_MODEL = "qwen3-vl:8b"
 DEFAULT_HOSTS = {"ollama": "http://localhost:11434", "lm-studio": "http://localhost:1234"}
@@ -1586,6 +1588,58 @@ def _create_client(backend: str, host: str, timeout: float = DEFAULT_TIMEOUT) ->
     return OpenAI(base_url=f"{host}/v1", api_key="lm-studio", timeout=timeout, max_retries=0)
 
 
+class _ServerCheckError(Exception):
+    """The model server can't be reached or doesn't offer the requested model."""
+
+
+def _available_models(client: Any, backend: str) -> list[str]:
+    """Returns the model names the server offers (Ollama /api/tags, LM Studio /v1/models)."""
+
+    if backend == "ollama":
+        return [m.model for m in client.list().models if m.model]
+    return [m.id for m in client.models.list()]
+
+
+def _model_matches(name: str, model: str, backend: str) -> bool:
+    """Tells whether the listed model name is the model the user asked for."""
+
+    if name == model:
+        return True
+    if backend == "ollama":  # Ollama adds the default tag: "llava" means "llava:latest"
+        return ":" not in model.rsplit("/", 1)[-1] and name == f"{model}:latest"
+    return name.startswith(f"{model}@")  # LM Studio lists extra quantizations as "<id>@<quant>"
+
+
+def _check_server(backend: str, host: str, model: str, timeout: float = DEFAULT_TIMEOUT) -> None:
+    """
+    Fails fast if the server is down or lacks the model, instead of failing every image separately.
+
+    Raises:
+        _ServerCheckError: The server could not be reached or does not list the model.
+    """
+
+    label = "Ollama" if backend == "ollama" else "LM Studio"
+    client = _create_client(backend, host, min(timeout, SERVER_CHECK_TIMEOUT))
+    try:
+        models = _available_models(client, backend)
+    except Exception as e:  # connection refused, timeout, HTTP error or an unexpected reply
+        logger.exception(f"Server check failed for {host}")
+        raise _ServerCheckError(f"Could not reach the {label} server at {host}: {e}") from e
+
+    if any(_model_matches(name, model, backend) for name in models):
+        logger.info(f"Server check passed: {host} offers {model}")
+        return
+    available = ", ".join(sorted(models)) or "none"
+    if backend == "ollama":
+        hint = f"Download it with: ollama pull {model}"
+    else:
+        hint = "LM Studio model ids differ from Ollama names (e.g. qwen/qwen3-vl-8b); pass one with --model"
+    logger.error(f"Model {model} not offered by {host}; available: {available}")
+    raise _ServerCheckError(
+        f"The {label} server at {host} has no model '{model}'. Available models: {available}. {hint}."
+    )
+
+
 def _run_tasks(
     image_files: list[Path],
     client: Any,
@@ -1729,6 +1783,9 @@ def process_directory(
         clear: If True, clears metadata and comments instead of tagging.
         timeout: Seconds to wait for each model reply before that image fails.
         max_megapixels: Pixel budget for the copy of each image sent to the model (0 sends the original).
+
+    Raises:
+        _ServerCheckError: When tagging, the server could not be reached or does not list the model.
     """
 
     if clear:
@@ -1750,6 +1807,7 @@ def process_directory(
 
     prompt = _load_prompt()
     logger.debug(f"Prompt: {prompt}")
+    _check_server(backend, host, model, timeout)
     client = _create_client(backend, host, timeout)
 
     start_time = time.monotonic()
@@ -1857,7 +1915,8 @@ def main(argv: list[str] | None = None) -> int:
         argv: The arguments without the program name; defaults to sys.argv[1:].
 
     Returns:
-        The exit code: 0, or 1 for invalid arguments, an unopenable log or an unsafe image folder.
+        The exit code: 0, or 1 for invalid arguments, an unopenable log, an unsafe image folder
+        or an unreachable server (or one without the model).
     """
 
     args = _build_parser().parse_args(argv)
@@ -1896,6 +1955,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     except _UnsafeImagePath as e:  # the folder itself (per-image problems are reported per image)
         logger.exception("Refused the image folder")
+        print(f"Error: {e}")
+        return 1
+    except _ServerCheckError as e:  # already logged by _check_server()
         print(f"Error: {e}")
         return 1
     return 0

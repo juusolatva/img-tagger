@@ -1,12 +1,15 @@
 """CLI tests: main() in-process for argument handling, subprocesses for end-to-end runs (no model server needed)."""
 
+import json
 import os
 import subprocess
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
-from conftest import SAMPLE_TAGS, FakeOpenAIClient, make_gif, make_image
+from conftest import SAMPLE_TAGS, FakeOllamaClient, FakeOpenAIClient, make_gif, make_image
 
 import img_tagger
 
@@ -23,6 +26,39 @@ def run(script: str, *args: str, env: dict[str, str] | None = None) -> subproces
         timeout=60,
         env={**os.environ, **env} if env else None,
     )
+
+
+class _FailingOllama(BaseHTTPRequestHandler):
+    """Lists the default model (so the server check passes) and fails every chat request."""
+
+    def _reply(self, status: int, body: dict) -> None:
+        data = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        self._reply(200, {"models": [{"name": img_tagger.DEFAULT_MODEL, "model": img_tagger.DEFAULT_MODEL}]})
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self._reply(500, {"error": "stub failure"})
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture
+def failing_ollama():
+    """URL of a local Ollama stand-in whose model replies all fail."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _FailingOllama)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+    server.server_close()
 
 
 def call_main(capsys, *args: str) -> tuple[int, str]:
@@ -99,7 +135,7 @@ class TestMain:
         monkeypatch.setattr(img_tagger, "_create_client", fake_client)
         assert img_tagger.main([str(tmp_path), "--backend", "lm-studio"]) == 0
         img_tagger.process_directory(str(tmp_path), backend="lm-studio")
-        assert hosts == [img_tagger.DEFAULT_HOSTS["lm-studio"]] * 2
+        assert hosts == [img_tagger.DEFAULT_HOSTS["lm-studio"]] * 4  # server check + tagging, two runs
 
 
 class TestImgTaggerCli:
@@ -132,22 +168,36 @@ class TestImgTaggerCli:
         assert result.returncode == 0
         assert log.read_text(encoding="utf-8").startswith("earlier run\n")
 
-    # Port 9 (discard) refuses connections, so tagging fails fast without a model server.
+    # Port 9 (discard) refuses connections, so the server check fails fast without a model server.
     DEAD_HOST = "http://127.0.0.1:9"
 
-    def test_failed_image_prints_no_traceback(self, tmp_path):
+    def test_unreachable_server_stops_before_any_image(self, tmp_path):
+        image = make_image(tmp_path / "a.png")
+        log = tmp_path / "run.log"
+        result = run("img_tagger.py", str(tmp_path), "--host", self.DEAD_HOST, "--log", str(log))
+        assert result.returncode == 1
+        assert f"Error: Could not reach the Ollama server at {self.DEAD_HOST}" in result.stdout
+        assert "Processing images" not in result.stdout + result.stderr
+        assert "Traceback" not in result.stdout + result.stderr
+        text = log.read_text(encoding="utf-8")
+        assert "Server check failed" in text
+        assert "Traceback" in text
+        assert not img_tagger.is_already_processed(image)
+
+    def test_failed_image_prints_no_traceback(self, tmp_path, failing_ollama):
         make_image(tmp_path / "a.png")
-        result = run("img_tagger.py", str(tmp_path), "--host", self.DEAD_HOST)
+        result = run("img_tagger.py", str(tmp_path), "--host", failing_ollama)
         assert result.returncode == 0
         assert "Failed images: 1" in result.stdout
+        assert "stub failure" in result.stdout
         assert "Traceback" not in result.stdout + result.stderr
 
-    def test_log_file_records_run(self, tmp_path):
+    def test_log_file_records_run(self, tmp_path, failing_ollama):
         images = tmp_path / "images"
         images.mkdir()
         make_image(images / "a.png")
         log = tmp_path / "run.log"
-        result = run("img_tagger.py", str(images), "--host", self.DEAD_HOST, "--timeout", "30", "--log", str(log))
+        result = run("img_tagger.py", str(images), "--host", failing_ollama, "--timeout", "30", "--log", str(log))
 
         assert result.returncode == 0
         assert "Traceback" not in result.stderr
@@ -156,6 +206,7 @@ class TestImgTaggerCli:
         assert "workers=1, timeout=30s" in text
         assert "[DEBUG]" in text
         assert "Prompt: " in text
+        assert "Server check passed" in text
         assert "[ERROR]" in text
         assert "Error processing a.png after" in text
         assert "Traceback" in text
@@ -337,7 +388,7 @@ class TestMaxPixels:
             budgets.append(max_megapixels)
             return ", ".join(SAMPLE_TAGS)
 
-        monkeypatch.setattr(img_tagger, "_create_client", lambda *args: FakeOpenAIClient())
+        monkeypatch.setattr(img_tagger, "_create_client", lambda *args: FakeOllamaClient())
         monkeypatch.setattr(img_tagger, "get_tags_ollama", fake_get_tags)
         args = [str(tmp_path)] + (["--max-pixels", value] if value else [])
         assert img_tagger.main(args) == 0
