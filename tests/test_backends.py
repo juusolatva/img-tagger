@@ -3,12 +3,16 @@
 import base64
 import io
 import struct
+import threading
 import zlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import conftest
+import ollama
+import openai
 import pytest
 from conftest import FakeOllamaClient, FakeOpenAIClient, _Obj, make_animated, make_gif, make_image
-from PIL import Image
+from PIL import Image, ImageCms
 
 import img_tagger
 
@@ -142,6 +146,27 @@ class TestModelImage:
         assert b"Exif" not in sent
         assert b"xmp" not in sent.lower()
 
+    @pytest.mark.parametrize("backend", ["ollama", "lm-studio"])
+    @pytest.mark.parametrize("size", [(64, 48), (2000, 1000)], ids=["small", "scaled"])
+    def test_strips_jpeg_comment_and_png_icc_profile(self, tmp_path, backend, size):
+        icc = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+        jpeg, png = tmp_path / "a.jpg", tmp_path / "a.png"
+        Image.new("RGB", size, "red").save(jpeg, format="JPEG", comment=b"private caption")
+        Image.new("RGB", size, "red").save(png, format="PNG", icc_profile=icc)
+        for path in (jpeg, png):
+            if backend == "ollama":
+                client = FakeOllamaClient()
+                img_tagger.get_tags_ollama(client, "m", path, "p")
+                sent = sent_ollama_image(client)
+            else:
+                client = FakeOpenAIClient()
+                img_tagger.get_tags_lm_studio(client, "m", path, "p")
+                sent = sent_lm_studio_image(client)[1]
+            assert b"private caption" not in sent
+            with Image.open(io.BytesIO(sent)) as image:
+                assert "comment" not in image.info
+                assert "icc_profile" not in image.info
+
     def test_transparency_is_kept_as_png(self, tmp_path):
         path = tmp_path / "alpha.webp"
         Image.new("RGBA", (2000, 1000), (255, 0, 0, 128)).save(path, format="WEBP")
@@ -195,6 +220,85 @@ class TestModelImageFallback:
         truncated = full[: len(full) // 2]
         assert img_tagger.get_image_format(truncated) == "JPEG"  # passes the pipeline's format check
         assert img_tagger._model_image(truncated) == (truncated, "image/jpeg")
+
+
+class _RedirectingServer(BaseHTTPRequestHandler):
+    """Answers every request with a redirect and records the request line and headers."""
+
+    requests: list[tuple[str, dict[str, str]]]
+
+    def _redirect(self):
+        self.requests.append((self.path, {k.lower(): v for k, v in self.headers.items()}))
+        length = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(length)
+        self.send_response(307)
+        self.send_header("Location", "/elsewhere")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    do_GET = do_POST = _redirect
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture
+def redirecting_server(monkeypatch):
+    """(URL, recorded requests) of a local server that redirects every request."""
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    requests = []
+    handler = type("Handler", (_RedirectingServer,), {"requests": requests})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}", requests
+    server.shutdown()
+    server.server_close()
+
+
+class TestClientHardening:
+    """The real SDK clients from _create_client(): no ambient credentials, no redirects (security audit 1 and 3)."""
+
+    def test_ollama_sends_no_api_key_and_follows_no_redirect(self, monkeypatch, redirecting_server):
+        url, requests = redirecting_server
+        monkeypatch.setenv("OLLAMA_API_KEY", "secret-key")
+        client = img_tagger._create_client("ollama", url, timeout=5)
+        with pytest.raises(ollama.ResponseError):
+            client.list()
+        with pytest.raises(ollama.ResponseError):
+            client.chat(model="m", messages=[{"role": "user", "content": "p", "images": [b"x"]}])
+        client.close()
+        assert [path for path, _ in requests] == ["/api/tags", "/api/chat"]
+        assert all("authorization" not in headers for _, headers in requests)
+
+    def test_lm_studio_sends_no_openai_ids_and_follows_no_redirect(self, monkeypatch, redirecting_server):
+        url, requests = redirecting_server
+        monkeypatch.setenv("OPENAI_ORG_ID", "org-secret")
+        monkeypatch.setenv("OPENAI_PROJECT_ID", "proj-secret")
+        client = img_tagger._create_client("lm-studio", url + "/", timeout=5)  # trailing slash: no "//v1"
+        with pytest.raises(openai.APIStatusError):
+            client.models.list()
+        with pytest.raises(openai.APIStatusError):
+            client.chat.completions.create(model="m", messages=[{"role": "user", "content": "p"}])
+        client.close()
+        assert [path for path, _ in requests] == ["/v1/models", "/v1/chat/completions"]
+        for _, headers in requests:
+            assert "openai-organization" not in headers
+            assert "openai-project" not in headers
+            assert headers["authorization"] == "Bearer lm-studio"  # the placeholder, not OPENAI_API_KEY
+
+    def test_server_check_closes_its_client(self, fake_ollama):
+        img_tagger._check_server("ollama", "http://fake:1", conftest.FAKE_MODELS[0])
+        assert [client.closed for client in fake_ollama.instances] == [True]
+
+
+class TestLmStudioReply:
+    def test_no_choices_counts_as_empty_reply(self, tmp_path):
+        client = FakeOpenAIClient()
+        client._create = lambda model, messages: _Obj(choices=[])
+        client.chat = _Obj(completions=_Obj(create=client._create))
+        assert img_tagger.get_tags_lm_studio(client, "m", make_image(tmp_path / "a.png"), "p") == ""
 
 
 class TestMissingContent:
@@ -309,6 +413,9 @@ class TestCheckServer:
         class DownClient:  # both SDK shapes: Ollama's client.list(), LM Studio's client.models.list()
             list = staticmethod(refuse)
             models = _Obj(list=refuse)
+
+            def close(self):
+                pass
 
         monkeypatch.setattr(img_tagger, "_create_client", lambda *args: DownClient())
         with pytest.raises(img_tagger._ServerCheckError, match="Could not reach the .* server at http://fake:1") as exc:
