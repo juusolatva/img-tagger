@@ -23,6 +23,7 @@ import re
 import secrets
 import select
 import stat
+import struct
 import sys
 import threading
 import time
@@ -647,14 +648,15 @@ def _restore_xattrs(fd: int, attributes: dict[str, bytes]) -> None:
             logger.debug(f"Kept the folder's default SELinux label instead of the source's: {error}")
 
 
-def _restore_group(fd: int, source: os.stat_result, name: str) -> int:
+def _restore_group(fd: int, source: os.stat_result, name: str, acl: bytes | None = None) -> int:
     """
     Give the POSIX temporary the source's owning group, so the kept mode doesn't grant its group
     bits to a different (e.g. setgid-directory or primary) group. If that group can't be set
     (this user isn't a member, or the filesystem/user namespace refuses it, e.g. EINVAL for an
     unmapped gid), group access is dropped instead, and the other bits are limited to what the
-    group had: members of the source group now count as others, so with 0604 they would gain the
-    read access that mode denied them. Returns the mode to apply.
+    owning group had (_owning_group_bits(), from the source ACL if any): members of the source
+    group now count as others, so with 0604 they would gain the read access that mode denied them.
+    Returns the mode to apply.
     """
     mode = stat.S_IMODE(source.st_mode)
     if os.fstat(fd).st_gid == source.st_gid:
@@ -664,7 +666,23 @@ def _restore_group(fd: int, source: os.stat_result, name: str) -> int:
         return mode
     except OSError as error:
         _warn(f"Could not keep group {source.st_gid} on {name} ({error}); removed its group permissions instead")
-        return (mode & ~0o077) | (mode & 0o007 & (mode >> 3))
+        return (mode & ~0o077) | (mode & 0o007 & _owning_group_bits(mode, acl))
+
+
+def _owning_group_bits(mode: int, acl: bytes | None) -> int:
+    """
+    The owning group's rwx bits. With a POSIX ACL the mode's group bits are the ACL mask, which may
+    allow more than the group entry (group::--- with mask::rw-), so read the ACL_GROUP_OBJ entry of
+    the system.posix_acl_access value (u32 version, then u16 tag, u16 perm, u32 id per entry).
+    An ACL without one counts as no access.
+    """
+    if not acl:
+        return (mode >> 3) & 0o7
+    for offset in range(4, len(acl) - 7, 8):
+        tag, perm, _ = struct.unpack_from("<HHI", acl, offset)
+        if tag == 0x04:  # ACL_GROUP_OBJ
+            return perm & 0o7
+    return 0
 
 
 def _apply_permissions(output: BinaryIO, source: os.stat_result, attributes: dict[str, bytes], image_name: str) -> None:
@@ -675,7 +693,7 @@ def _apply_permissions(output: BinaryIO, source: os.stat_result, attributes: dic
     fd = output.fileno()
     mode = stat.S_IMODE(source.st_mode)
     if os.name != "nt":
-        mode = _restore_group(fd, source, image_name)
+        mode = _restore_group(fd, source, image_name, attributes.get(ACL_XATTR))
         _restore_xattrs(fd, attributes)
     os.chmod(fd, mode)
 
@@ -1301,7 +1319,7 @@ def parse_model_output(raw_output: str | None) -> list[str] | None:
     elif "<think>" in raw_output:
         return None
     # Markdown code fences around the list ("```" or "```json" lines) are not tags
-    raw_output = re.sub(r"^[ \t]*```[\w-]*[ \t]*$", "", raw_output, flags=re.MULTILINE)
+    raw_output = re.sub(r"^[ \t]*```[\w-]*[ \t]*\r?$", "", raw_output, flags=re.MULTILINE)
 
     # Pattern 1: JSON array ["tag1", "tag2"] - most reliable. A list with strings is the model's answer, even
     # with too few tags: splitting its text on commas would turn '[true' or 'd]' into tags. A list without
@@ -1616,11 +1634,13 @@ def _find_images(directory: str, recursive: bool) -> list[Path]:
 
     base_path = _without_leading_parent_refs(Path(directory))
     with _image_parent(base_path / ".image-directory-check"):
+        # Opening it is enough to know it can be listed: rglob() silently finds nothing in a folder it can't list
         try:
-            entries = list(base_path.iterdir())
-        except OSError as error:  # rglob() would silently find nothing in a folder it can't list
+            with os.scandir(base_path):
+                pass
+        except OSError as error:
             raise OSError(error.errno, f"Could not list the image folder: {error.strerror}", directory) from error
-        files = base_path.rglob("*") if recursive else entries
+        files = base_path.rglob("*") if recursive else base_path.iterdir()
         # Reads revalidate ancestors and the opened leaf; this filter only avoids existing links.
         return [f for f in files if not f.is_symlink() and f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS]
 

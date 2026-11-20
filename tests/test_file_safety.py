@@ -609,6 +609,49 @@ def test_unkeepable_group_never_widens_access_for_former_group(monkeypatch, caps
     assert "removed its group permissions" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(
+    ("group_obj", "expected"),
+    # mode 0664 with an ACL: its group bits are the mask (rw-), the owning group itself has group_obj
+    [(0, 0o600), (4, 0o604), (6, 0o604), (None, 0o600)],
+    ids=["group-denied", "group-read", "group-rw", "no-group-entry"],
+)
+def test_unkeepable_group_limits_others_by_the_acl_group_entry(monkeypatch, capsys, group_obj, expected):
+    entries = [(1, 6, 0xFFFFFFFF), (16, 6, 0xFFFFFFFF), (32, 4, 0xFFFFFFFF)]  # user::rw- mask::rw- other::r--
+    if group_obj is not None:
+        entries.insert(1, (4, group_obj, 0xFFFFFFFF))
+    acl = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *entry) for entry in entries)
+    source = os.stat_result((0o100664, 0, 0, 1, 0, 1000, 0, 0, 0, 0))
+    monkeypatch.setattr(img_tagger.os, "fstat", lambda fd: os.stat_result((0o100600, 0, 0, 1, 0, 2000, 0, 0, 0, 0)))
+
+    def not_a_member(fd, uid, gid):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(img_tagger.os, "fchown", not_a_member)
+    assert img_tagger._restore_group(3, source, "a.png", acl) == expected
+    assert "removed its group permissions" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux POSIX ACL extended attributes")
+def test_unkeepable_group_with_group_denying_acl_keeps_former_group_out(tmp_path, monkeypatch, capsys):
+    image = make_image(tmp_path / "a.png")
+    os.chown(image, -1, other_group_or_skip(tmp_path))
+    entries = [(1, 6, 0xFFFFFFFF), (4, 0, 0xFFFFFFFF), (16, 6, 0xFFFFFFFF), (32, 4, 0xFFFFFFFF)]
+    acl = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *entry) for entry in entries)
+    try:
+        os.setxattr(image, img_tagger.ACL_XATTR, acl)  # group::--- mask::rw- other::r--, shown as 0664
+    except OSError as error:
+        pytest.skip(f"ACLs unavailable on test filesystem: {error}")
+    assert stat.S_IMODE(image.stat().st_mode) == 0o664
+
+    def not_a_member(fd, uid, gid):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(img_tagger.os, "fchown", not_a_member)
+    img_tagger.tag_image(str(image), SAMPLE_TAGS)
+    assert stat.S_IMODE(image.stat().st_mode) & 0o077 == 0  # no group or other access left
+    assert "removed its group permissions" in capsys.readouterr().out
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX owning group")
 def test_unkeepable_group_on_world_readable_but_group_denied_image(tmp_path, monkeypatch, capsys):
     image = make_image(tmp_path / "a.png")

@@ -247,6 +247,11 @@ class TestParseModelOutputRegressions:
         raw = f"{fence}\nphoto, sunset, beach, ocean, sky, clouds\n```"
         assert parse_model_output(raw) == SIX
 
+    def test_crlf_code_fences_are_not_tags(self):
+        # with fences counted, five real tags would pass the six-tag minimum
+        assert parse_model_output("```text\r\nphoto, sunset, beach, ocean, sky\r\n```\r\n") is None
+        assert parse_model_output("```text\r\nphoto, sunset, beach, ocean, sky, clouds\r\n```\r\n") == SIX
+
     def test_fenced_json_list(self):
         raw = '```json\n["photo", "sunset", "beach", "ocean", "sky", "clouds"]\n```'
         assert parse_model_output(raw) == SIX
