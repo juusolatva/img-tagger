@@ -69,9 +69,8 @@ def backend_settings(pytestconfig: pytest.Config) -> dict:
 def client(backend_settings: dict):
     # Same client as a real run: DEFAULT_TIMEOUT and, for LM Studio, no retries
     client = img_tagger._create_client(backend_settings["backend"], backend_settings["host"])
-    if client is None:
-        pytest.skip(f"client library for {backend_settings['backend']} not installed")
-    return client
+    yield client
+    client.close()
 
 
 @pytest.fixture(scope="session")

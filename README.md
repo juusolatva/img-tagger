@@ -150,13 +150,15 @@ img tagger itself doesn't read the `OLLAMA_HOST` variable on the computer it run
 | `192.168.1.50` | `http://192.168.1.50:11434` |
 | `http://192.168.1.50` | `http://192.168.1.50:80`: **add `:11434`** |
 
-LM Studio needs the full address with `http://` and the port, and **without** `/v1` (img tagger adds it) or a trailing slash:
+LM Studio needs the full address with `http://` and the port, and **without** `/v1` (img tagger adds it; a trailing slash is fine):
 
 ```bash
 python img_tagger.py path/to/images --backend lm-studio --host http://192.168.1.50:1234 --model qwen/qwen3-vl-8b
 ```
 
 Without `http://`, the run stops before the first image with `Could not reach the LM Studio server at ...: Connection error.`
+
+For both servers, img tagger talks only to the address you gave: a redirect to another address is not followed (the request fails instead). It also doesn't send credentials from your environment to the server: an `OLLAMA_API_KEY` (meant for ollama.com) or `OPENAI_ORG_ID`/`OPENAI_PROJECT_ID` set for other tools stays on your computer.
 
 
 ---
@@ -199,7 +201,7 @@ python img_tagger.py "C:\Users\you\Pictures\My memes"
 
 - Files ending in `.jpg`, `.jpeg`, `.png`, `.webp` or `.gif`, in any letter case (`photo.JPG` counts). Hidden files such as `.hidden.jpg` are included.
 - Everything else (`.jfif`, `.tif`, `.heic`, `.avif`, `.bmp`, ...) is silently ignored and not counted.
-- Image symlinks and symlinked parent directories are refused; choose the real image directory. Shared ancestors such as `/tmp` are allowed because directory handles stay pinned.
+- Image symlinks and symlinked parent directories are refused; choose the real image directory. Passing a symlinked folder stops with `Error: Image paths must not contain links: <folder> is a symlink or not a folder` and exit code 1, and a folder you aren't allowed to list stops with `Error: ... Could not list the image folder: Permission denied`. Shared ancestors such as `/tmp` are allowed because directory handles stay pinned.
 - On Linux and macOS, the folder holding an image must belong to you (or root) and must not be writable by its group or other users. Folders created with `umask 0002` (the default on Ubuntu and some other distributions) are mode `775` and therefore refused; `chmod go-w <folder>` fixes that. If the folder you pass is refused, img tagger prints `Error: Image folder must not be writable by its group or other users (chmod go-w): <folder>` and exits with code 1. With `-r`, images in a refused subfolder fail one by one with that reason, and the rest of the run continues.
 - A path starting with `..` (e.g. `../memes`) works. A `..` later in the path (e.g. `photos/../memes`) is refused with `Error: Image paths must not contain '..'`, because it could lead through a link to a different folder.
 - Each file is opened with Pillow first, and img tagger goes by the image's real format, not its extension (a PNG named `.gif` is tagged like a PNG).
@@ -213,7 +215,7 @@ python img_tagger.py "C:\Users\you\Pictures\My memes"
 | Code | When |
 |---|---|
 | `0` | The run finished, even if some images failed. Also after pressing `Q` or when no images were found. |
-| `1` | The folder doesn't exist, `--workers` is outside 1 to 4, `--timeout` is zero, negative, `nan` or `inf`, `--max-pixels` is negative, `nan` or `inf`, `--log` fails validation or can't be opened, the folder itself is refused (see [Which files are processed](#which-files-are-processed)), the model server can't be reached or doesn't have the model (not checked with `--clear`), or `prompt.txt` exists but can't be read. These print `Error: ...` without a traceback; invalid options are reported before any log file is created. Unhandled exceptions also exit with 1 and a traceback, e.g. a missing required package. |
+| `1` | The folder doesn't exist, `--workers` is outside 1 to 4, `--timeout` is zero, negative, `nan` or `inf`, `--max-pixels` is negative, `nan` or `inf`, `--log` fails validation or can't be opened, the folder itself is refused or can't be listed (see [Which files are processed](#which-files-are-processed)), the model server can't be reached or doesn't have the model (not checked with `--clear`), or `prompt.txt` exists but can't be read or is empty. These print `Error: ...` without a traceback; invalid options are reported before any log file is created. Unhandled exceptions also exit with 1 and a traceback, e.g. a missing required package. |
 | `2` | An invalid option, e.g. an unknown `--backend` or a non-number for `--workers`, `--timeout` or `--max-pixels`. |
 
 ### Examples
@@ -300,7 +302,7 @@ IPTC keywords are not updated, so apps that read IPTC keywords may still show th
 - **JPEG, WebP and PNG**: only the metadata is edited; the image data is not re-encoded. Animated WebPs keep their frames, frame durations and loop count.
 - **GIF**: the whole file is re-encoded through Pillow. Each frame keeps its duration (100 ms if it had none) and the loop setting is kept (a GIF that plays once still plays once). Consecutive identical frames are merged into one frame with their combined duration, so playback looks the same. Pillow keeps all of a GIF's frames in memory while writing it, so a very large animated GIF can need a lot of RAM. See [Known issues](#known-issues-and-limitations) for the side effects.
 - Each image is read through guarded file access. Output is written to an open temporary `tmpXXXX.tmp` file **in the same folder**, edited through that file handle and then moved over the original. If the original is locked (e.g. open in another program), the move is retried up to 10 times, half a second apart. The temporary file is removed afterwards.
-- File mode permissions and, on Linux and macOS, the file's group are kept. If the group can't be preserved (because of your permissions or a filesystem restriction), its group permissions are removed instead, with a warning. Linux extended attributes and POSIX ACLs are preserved through the opened file handles; inherited temporary-file ACL grants are removed. On Windows the image's NTFS permissions (its DACL, including whether it inherits from the folder) are given to the temporary file when it is created, before anything is written to it, and the read-only attribute is kept. Timestamps are not copied, and on Windows the file's owner becomes your account.
+- File mode permissions and, on Linux and macOS, the file's group are kept. If the group can't be preserved (because of your permissions or a filesystem restriction), its group permissions are removed instead, with a warning, and everyone else keeps at most what the group had (a `604` file becomes `600`, a `644` file `604`), so nobody gains access. On Linux the POSIX ACL and `user.*` extended attributes are preserved through the opened file handles, and inherited temporary-file ACL grants are removed. The SELinux label is kept when your account may set it; otherwise the image gets its folder's default label, as a newly saved file would. Other kernel-managed attributes (`security.capability`, `security.ima`, `trusted.*`) are not copied. On Windows the image's NTFS permissions (its DACL, including whether it inherits from the folder) are given to the temporary file when it is created, before anything is written to it, and the read-only attribute is kept. Timestamps are not copied, and on Windows the file's owner becomes your account.
 - On POSIX, parent directories are opened without following symlinks, and replacement uses pinned directory descriptors. This protects against other-user directory substitution subject to the directory ownership/write restrictions above; it does not isolate another process running as your own account or root.
 - On Windows, folders above an image are held open while the image is read or written, so they can't be renamed or swapped for junctions meanwhile (renaming those folders fails with "in use"). A folder that grants neither traverse nor list access is checked for reparse points but can't be pinned this way. Symlinks, junctions and other reparse points are refused. Nobody else can open the temporary file, and it replaces the original through its open handle. Tested on local NTFS drives only; see [Known issues](#known-issues-and-limitations) for USB sticks and network folders.
 
@@ -331,8 +333,8 @@ The instructions sent to the model are in [`prompt.txt`](prompt.txt). Edit it to
 
 - img tagger reads `prompt.txt` from the **same folder as `img_tagger.py`**, not from the folder you run it in. It's read as UTF-8.
 - If the file is missing, it prints `Warning: Could not read prompt.txt from <path>. Falling back to default.` and uses a built-in copy of the same prompt.
-- If the file exists but can't be read (no permission, invalid UTF-8), it prints an error and exits with code 1.
-- Whatever you change, the model still has to reply with **at least 6** tags, or the image fails; only the first 12 are kept. A comma-separated list is the simplest. The reply can also be a JSON list (`["a", "b", ...]`), a bullet or numbered list with at least 6 items, or a list after an intro like `Here are the tags:`. Anything a thinking model writes before its last `</think>` is ignored.
+- If the file exists but can't be read (no permission, invalid UTF-8) or is empty, it prints an error and exits with code 1.
+- Whatever you change, the model still has to reply with **at least 6** tags, or the image fails; only the first 12 are kept. A comma-separated list is the simplest. The reply can also be a JSON list (`["a", "b", ...]`), a bullet or numbered list with at least 6 items, or a list after an intro like `Here are the tags:`. Anything a thinking model writes before its last `</think>` is ignored; a reply whose `<think>` never closes (the model was cut off while reasoning) fails. Markdown code fence lines (```` ``` ````) around the list are ignored.
 
 The default prompt asks for 6 to 12 English tags with the image type first, and has extra instructions for memes (the template, subjects, mood and a few words from the text) and screenshots (the main topic or software shown).
 
@@ -432,7 +434,8 @@ Good to know:
 
 - Keys you type during a run are used by the quit listener: on Windows they're consumed, and on Linux and macOS they're not echoed until the run ends.
 - `Q` is not available with `--clear`.
-- On Linux and macOS, when input isn't a terminal (e.g. it's piped in), a `q` in the input stops the run. If the input is empty (`</dev/null`), `Q` isn't available.
+- On Linux and macOS, when input isn't a terminal (e.g. it's piped in), a `q` in the input stops the run. If the input is empty (`</dev/null`) or there is none at all, `Q` isn't available.
+- On Windows, arrow keys, Page Up/Down and function keys don't stop the run (Page Down arrives as the same byte as `Q`).
 - On Windows, `Q` is only tested against a simulated console. If it doesn't react, closing the terminal window stops the run; an image being written at that moment may leave a `tmpXXXX.tmp` file in its folder, which you can delete.
 - **Ctrl+C does not stop a run cleanly.** The images already queued keep being tagged, and you end up with a traceback and no report. Use `Q` instead.
 
@@ -485,7 +488,7 @@ A file whose metadata had to be repaired shows `Repaired and cleared (Pillow) fo
 - `--timeout` (600 seconds by default) is how long to wait for **one** image's complete answer, including loading the model. An image that runs out of time is marked failed and retried on the next run. With LM Studio, a request that timed out is not resent.
 - `--workers` sends up to 4 images at once, which matches the default number of parallel requests in both Ollama and LM Studio. If the server handles fewer requests at a time, the extra ones wait their turn on the server, and that wait may count towards `--timeout`.
 - **Images are scaled down before sending** to at most 1 megapixel by default (`--max-pixels`); smaller images are sent at their own size, never enlarged. Measured with Qwen3 VL 4B, a 12-megapixel photo took 29 s as is and 5 s at 1 megapixel with the same tags, and small text in diagrams was still read at 1 megapixel but not at 0.5. Ollama enlarges anything below about 1 megapixel anyway, so going lower saves nothing there; LM Studio keeps getting faster. Raise it (e.g. `--max-pixels 2`) for screenshots or scans with very small text.
-- **What is sent** is normally a new copy: the first frame, turned upright by its EXIF orientation, as PNG (for PNG and GIF files and anything with transparency) or JPEG (quality 90), with **no metadata**. With `--max-pixels 0`, or if the copy can't be prepared (e.g. a truncated image Pillow identifies but can't decode), the original file is sent whole instead, **including any metadata such as camera details and GPS location**. The fallback is recorded only in the log. Both backends base64-encode the outgoing bytes, making the request data about a third larger.
+- **What is sent** is normally a new copy: the first frame, turned upright by its EXIF orientation, as PNG (for PNG and GIF files and anything with transparency) or JPEG (quality 90), with **no metadata** (no EXIF, XMP, comments or colour profile). With `--max-pixels 0`, or if the copy can't be prepared (e.g. a truncated image Pillow identifies but can't decode), the original file is sent whole instead, **including any metadata such as camera details and GPS location**. The fallback is recorded only in the log. Both backends base64-encode the outgoing bytes, making the request data about a third larger.
 
 
 ---
@@ -502,6 +505,7 @@ A file whose metadata had to be repaired shows `Repaired and cleared (Pillow) fo
 **`Error: Could not reach the LM Studio server at ...: Connection error.`**
 - Make sure LM Studio's server is running and the port is right.
 - `--host` must start with `http://`, e.g. `http://localhost:1234`, and must not end in `/v1`.
+- `Error code: 307` (or another 3xx code) means the server redirected the request, which img tagger doesn't follow. Pass the address it redirects to.
 - Run with `--log` to see the real cause.
 
 **`Error: Could not reach the ... server at ...: timed out`** (or `Request timed out.`)

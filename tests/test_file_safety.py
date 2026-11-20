@@ -447,6 +447,85 @@ def test_windows_volume_without_acls_skips_dacl_handling(tmp_path, monkeypatch):
     assert img_tagger.is_already_processed(image)
 
 
+class FakeXattrs:
+    """
+    In-memory extended attributes keyed by inode, standing in for an SELinux system where this user
+    may not write security.* attributes: the source image's attributes, the temporary's defaults.
+    """
+
+    def __init__(self, monkeypatch, image: Path, source: dict[str, bytes], temporary: dict[str, bytes]):
+        self.source_inode = image.stat().st_ino
+        self.source, self.temporary = dict(source), dict(temporary)
+        self.unreadable: dict[str, int] = {}
+        self.written: list[str] = []
+        for name in ("listxattr", "getxattr", "setxattr", "removexattr"):
+            monkeypatch.setattr(img_tagger.os, name, getattr(self, name), raising=False)
+
+    def _of(self, fd) -> dict[str, bytes]:
+        return self.source if os.fstat(fd).st_ino == self.source_inode else self.temporary
+
+    def listxattr(self, fd):
+        return list(self._of(fd))
+
+    def getxattr(self, fd, name):
+        if name in self.unreadable:
+            raise OSError(self.unreadable[name], os.strerror(self.unreadable[name]))
+        return self._of(fd)[name]
+
+    def setxattr(self, fd, name, value):
+        if not name.startswith(("user.", "system.posix_acl")):
+            raise PermissionError(errno.EACCES, "Permission denied")
+        self.written.append(name)
+        self._of(fd)[name] = value
+
+    def removexattr(self, fd, name):
+        if not name.startswith(("user.", "system.posix_acl")):
+            raise PermissionError(errno.EACCES, "Permission denied")
+        self.written.append(f"-{name}")
+        del self._of(fd)[name]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX extended attributes")
+class TestExtendedAttributes:
+    """Only the access ACL, user.* and (best effort) the SELinux label are carried over (review finding 3)."""
+
+    @pytest.mark.parametrize("clear", [False, True])
+    def test_differing_selinux_label_does_not_fail_the_edit(self, tmp_path, monkeypatch, clear):
+        image = make_image(tmp_path / "a.png")
+        source = {"security.selinux": b"user_tmp_t\0", "user.origin": b"camera", "security.capability": b"cap"}
+        fake = FakeXattrs(monkeypatch, image, source, {"security.selinux": b"user_home_t\0"})
+        if clear:
+            img_tagger.clear_tags(image)
+        else:
+            img_tagger.tag_image(str(image), SAMPLE_TAGS)
+        assert img_tagger.is_already_processed(image) is not clear
+        assert fake.written == ["user.origin"]  # never security.capability, never removing the label
+        assert fake.temporary == {"security.selinux": b"user_home_t\0", "user.origin": b"camera"}
+
+    def test_inherited_default_acl_is_replaced_by_the_source_state(self, tmp_path, monkeypatch):
+        image = make_image(tmp_path / "a.png")
+        fake = FakeXattrs(monkeypatch, image, {}, {img_tagger.ACL_XATTR: b"inherited"})
+        img_tagger.tag_image(str(image), SAMPLE_TAGS)
+        assert fake.written == [f"-{img_tagger.ACL_XATTR}"]
+
+    def test_unreadable_acl_fails_closed(self, tmp_path, monkeypatch):
+        image = make_image(tmp_path / "a.png")
+        fake = FakeXattrs(monkeypatch, image, {img_tagger.ACL_XATTR: b"acl"}, {})
+        fake.unreadable[img_tagger.ACL_XATTR] = errno.EACCES
+        with pytest.raises(RuntimeError, match="Permission denied"):
+            img_tagger.tag_image(str(image), SAMPLE_TAGS)
+        assert not img_tagger.is_already_processed(image)
+        assert [p.name for p in tmp_path.iterdir()] == ["a.png"]
+
+    @pytest.mark.parametrize("error", [errno.ENODATA, errno.EACCES])
+    def test_vanished_or_unreadable_user_attribute_is_skipped(self, tmp_path, monkeypatch, error):
+        image = make_image(tmp_path / "a.png")
+        fake = FakeXattrs(monkeypatch, image, {"user.gone": b"x", "user.kept": b"y"}, {})
+        fake.unreadable["user.gone"] = error
+        img_tagger.tag_image(str(image), SAMPLE_TAGS)
+        assert fake.temporary == {"user.kept": b"y"}
+
+
 def test_reads_do_not_capture_permissions(tmp_path, monkeypatch):
     image = make_image(tmp_path / "a.png")
 
@@ -508,6 +587,39 @@ def test_unkeepable_group_drops_group_access(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr(img_tagger.os, "fchown", not_a_member)
     img_tagger.tag_image(str(image), SAMPLE_TAGS)
+    assert stat.S_IMODE(image.stat().st_mode) == 0o600
+    assert "removed its group permissions" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX owning group")
+@pytest.mark.parametrize(
+    ("source_mode", "expected"),
+    # Source-group members become "others" once the group is gone: they must not gain the other bits
+    [(0o604, 0o600), (0o644, 0o604), (0o664, 0o604), (0o2754, 0o2704), (0o640, 0o600)],
+)
+def test_unkeepable_group_never_widens_access_for_former_group(monkeypatch, capsys, source_mode, expected):
+    source = os.stat_result((source_mode | stat.S_IFREG, 0, 0, 1, 0, 1000, 0, 0, 0, 0))
+    monkeypatch.setattr(img_tagger.os, "fstat", lambda fd: os.stat_result((0o100600, 0, 0, 1, 0, 2000, 0, 0, 0, 0)))
+
+    def not_a_member(fd, uid, gid):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(img_tagger.os, "fchown", not_a_member)
+    assert img_tagger._restore_group(3, source, "a.png") == expected
+    assert "removed its group permissions" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX owning group")
+def test_unkeepable_group_on_world_readable_but_group_denied_image(tmp_path, monkeypatch, capsys):
+    image = make_image(tmp_path / "a.png")
+    os.chown(image, -1, other_group_or_skip(tmp_path))
+    image.chmod(0o604)  # the owning group may not read it, everybody else may
+
+    def not_a_member(fd, uid, gid):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(img_tagger.os, "fchown", not_a_member)
+    img_tagger.clear_tags(image)
     assert stat.S_IMODE(image.stat().st_mode) == 0o600
     assert "removed its group permissions" in capsys.readouterr().out
 

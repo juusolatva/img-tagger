@@ -87,6 +87,32 @@ class TestMain:
         assert code == 1
         assert "Timeout must be a positive number" in out
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks and folder modes")
+    @pytest.mark.parametrize("recursive", [False, True])
+    def test_symlinked_folder_is_a_clean_error(self, capsys, tmp_path, recursive):
+        real = tmp_path / "real"
+        real.mkdir()
+        make_image(real / "a.png")
+        (tmp_path / "link").symlink_to(real)
+        code, out = call_main(capsys, str(tmp_path / "link"), "--clear", *(["-r"] if recursive else []))
+        assert code == 1
+        assert f"Error: Image paths must not contain links: {tmp_path / 'link'} is a symlink" in out
+
+    @pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX folder modes (root reads anyway)")
+    @pytest.mark.parametrize("recursive", [False, True])
+    def test_unlistable_folder_is_a_clean_error(self, capsys, tmp_path, recursive):
+        folder = tmp_path / "locked"
+        folder.mkdir()
+        make_image(folder / "a.png")
+        folder.chmod(0o311)  # can enter, can't list
+        try:
+            code, out = call_main(capsys, str(folder), "--clear", *(["-r"] if recursive else []))
+        finally:
+            folder.chmod(0o755)
+        assert code == 1
+        assert "Error: [Errno 13] Could not list the image folder: Permission denied" in out
+        assert "No valid images found" not in out
+
     def test_rejects_unknown_backend(self, capsys, tmp_path):
         with pytest.raises(SystemExit) as exit_info:
             img_tagger.main([str(tmp_path), "--backend", "bogus"])

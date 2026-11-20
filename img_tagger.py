@@ -34,7 +34,7 @@ from typing import Any, BinaryIO, TextIO
 
 import pyexiv2
 from ollama import Client as OllamaClient
-from openai import OpenAI
+from openai import DefaultHttpxClient, Omit, OpenAI
 from PIL import Image, ImageOps, ImageSequence
 from tqdm import tqdm
 
@@ -57,6 +57,8 @@ metadata_lock = threading.Lock()
 
 PROCESSED_MARKER = "[PROCESSED BY AI]"
 DEFAULT_MIME_TYPE = "image/jpeg"
+ACL_XATTR = "system.posix_acl_access"
+SELINUX_XATTR = "security.selinux"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 # Pillow formats tag_image() can write (GIFs get a comment, the rest EXIF/XMP via pyexiv2)
 TAGGABLE_FORMATS = {"JPEG", "WEBP", "PNG", "GIF"}
@@ -78,7 +80,7 @@ MODEL_JPEG_QUALITY = 90
 
 DEFAULT_PROMPT = (
     "Analyze this image, which could be an internet meme, screenshot, artwork, or photograph. "
-    "Extract 6 to 12 highly relevant keywords and return ONLY a comma-separated list of tags."
+    "Extract 6 to 12 highly relevant keywords and return ONLY a comma-separated list of tags. "
     "1. Always include the image type as the first tag (e.g., 'Meme', 'Screenshot', 'Artwork', 'Photo'). "
     "2. If it is a meme, identify the meme template/format, the main subjects, the core vibe/emotion, and 1-3 key words from the text. "
     "3. If it is a screenshot, summarize the main topic or software shown. "
@@ -217,8 +219,11 @@ def listen_for_quit(stop_event: threading.Event) -> None:
             _wait_for_quit_posix(stop_event)
     except Exception as e:  # noqa: BLE001 - any terminal setup failure falls back to plain reads
         logger.debug(f"Terminal input unavailable ({e}); basic fallback active")
-        # The extra sleep prevents hot-spinning on endless non-tty input (e.g. `yes |`)
-        _wait_for_quit_posix(stop_event, idle_sleep=0.1)
+        try:
+            # The extra sleep prevents hot-spinning on endless non-tty input (e.g. `yes |`)
+            _wait_for_quit_posix(stop_event, idle_sleep=0.1)
+        except (OSError, ValueError, AttributeError) as error:  # no stdin (None, closed, or no file descriptor)
+            logger.debug(f"No usable stdin ({error!r}); 'q' to quit is unavailable")
 
 
 def _wait_for_quit_windows(stop_event: threading.Event) -> None:
@@ -227,9 +232,14 @@ def _wait_for_quit_windows(stop_event: threading.Event) -> None:
     if msvcrt is None:
         return
     while not stop_event.is_set():
-        if msvcrt.kbhit() and msvcrt.getch().decode("utf-8", errors="ignore").lower() == "q":
-            stop_event.set()
-            return
+        if msvcrt.kbhit():
+            key = msvcrt.getch()
+            if key in {b"\x00", b"\xe0"}:
+                # Extended keys arrive as a prefix plus a scan code: Page Down is b"\xe0" b"Q"
+                msvcrt.getch()
+            elif key.lower() == b"q":
+                stop_event.set()
+                return
         time.sleep(0.05)  # Prevents a 100% CPU hot-spin on Windows when idle
 
 
@@ -556,28 +566,85 @@ def _image_parent(path: Path) -> Generator[tuple[Path, int | None]]:
     with contextlib.ExitStack() as stack:
         fd = os.open(path.anchor, flags)
         stack.callback(os.close, fd)
+        folder = Path(path.anchor)
         for part in path.parent.parts[1:]:
-            fd = os.open(part, flags, dir_fd=fd)
+            folder /= part
+            fd = _open_folder(folder, flags, fd)
             stack.callback(os.close, fd)
         _check_directory(os.fstat(fd), path.parent)
         yield path, fd
 
 
+def _open_folder(folder: Path, flags: int, parent_fd: int) -> int:
+    """Open one path part relative to its pinned parent, naming it if it is a symlink or not a folder."""
+    try:
+        return os.open(folder.name, flags, dir_fd=parent_fd)
+    except OSError as error:
+        # O_NOFOLLOW: a symlink gives ELOOP, or ENOTDIR together with O_PATH (Linux)
+        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise _UnsafeImagePath(
+                f"Image paths must not contain links: {folder} is a symlink or not a folder"
+            ) from error
+        raise
+
+
 def _file_attributes(fd: int) -> dict[str, bytes]:
     """
-    Capture extended attributes, including POSIX ACLs, or the Windows DACL, without reopening a pathname.
-    Volumes that don't store ACLs (FAT32/exFAT) have no DACL to keep.
+    Capture the POSIX ACL and the user.* and SELinux extended attributes (see _kept_xattr()), or the
+    Windows DACL, without reopening a pathname. Volumes that don't store ACLs (FAT32/exFAT) have no DACL to keep.
     """
     if os.name == "nt":
         return {_Win.SECURITY_KEY: _windows_security(fd)} if _windows_persistent_acls(fd) else {}
     if not hasattr(os, "listxattr"):
         return {}
     try:
-        return {name: os.getxattr(fd, name) for name in os.listxattr(fd)}
+        names = os.listxattr(fd)
     except OSError as error:
         if error.errno not in {errno.ENOTSUP, errno.EOPNOTSUPP}:
             raise
         return {}
+    attributes = {}
+    for name in filter(_kept_xattr, names):
+        try:
+            attributes[name] = os.getxattr(fd, name)
+        except OSError as error:
+            # The ACL decides who may read the image: fail closed unless it has just been removed (ENODATA).
+            # Other attributes are best effort, e.g. one removed meanwhile or one this user may not read.
+            if name == ACL_XATTR and error.errno != errno.ENODATA:
+                raise
+            logger.debug(f"Could not read extended attribute {name}: {error}")
+    return attributes
+
+
+def _kept_xattr(name: str) -> bool:
+    """
+    The extended attributes an edit carries over: the access ACL (permissions), user.* (user data)
+    and the SELinux label (best effort). Other security.* and trusted.* attributes are kernel-
+    or root-managed (e.g. security.capability, security.ima); an unprivileged user can't write them.
+    """
+    return name in {ACL_XATTR, SELINUX_XATTR} or name.startswith("user.")
+
+
+def _restore_xattrs(fd: int, attributes: dict[str, bytes]) -> None:
+    """
+    Give the temporary exactly the source's kept attributes: inherited ACL entries (a default ACL on
+    the folder) are removed, the source ACL is set and any failure there propagates (fail closed).
+    The SELinux label is only attempted: a new file gets its folder's default label, and changing it
+    needs a policy permission the user may lack (e.g. for an image moved in from ~/Downloads or /tmp).
+    """
+    existing = _file_attributes(fd)
+    for name in existing.keys() - attributes.keys() - {SELINUX_XATTR}:
+        os.removexattr(fd, name)
+    for name, value in attributes.items():
+        if existing.get(name) == value:
+            continue
+        if name != SELINUX_XATTR:
+            os.setxattr(fd, name, value)
+            continue
+        try:
+            os.setxattr(fd, name, value)
+        except OSError as error:
+            logger.debug(f"Kept the folder's default SELinux label instead of the source's: {error}")
 
 
 def _restore_group(fd: int, source: os.stat_result, name: str) -> int:
@@ -585,7 +652,9 @@ def _restore_group(fd: int, source: os.stat_result, name: str) -> int:
     Give the POSIX temporary the source's owning group, so the kept mode doesn't grant its group
     bits to a different (e.g. setgid-directory or primary) group. If that group can't be set
     (this user isn't a member, or the filesystem/user namespace refuses it, e.g. EINVAL for an
-    unmapped gid), group access is dropped instead. Returns the mode to apply.
+    unmapped gid), group access is dropped instead, and the other bits are limited to what the
+    group had: members of the source group now count as others, so with 0604 they would gain the
+    read access that mode denied them. Returns the mode to apply.
     """
     mode = stat.S_IMODE(source.st_mode)
     if os.fstat(fd).st_gid == source.st_gid:
@@ -595,7 +664,7 @@ def _restore_group(fd: int, source: os.stat_result, name: str) -> int:
         return mode
     except OSError as error:
         _warn(f"Could not keep group {source.st_gid} on {name} ({error}); removed its group permissions instead")
-        return mode & ~0o070
+        return (mode & ~0o077) | (mode & 0o007 & (mode >> 3))
 
 
 def _apply_permissions(output: BinaryIO, source: os.stat_result, attributes: dict[str, bytes], image_name: str) -> None:
@@ -607,12 +676,7 @@ def _apply_permissions(output: BinaryIO, source: os.stat_result, attributes: dic
     mode = stat.S_IMODE(source.st_mode)
     if os.name != "nt":
         mode = _restore_group(fd, source, image_name)
-        existing = _file_attributes(fd)
-        for name in existing.keys() - attributes.keys():
-            os.removexattr(fd, name)
-        for name, value in attributes.items():
-            if existing.get(name) != value:
-                os.setxattr(fd, name, value)
+        _restore_xattrs(fd, attributes)
     os.chmod(fd, mode)
 
 
@@ -769,7 +833,9 @@ def robust_replace(src: Path, dst: Path, *, parent_fd: int | None = None, source
     renamed through that open descriptor.
     """
     last_error: OSError | None = None
-    for _ in range(10):
+    for attempt in range(10):
+        if attempt:
+            time.sleep(0.5)
         try:
             if source_fd is not None:
                 _rename_windows_handle(source_fd, dst)
@@ -780,8 +846,7 @@ def robust_replace(src: Path, dst: Path, *, parent_fd: int | None = None, source
             return
         except OSError as error:
             last_error = error
-            time.sleep(0.5)
-    raise OSError(f"Failed to replace {src} with {dst} after retries: {last_error}") from last_error
+    raise OSError(f"Failed to replace {dst} with {src} after retries: {last_error}") from last_error
 
 
 def _sanitize_with_pillow(src, dst, fmt=None) -> None:
@@ -1096,6 +1161,9 @@ def _scaled_image(source: bytes, max_megapixels: float) -> tuple[bytes, str]:
     # "transparency" covers palette images and RGB/grayscale PNGs with a transparent colour (tRNS)
     alpha = frame.mode in {"RGBA", "LA", "PA"} or "transparency" in frame.info
     frame = frame.convert("RGBA" if alpha else "RGB")
+    # Pillow carries info through convert()/resize() and its encoders write some of it back
+    # (a JPEG comment, a PNG ICC profile): send pixels only
+    frame.info = {}
     if frame.width * frame.height > budget:
         scale = math.sqrt(budget / (frame.width * frame.height))
         size = (max(1, int(frame.width * scale)), max(1, int(frame.height * scale)))
@@ -1187,7 +1255,8 @@ def get_tags_lm_studio(
             }
         ],
     )
-    content = response.choices[0].message.content
+    # An OpenAI-compatible server may answer with no choices at all
+    content = response.choices[0].message.content if response.choices else None
     logger.debug(f"Raw LM Studio response for {img_path}: {content}")
     return content or ""
 
@@ -1225,9 +1294,14 @@ def parse_model_output(raw_output: str | None) -> list[str] | None:
     if not raw_output:
         return None
 
-    # Thinking models (e.g. qwen3, deepseek-r1) may emit <think>...</think> reasoning before the answer
+    # Thinking models (e.g. qwen3, deepseek-r1) may emit <think>...</think> reasoning before the answer.
+    # Reasoning that never closed (cut off by max_tokens) has no answer; its prose must not become tags.
     if "</think>" in raw_output:
         raw_output = raw_output.rsplit("</think>", 1)[1]
+    elif "<think>" in raw_output:
+        return None
+    # Markdown code fences around the list ("```" or "```json" lines) are not tags
+    raw_output = re.sub(r"^[ \t]*```[\w-]*[ \t]*$", "", raw_output, flags=re.MULTILINE)
 
     # Pattern 1: JSON array ["tag1", "tag2"] - most reliable. A list with strings is the model's answer, even
     # with too few tags: splitting its text on commas would turn '[true' or 'd]' into tags. A list without
@@ -1542,7 +1616,11 @@ def _find_images(directory: str, recursive: bool) -> list[Path]:
 
     base_path = _without_leading_parent_refs(Path(directory))
     with _image_parent(base_path / ".image-directory-check"):
-        files = base_path.rglob("*") if recursive else base_path.iterdir()
+        try:
+            entries = list(base_path.iterdir())
+        except OSError as error:  # rglob() would silently find nothing in a folder it can't list
+            raise OSError(error.errno, f"Could not list the image folder: {error.strerror}", directory) from error
+        files = base_path.rglob("*") if recursive else entries
         # Reads revalidate ancestors and the opened leaf; this filter only avoids existing links.
         return [f for f in files if not f.is_symlink() and f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS]
 
@@ -1565,6 +1643,10 @@ def _load_prompt() -> str:
         logger.exception("Failed to read prompt.txt")
         print(f"Error: Could not read prompt.txt from {prompt_file}: {e}")
         sys.exit(1)
+    if not prompt:
+        logger.error(f"prompt.txt at {prompt_file} is empty")
+        print(f"Error: prompt.txt at {prompt_file} is empty. Write a prompt into it or delete it to use the default.")
+        sys.exit(1)
     logger.info(f"Using prompt from {prompt_file}")
     return prompt
 
@@ -1582,10 +1664,28 @@ def _create_client(backend: str, host: str, timeout: float = DEFAULT_TIMEOUT) ->
         The ollama Client or the LM Studio OpenAI client.
     """
 
+    # Both SDKs follow redirects by default, which would let the selected server send the request
+    # (image and prompt) on to any other host this machine can reach.
     if backend == "ollama":
-        return OllamaClient(host=host, timeout=timeout)
-    # No retries: a timed-out request would be resent to a server still busy with it.
-    return OpenAI(base_url=f"{host}/v1", api_key="lm-studio", timeout=timeout, max_retries=0)
+        # The ollama client adds OLLAMA_API_KEY (meant for ollama.com) to every host; strip it per request
+        return OllamaClient(host=host, timeout=timeout, follow_redirects=False, auth=_without_authorization)
+    # No retries: a timed-out request would be resent to a server still busy with it. Omit() drops the
+    # OpenAI-Organization/-Project headers the SDK would otherwise fill in from OPENAI_ORG_ID/OPENAI_PROJECT_ID.
+    return OpenAI(
+        base_url=f"{host.rstrip('/')}/v1",
+        api_key="lm-studio",
+        timeout=timeout,
+        max_retries=0,
+        default_headers={"OpenAI-Organization": Omit(), "OpenAI-Project": Omit()},
+        http_client=DefaultHttpxClient(follow_redirects=False),
+    )
+
+
+def _without_authorization(request: Any) -> Any:
+    """httpx auth hook for the ollama client: send no Authorization header to the model server."""
+
+    request.headers.pop("authorization", None)
+    return request
 
 
 class _ServerCheckError(Exception):
@@ -1619,9 +1719,9 @@ def _check_server(backend: str, host: str, model: str, timeout: float = DEFAULT_
     """
 
     label = "Ollama" if backend == "ollama" else "LM Studio"
-    client = _create_client(backend, host, min(timeout, SERVER_CHECK_TIMEOUT))
     try:
-        models = _available_models(client, backend)
+        with contextlib.closing(_create_client(backend, host, min(timeout, SERVER_CHECK_TIMEOUT))) as client:
+            models = _available_models(client, backend)
     except Exception as e:  # connection refused, timeout, HTTP error or an unexpected reply
         logger.exception(f"Server check failed for {host}")
         raise _ServerCheckError(f"Could not reach the {label} server at {host}: {e}") from e
@@ -1829,6 +1929,7 @@ def process_directory(
         # terminal (POSIX) and the report isn't held up waiting for it.
         stop_event.set()
         quit_thread.join(timeout=2)
+        client.close()
 
     total_seconds = time.monotonic() - start_time
     _print_report(stats, total_seconds)
@@ -1915,8 +2016,8 @@ def main(argv: list[str] | None = None) -> int:
         argv: The arguments without the program name; defaults to sys.argv[1:].
 
     Returns:
-        The exit code: 0, or 1 for invalid arguments, an unopenable log, an unsafe image folder
-        or an unreachable server (or one without the model).
+        The exit code: 0, or 1 for invalid arguments, an unopenable log, an unsafe or unreadable
+        image folder or an unreachable server (or one without the model).
     """
 
     args = _build_parser().parse_args(argv)
@@ -1953,7 +2054,8 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             max_megapixels=args.max_pixels,
         )
-    except _UnsafeImagePath as e:  # the folder itself (per-image problems are reported per image)
+    # The folder itself, e.g. _UnsafeImagePath or no permission to list it (per-image problems are reported per image)
+    except OSError as e:
         logger.exception("Refused the image folder")
         print(f"Error: {e}")
         return 1

@@ -197,11 +197,16 @@ class FakeOllamaClient:
     instances: ClassVar[list["FakeOllamaClient"]] = []
     reply: str = ", ".join(SAMPLE_TAGS)
 
-    def __init__(self, host: str | None = None, timeout: float | None = None):
+    def __init__(self, host: str | None = None, timeout: float | None = None, **kwargs):
         self.host = host
         self.timeout = timeout
+        self.kwargs = kwargs
         self.calls: list[dict] = []
+        self.closed = False
         FakeOllamaClient.instances.append(self)
+
+    def close(self):
+        self.closed = True
 
     def chat(self, model, messages):
         self.calls.append({"model": model, "messages": messages})
@@ -223,12 +228,15 @@ class FakeOpenAIClient:
         api_key: str | None = None,
         timeout: float | None = None,
         max_retries: int = 2,
+        **kwargs,
     ):
         self.base_url = base_url
         self.api_key = api_key
         self.timeout = timeout
         self.max_retries = max_retries
+        self.kwargs = kwargs
         self.calls: list[dict] = []
+        self.closed = False
         self.chat = _Obj(completions=_Obj(create=self._create))
         self.models = _Obj(list=lambda: [_Obj(id=name) for name in FAKE_MODELS])
         FakeOpenAIClient.instances.append(self)
@@ -236,6 +244,9 @@ class FakeOpenAIClient:
     def _create(self, model, messages):
         self.calls.append({"model": model, "messages": messages})
         return _Obj(choices=[_Obj(message=_Obj(content=self.reply))])
+
+    def close(self):
+        self.closed = True
 
 
 @pytest.fixture

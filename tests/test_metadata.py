@@ -4,6 +4,7 @@ import stat
 import sys
 from pathlib import Path
 
+import pyexiv2
 import pytest
 from conftest import (
     GIF_DURATIONS,
@@ -25,6 +26,13 @@ import img_tagger
 def pixels(path: Path) -> bytes:
     with Image.open(path) as img:
         return img.convert("RGB").tobytes()
+
+
+def modify_xmp(path: Path, values: dict) -> None:
+    """Edits XMP like the tagger does, through bytes: pyexiv2.Image(path) fails on non-ASCII Windows paths."""
+    with pyexiv2.ImageData(path.read_bytes()) as img:
+        img.modify_xmp(values)
+        path.write_bytes(img.get_bytes())
 
 
 # --- get_image_format -----------------------------------------------------
@@ -328,11 +336,8 @@ class TestIsAlreadyProcessed:
         assert img_tagger.is_already_processed(path)
 
     def test_marker_only_in_xmp_description(self, tmp_path):
-        import pyexiv2
-
         path = make_image(tmp_path / "x.jpg")
-        with pyexiv2.Image(str(path)) as img:
-            img.modify_xmp({"Xmp.dc.description": f"tagged elsewhere {MARKER}"})
+        modify_xmp(path, {"Xmp.dc.description": f"tagged elsewhere {MARKER}"})
         assert img_tagger.is_already_processed(path)
 
     def test_marker_only_in_png_text_chunk_uses_pillow_fallback(self, tmp_path):
@@ -363,11 +368,8 @@ class TestIsAlreadyProcessed:
         ) in capsys.readouterr().out
 
     def test_xmp_still_checked_when_exif_read_fails(self, tmp_path, monkeypatch, capsys):
-        import pyexiv2
-
         path = make_image(tmp_path / "x.jpg")
-        with pyexiv2.Image(str(path)) as img:
-            img.modify_xmp({"Xmp.dc.description": f"tagged elsewhere {MARKER}"})
+        modify_xmp(path, {"Xmp.dc.description": f"tagged elsewhere {MARKER}"})
 
         def broken_read_exif(self, *args, **kwargs):
             raise RuntimeError("corrupt EXIF")
@@ -432,7 +434,11 @@ class TestRobustReplace:
             raise PermissionError("file is locked")
 
         monkeypatch.setattr(Path, "replace", always_locked)
+        sleeps = []
+        monkeypatch.setattr(img_tagger.time, "sleep", sleeps.append)
         with pytest.raises(OSError, match="after retries: file is locked") as error:
             img_tagger.robust_replace(tmp_path / "a", tmp_path / "b")
         assert len(calls) == 10
+        assert len(sleeps) == 9  # no pointless wait after the last attempt
+        assert f"Failed to replace {tmp_path / 'b'} with {tmp_path / 'a'}" in str(error.value)
         assert isinstance(error.value.__cause__, PermissionError)

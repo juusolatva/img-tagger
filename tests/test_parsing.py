@@ -237,6 +237,20 @@ class TestParseModelOutputRegressions:
             "pet",
         ]
 
+    def test_unclosed_reasoning_is_not_parsed_as_tags(self):
+        # a thinking model cut off by max_tokens before </think>
+        raw = "<think>The image shows a cat, maybe a dog, grass, sun, sky, tree, fence"
+        assert parse_model_output(raw) is None
+
+    @pytest.mark.parametrize("fence", ["```", "```text", "  ```  "])
+    def test_code_fence_lines_are_not_tags(self, fence):
+        raw = f"{fence}\nphoto, sunset, beach, ocean, sky, clouds\n```"
+        assert parse_model_output(raw) == SIX
+
+    def test_fenced_json_list(self):
+        raw = '```json\n["photo", "sunset", "beach", "ocean", "sky", "clouds"]\n```'
+        assert parse_model_output(raw) == SIX
+
 
 class TestParseModelOutputEdgeCases:
     @pytest.mark.parametrize("raw", [None, ""])

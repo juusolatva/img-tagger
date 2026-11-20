@@ -1,5 +1,6 @@
 """Tests for process_single_image(), process_directory() and listen_for_quit() with fake backends."""
 
+import io
 import os
 import sys
 import threading
@@ -250,6 +251,26 @@ class TestProcessDirectory:
 
         assert fake_ollama.instances[-1].calls[0]["messages"][0]["content"] == "my custom prompt"
 
+    @pytest.mark.parametrize("content", ["", " \n\t\n"])
+    def test_empty_prompt_file_exits(self, tmp_path, fake_ollama, monkeypatch, capsys, content):
+        script_dir = tmp_path / "script"
+        script_dir.mkdir()
+        (script_dir / "prompt.txt").write_text(content, encoding="utf-8")
+        monkeypatch.setattr(img_tagger, "__file__", str(script_dir / "img_tagger.py"))
+        images = tmp_path / "images"
+        images.mkdir()
+        make_image(images / "a.jpg")
+
+        with pytest.raises(SystemExit) as exc:
+            self._run(images)
+
+        assert exc.value.code == 1
+        assert "prompt.txt at" in capsys.readouterr().out
+        assert fake_ollama.instances == []
+
+    def test_default_prompt_sentences_are_separated(self):
+        assert "tags. 1. Always" in img_tagger.DEFAULT_PROMPT
+
     def test_unreadable_prompt_file_exits(self, tmp_path, fake_ollama, monkeypatch, capsys):
         script_dir = tmp_path / "script"
         (script_dir / "prompt.txt").mkdir(parents=True)  # exists() but read_text() fails
@@ -368,6 +389,18 @@ class TestListenForQuit:
         writer.flush()
         assert event.wait(timeout=1)
 
+    @pytest.mark.parametrize("stdin", ["none", "string", "closed"])
+    def test_no_usable_stdin_returns_quietly(self, monkeypatch, stdin):
+        # e.g. pythonw, a daemon or an embedding app: no file descriptor to read 'q' from
+        closed = io.StringIO()
+        closed.close()
+        fake = {"none": None, "string": io.StringIO(""), "closed": closed}[stdin]
+        monkeypatch.setattr(img_tagger.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(sys, "stdin", fake)
+        event = threading.Event()
+        img_tagger.listen_for_quit(event)  # must return instead of raising in the listener thread
+        assert not event.is_set()
+
 
 @pytest.mark.skipif(sys.platform == "win32", reason="needs a POSIX pseudo-terminal")
 class TestListenForQuitCbreak:
@@ -469,7 +502,7 @@ class TestListenForQuitWindows:
 
     @pytest.mark.parametrize("key", [b"q", b"Q"])
     def test_q_sets_stop_event(self, monkeypatch, key):
-        event, thread, fake = self.run(monkeypatch, [b"x", b"\xe0", key])
+        event, thread, fake = self.run(monkeypatch, [b"x", b"\xe0", b"H", key])  # x, Up arrow, q
         assert event.wait(timeout=3)
         thread.join(timeout=3)
         assert not thread.is_alive()
@@ -479,6 +512,15 @@ class TestListenForQuitWindows:
         event, thread, fake = self.run(monkeypatch, [b"a", b"b"])
         assert not event.wait(timeout=0.3)
         assert thread.is_alive()
+        assert fake.keys == []
+        event.set()
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+
+    @pytest.mark.parametrize("keys", [[b"\xe0", b"Q"], [b"\x00", b"q"]], ids=["page-down", "f-key-prefix"])
+    def test_extended_key_scan_codes_are_not_q(self, monkeypatch, keys):
+        event, thread, fake = self.run(monkeypatch, keys)
+        assert not event.wait(timeout=0.3)
         assert fake.keys == []
         event.set()
         thread.join(timeout=3)
