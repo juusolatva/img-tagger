@@ -609,6 +609,7 @@ def test_unkeepable_group_never_widens_access_for_former_group(monkeypatch, caps
     assert "removed its group permissions" in capsys.readouterr().out
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX owning group")
 @pytest.mark.parametrize(
     ("group_obj", "expected"),
     # mode 0664 with an ACL: its group bits are the mask (rw-), the owning group itself has group_obj
