@@ -814,8 +814,10 @@ class TestSizeLimits:
     def test_huge_animation_is_not_decoded_for_repair(self, tmp_path, monkeypatch):
         path = make_animated(tmp_path / "anim.webp")
         monkeypatch.setattr(img_tagger, "MAX_ANIMATION_PIXELS", 10)
+        source, output = path.read_bytes(), io.BytesIO()
         with pytest.raises(ValueError, match="Animation too large to repair"):
-            img_tagger._sanitize_with_pillow(path.read_bytes(), io.BytesIO())
+            img_tagger._sanitize_with_pillow(source, output)
+        assert output.getvalue() == b""  # refused before anything was decoded or written
 
 
 class TestEfsEncryptedImages:
