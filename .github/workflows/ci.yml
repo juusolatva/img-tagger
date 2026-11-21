@@ -114,17 +114,20 @@ jobs:
         if: env.SONAR_TOKEN == ''
         run: echo "::warning::SONAR_TOKEN is not available to this run (fork PR or unset secret); skipping the SonarQube scan."
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - if: env.SONAR_TOKEN != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Download coverage report
+        if: env.SONAR_TOKEN != ''
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: coverage
 
       - name: Download Windows coverage report
+        if: env.SONAR_TOKEN != ''
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: coverage-windows

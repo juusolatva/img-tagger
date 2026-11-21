@@ -412,12 +412,8 @@ def test_windows_non_bmp_path_is_renamed_exactly(tmp_path):
     assert sorted(p.name for p in folder.iterdir()) == [image.name]
 
 
-@windows_only
-@pytest.mark.parametrize("denied", [{0x20}, {0x20, 0x01}])
-def test_windows_folder_without_traverse_right_still_works(tmp_path, monkeypatch, denied):
-    folder = tmp_path / "list-only"
-    folder.mkdir()
-    image = make_image(folder / "a.png")
+def deny_folder_rights(monkeypatch, folder: Path, denied: set[int]) -> list[int]:
+    """Make _win_open() refuse the given access rights on folder; returns the rights it granted there."""
     real_open = img_tagger._win_open
     granted = []
 
@@ -429,10 +425,41 @@ def test_windows_folder_without_traverse_right_still_works(tmp_path, monkeypatch
         return real_open(path, access, *args, **kwargs)
 
     monkeypatch.setattr(img_tagger, "_win_open", restricted)
+    return granted
+
+
+@windows_only
+def test_windows_folder_without_traverse_right_still_works(tmp_path, monkeypatch):
+    folder = tmp_path / "list-only"
+    folder.mkdir()
+    image = make_image(folder / "a.png")
+    granted = deny_folder_rights(monkeypatch, folder, {0x20})
     img_tagger.tag_image(str(image), SAMPLE_TAGS)
     assert img_tagger.is_already_processed(image)
-    expected = img_tagger._Win.FILE_READ_ATTRIBUTES | (0 if 0x01 in denied else img_tagger._Win.FILE_LIST_DIRECTORY)
-    assert set(granted) == {expected}
+    assert set(granted) == {img_tagger._Win.FILE_READ_ATTRIBUTES | img_tagger._Win.FILE_LIST_DIRECTORY}
+
+
+@windows_only
+@pytest.mark.parametrize("clear", [False, True])
+def test_windows_folder_that_cannot_be_pinned_is_refused(tmp_path, monkeypatch, capsys, clear):
+    # Neither traverse nor list: an attribute-only handle wouldn't stop a rename + junction swap
+    folder = tmp_path / "attributes-only"
+    folder.mkdir()
+    image = make_image(folder / "a.png")
+    before = image.read_bytes()
+    deny_folder_rights(monkeypatch, folder, {0x20, 0x01})
+    if clear:
+        img_tagger.clear_tags(image)
+        assert "grants neither traverse nor list access" in capsys.readouterr().out
+    else:
+        status, _, message, _ = img_tagger.process_single_image(
+            image, FakeOllamaClient(), "ollama", "m", "p", threading.Event()
+        )
+        assert status == "FAILED"
+        assert "grants neither traverse nor list access" in message
+    monkeypatch.undo()
+    assert image.read_bytes() == before
+    assert [p.name for p in folder.iterdir()] == ["a.png"]
 
 
 @windows_only
