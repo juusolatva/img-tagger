@@ -92,6 +92,14 @@ class TestProcessSingleImage:
         assert status == "CANCELLED"
         assert client.calls == []
 
+    def test_stop_event_cancels_before_the_file_is_read(self, static_image, monkeypatch):
+        def no_read(*args, **kwargs):
+            raise AssertionError("a cancelled image must not be read")
+
+        monkeypatch.setattr(img_tagger, "_read_image_snapshot", no_read)
+        status, *_ = run_single(static_image, stop=True)
+        assert status == "CANCELLED"
+
     def test_unparseable_model_output_fails_and_leaves_image_untagged(self, static_image):
         client = FakeOllamaClient()
         client.reply = "I cannot help with that."

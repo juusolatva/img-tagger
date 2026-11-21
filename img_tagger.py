@@ -466,10 +466,11 @@ def _pin_windows_directory(path: Path) -> int:
     """
     Hold a directory open without delete sharing, so nobody can rename it or swap in a junction
     while the handle is open. A data right (traverse, else list) matters: Windows ignores the
-    share mode of handles that only read attributes. A folder granting neither (reached through
-    the "bypass traverse checking" privilege) is only checked for reparse points, not pinned.
+    share mode of handles that only read attributes. A folder granting neither (reachable only
+    through the "bypass traverse checking" privilege) can't be pinned, so it is refused: it could
+    be renamed and replaced by a junction between later opens (audit finding 5).
     """
-    for access in (_Win.FILE_TRAVERSE, _Win.FILE_LIST_DIRECTORY, 0):
+    for access in (_Win.FILE_TRAVERSE, _Win.FILE_LIST_DIRECTORY):
         try:
             fd = _win_open(
                 path,
@@ -479,9 +480,11 @@ def _pin_windows_directory(path: Path) -> int:
                 _Win.FLAG_BACKUP_SEMANTICS,
             )
             break
-        except PermissionError:
-            if not access:
-                raise
+        except PermissionError as error:
+            if access == _Win.FILE_LIST_DIRECTORY:
+                raise _UnsafeImagePath(
+                    f"Image folder grants neither traverse nor list access, so it can't be held open: {path}"
+                ) from error
     try:
         info = os.fstat(fd)
         if info.st_file_attributes & _Win.ATTRIBUTE_REPARSE_POINT or not stat.S_ISDIR(info.st_mode):
@@ -1461,6 +1464,17 @@ def _log_excerpt(text: str | None, limit: int = MAX_LOGGED_REPLY_CHARS) -> str |
     return f"{text[:limit]}... [{len(text) - limit} more characters not logged]"
 
 
+# English refusal openings ("I'm sorry, I can't...", "As an AI..."). Anchored at the start of the reply, with
+# only whitespace or Markdown emphasis before it: a tag list that merely contains "sorry" or meme text like
+# "i can't even" is unaffected, and so is a JSON list whose first tag is that text (["i can't even", ...]).
+_REFUSAL = re.compile(
+    r"[\s*_]*(?:i(?:'|’)?m\s+(?:sorry|unable|not\s+able)|i\s+am\s+(?:sorry|unable|not\s+able)"
+    r"|i\s+(?:cannot|can(?:'|’)?t|can\s+not|won(?:'|’)?t)\b|sorry,\s+(?:but\s+)?i\b|unfortunately,\s+i\b"
+    r"|as\s+an\s+ai\b|i\s+apologi[sz]e\b|my\s+apologies\b)",
+    re.IGNORECASE,
+)
+
+
 def _json_list(raw_output: str) -> list | None:
     """The reply as a JSON list: the whole reply, else its first-to-last bracketed segment (None if neither)."""
     candidates = [raw_output]
@@ -1502,6 +1516,9 @@ def parse_model_output(raw_output: str | None) -> list[str] | None:
         return None
     # Markdown code fences around the list ("```" or "```json" lines) are not tags
     raw_output = re.sub(r"^[ \t]*```[\w-]*[ \t]*\r?$", "", raw_output, flags=re.MULTILINE)
+    # A reply that opens with a refusal is no tag list, even if its commas split it into six pieces
+    if _REFUSAL.match(raw_output):
+        return None
 
     # Pattern 1: JSON array ["tag1", "tag2"] - most reliable. A list with strings is the model's answer, even
     # with too few tags: splitting its text on commas would turn '[true' or 'd]' into tags. A list without
@@ -1707,6 +1724,11 @@ def process_single_image(
         A tuple containing (status, filename, message, duration).
     """
 
+    # After Q, queued images stop here, before anything is read: a big batch then stops promptly
+    if stop_event.is_set():
+        logger.info(f"Cancelled before start: {img_path.name}")
+        return "CANCELLED", img_path.name, "Cancelled by user", 0
+
     logger.info(f"Processing {img_path.name}")
     # One guarded read serves the format and skip checks and the model; tag_image() then refuses
     # a file that no longer matches it (replaced or modified while the model was working)
@@ -1728,10 +1750,6 @@ def process_single_image(
     if is_already_processed(img_path, fmt, data):
         logger.info(f"Skipping already processed image: {img_path.name}")
         return "SKIPPED", img_path.name, "Skipped: Already Tagged", 0
-
-    if stop_event.is_set():
-        logger.info(f"Cancelled before start: {img_path.name}")
-        return "CANCELLED", img_path.name, "Cancelled by user", 0
 
     start = time.monotonic()  # Start timing the actual processing
     try:

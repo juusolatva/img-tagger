@@ -185,9 +185,41 @@ class TestParseModelOutput:
         assert parse_model_output(raw) == SIX  # the digit run itself is too long to be a tag
 
     def test_sentence_length_entries_are_not_tags(self):
-        refusal = "I am unable to describe this image because it appears to be completely blank"
-        assert parse_model_output(f"{refusal}, photo, sunset, beach, ocean, sky") is None
-        assert parse_model_output(f"{refusal}, photo, sunset, beach, ocean, sky, clouds") == SIX
+        sentence = "The picture shows a sunny beach scene with people walking along the shore"
+        assert parse_model_output(f"{sentence}, photo, sunset, beach, ocean, sky") is None
+        assert parse_model_output(f"{sentence}, photo, sunset, beach, ocean, sky, clouds") == SIX
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "I'm sorry, I cannot analyze this image, as it appears blurry, dark, low resolution, and unclear.",
+            "I’m unable to help with that, photo, cat, dog, sky, tree, grass",
+            "I can't identify people in images, but: photo, crowd, street, city, night, lights",
+            "Sorry, but I won't describe this, meme, cat, funny, text, reaction, pet",
+            "  As an AI, I see: photo, sunset, beach, ocean, sky, clouds",
+            "<think>hmm</think>\nUnfortunately, I could not see it, photo, a, b, c, d, e",
+            "**I'm sorry**, but this image can't be described, photo, a, b, c, d, e",
+            "I apologize, but I can't help with that, photo, cat, dog, sky, tree, grass",
+            "My apologies, the image did not load, photo, cat, dog, sky, tree, grass",
+        ],
+    )
+    def test_refusals_are_not_tags(self, raw):
+        assert parse_model_output(raw) is None
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "meme, sorry, apology, text, cat, sad",
+            "meme, i can't even, reaction, funny, text, girl",
+            "Sorry, photo, sunset, beach, ocean, sky",  # a bare first tag, not "sorry, I ..."
+            "icon, ui, cannot, error, dialog, screenshot",
+            '["i can\'t even", "meme", "reaction", "funny", "text", "girl"]',
+            "- i can't even\n- meme\n- reaction\n- funny\n- text\n- girl",
+            "meme, apologies, sorry, text, cat, sad",
+        ],
+    )
+    def test_tag_lists_mentioning_refusal_words_still_parse(self, raw):
+        assert parse_model_output(raw) is not None
 
     def test_tag_of_maximum_length_is_kept(self):
         tag = "x" * img_tagger.MAX_TAG_LENGTH
