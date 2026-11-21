@@ -46,7 +46,7 @@ The tags are standard EXIF and XMP fields (a comment for GIFs), so they stay wit
 |---|---|
 | `ollama` | Talking to Ollama |
 | `openai` | Talking to LM Studio through its OpenAI-compatible API |
-| `pillow` | Checking image formats, reading and writing GIFs, repairing broken metadata |
+| `pillow` | Checking image formats, reading GIF comments, preparing the copy sent to the model, repairing broken metadata |
 | `pyexiv2` | Reading and writing EXIF and XMP metadata, and clearing EXIF, XMP and IPTC with `--clear` |
 | `tqdm` | The progress bar |
 
@@ -173,7 +173,7 @@ python img_tagger.py path/to/images
 ```
 
 > [!IMPORTANT]
-> img tagger changes your images in place. It overwrites any existing XMP keywords and description (caption) and the EXIF user comment, replaces the comment of every GIF and re-encodes it, and re-encodes images with corrupted metadata. See [What gets written to your images](#what-gets-written-to-your-images). Try it on a copy of a few images first, and back up anything you can't replace.
+> img tagger changes your images in place. It overwrites any existing XMP keywords and description (caption) and the EXIF user comment, replaces the comment of every GIF, and re-encodes images with corrupted metadata. See [What gets written to your images](#what-gets-written-to-your-images). Try it on a copy of a few images first, and back up anything you can't replace.
 
 On Windows, quote paths that contain spaces:
 
@@ -193,7 +193,7 @@ python img_tagger.py "C:\Users\you\Pictures\My memes"
 | `--workers` | `1` | How many images to process at the same time, from 1 to 4. |
 | `--timeout` | `600` | Seconds to wait for the model's answer to one image, including loading the model, before that image is marked failed. Must be a positive, finite number (`nan` and `inf` are rejected). Raise it for slow hardware. |
 | `--max-pixels` | `1` | Largest size, in megapixels, of the copy sent to the model; bigger images are scaled down (keeping their shape) before sending. Must be nonnegative and finite; `nan` and `inf` are rejected. `0` sends the original file, as does a failure to prepare the copy. Resizing affects only the outgoing copy; tagging still writes metadata to your files. See [Choosing a model and performance](#choosing-a-model-and-performance). |
-| `--log` | off | Append a detailed log to this file, e.g. `--log logs/run.log`. Missing folders are created; a relative path is relative to the current directory. The name must end in `.log` (any letter case), and an existing path must be a regular file, not a symlink or folder. On Linux and macOS it must also belong to you, and a new log is readable only by you. The file is opened once and kept open, so swapping its name for a link can't redirect the writes. |
+| `--log` | off | Append a detailed log to this file, e.g. `--log logs/run.log`. Missing folders are created; a relative path is relative to the current directory. The name must end in `.log` (any letter case), and an existing path must be a regular file, not a symlink or folder. It must also belong to you, and a new log is readable only by you (on Windows, a new log gets permissions for its owner only instead of the folder's). The file is opened once and kept open, so swapping its name for a link can't redirect the writes. |
 | `--clear` | off | Remove metadata from the images instead of tagging them. See [Clearing tags](#clearing-tags). |
 | `-h`, `--help` | | Show the options and exit. |
 
@@ -201,6 +201,9 @@ python img_tagger.py "C:\Users\you\Pictures\My memes"
 
 - Files ending in `.jpg`, `.jpeg`, `.png`, `.webp` or `.gif`, in any letter case (`photo.JPG` counts). Hidden files such as `.hidden.jpg` are included.
 - Everything else (`.jfif`, `.tif`, `.heic`, `.avif`, `.bmp`, ...) is silently ignored and not counted.
+- Files larger than 256 MiB fail with `Image is larger than 256 MiB` without being read into memory. Repairing broken metadata in a very large animated WebP or PNG (more than 250 million pixels across all frames) fails with `Animation too large to repair` instead of decoding it.
+- If a file found at the start is replaced by a different file before its turn comes (e.g. its folder was renamed and another put in its place), it fails with `File changed since it was found` and nothing is sent or written.
+- On Windows, an image encrypted with EFS (the Encrypt option in its properties) fails if the replacement file wouldn't be encrypted too, i.e. unless its folder is encrypted, so the image never ends up stored unencrypted.
 - Image symlinks and symlinked parent directories are refused; choose the real image directory. Passing a symlinked folder stops with `Error: Image paths must not contain links: <folder> is a symlink or not a folder` and exit code 1, and a folder you aren't allowed to list stops with `Error: ... Could not list the image folder: Permission denied`. Shared ancestors such as `/tmp` are allowed because directory handles stay pinned.
 - On Linux and macOS, the folder holding an image must belong to you (or root) and must not be writable by its group or other users. Folders created with `umask 0002` (the default on Ubuntu and some other distributions) are mode `775` and therefore refused; `chmod go-w <folder>` fixes that. If the folder you pass is refused, img tagger prints `Error: Image folder must not be writable by its group or other users (chmod go-w): <folder>` and exits with code 1. With `-r`, images in a refused subfolder fail one by one with that reason, and the rest of the run continues.
 - A path starting with `..` (e.g. `../memes`) works. A `..` later in the path (e.g. `photos/../memes`) is refused with `Error: Image paths must not contain '..'`, because it could lead through a link to a different folder.
@@ -300,7 +303,7 @@ IPTC keywords are not updated, so apps that read IPTC keywords may still show th
 ### How the files are changed
 
 - **JPEG, WebP and PNG**: only the metadata is edited; the image data is not re-encoded. Animated WebPs keep their frames, frame durations and loop count.
-- **GIF**: the whole file is re-encoded through Pillow. Each frame keeps its duration (100 ms if it had none) and the loop setting is kept (a GIF that plays once still plays once). Consecutive identical frames are merged into one frame with their combined duration, so playback looks the same. Pillow keeps all of a GIF's frames in memory while writing it, so a very large animated GIF can need a lot of RAM. See [Known issues](#known-issues-and-limitations) for the side effects.
+- **GIF**: only the comment is changed. img tagger edits the file's blocks directly without decoding the image, so frames, colours, transparency, frame timing, the loop setting and any other extensions stay byte for byte as they were. An old `GIF87a` file is marked `GIF89a` when it gets a comment, since comments need that version. A GIF cut off in the middle fails with `Truncated GIF file` and is left unchanged.
 - Each image is read through guarded file access. Output is written to an open temporary `tmpXXXX.tmp` file **in the same folder**, edited through that file handle and then moved over the original. If the original is locked (e.g. open in another program), the move is retried up to 10 times, half a second apart. The temporary file is removed afterwards.
 - File mode permissions and, on Linux and macOS, the file's group are kept. If the group can't be preserved (because of your permissions or a filesystem restriction), its group permissions are removed instead, with a warning, and everyone else keeps at most what the group had (a `604` file becomes `600`, a `644` file `604`), so nobody gains access. On Linux the POSIX ACL and `user.*` extended attributes are preserved through the opened file handles, and inherited temporary-file ACL grants are removed. The SELinux label is kept when your account may set it; otherwise the image gets its folder's default label, as a newly saved file would. Other kernel-managed attributes (`security.capability`, `security.ima`, `trusted.*`) are not copied. On Windows the image's NTFS permissions (its DACL, including whether it inherits from the folder) are given to the temporary file when it is created, before anything is written to it, and the read-only attribute is kept. Timestamps are not copied, and on Windows the file's owner becomes your account.
 - On POSIX, parent directories are opened without following symlinks, and replacement uses pinned directory descriptors. This protects against other-user directory substitution subject to the directory ownership/write restrictions above; it does not isolate another process running as your own account or root.
@@ -334,7 +337,7 @@ The instructions sent to the model are in [`prompt.txt`](prompt.txt). Edit it to
 - img tagger reads `prompt.txt` from the **same folder as `img_tagger.py`**, not from the folder you run it in. It's read as UTF-8.
 - If the file is missing, it prints `Warning: Could not read prompt.txt from <path>. Falling back to default.` and uses a built-in copy of the same prompt.
 - If the file exists but can't be read (no permission, invalid UTF-8) or is empty, it prints an error and exits with code 1.
-- Whatever you change, the model still has to reply with **at least 6** tags, or the image fails; only the first 12 are kept. A comma-separated list is the simplest. The reply can also be a JSON list (`["a", "b", ...]`), a bullet or numbered list with at least 6 items, or a list after an intro like `Here are the tags:`. Anything a thinking model writes before its last `</think>` is ignored; a reply whose `<think>` never closes (the model was cut off while reasoning) fails. Markdown code fence lines (```` ``` ````) around the list are ignored.
+- Whatever you change, the model still has to reply with **at least 6** tags, or the image fails; only the first 12 are kept. A comma-separated list is the simplest. The reply can also be a JSON list (`["a", "b", ...]`), a bullet or numbered list with at least 6 items, or a list after an intro like `Here are the tags:`. Entries longer than 64 characters are sentences, not tags, and are dropped. Anything a thinking model writes before its last `</think>` is ignored; a reply whose `<think>` never closes (the model was cut off while reasoning) fails. Markdown code fence lines (```` ``` ````) around the list are ignored.
 
 The default prompt asks for 6 to 12 English tags with the image type first, and has extra instructions for memes (the template, subjects, mood and a few words from the text) and screenshots (the main topic or software shown).
 
@@ -414,7 +417,7 @@ Some problems are always shown on screen as `  Warning: ...` lines, with or with
 - the HTTP requests made to the backend
 - a summary at the end: how many were tagged, skipped and failed, and the total time
 
-The log contains file paths (as you typed the folder, plus the full path of `prompt.txt`) and the model's replies, so check it before sharing it. When the screen shows only a short message such as `Connection error.`, the log usually has the real cause, e.g. `Request URL is missing an 'http://' or 'https://' protocol.`
+The log contains file paths (as you typed the folder, plus the full path of `prompt.txt`) and the model's replies, so check it before sharing it. Very long replies are cut to their first 4000 characters. Line breaks and other control characters in file names and replies are written as escapes such as `\n`, so each log entry stays on one line; the screen output does the same. When the screen shows only a short message such as `Connection error.`, the log usually has the real cause, e.g. `Request URL is missing an 'http://' or 'https://' protocol.`
 
 
 ---
@@ -455,7 +458,7 @@ python img_tagger.py path/to/images --clear
 - It was made for resetting images so they can be tagged again, e.g. when testing models or prompts.
 - **Kept**: the JPEG comment, and PNG text chunks and DPI.
 - A processing marker in a preserved PNG text chunk still causes the image to be skipped on the next tagging run; remove that marker with a metadata editor to tag the image again.
-- **GIFs**: the comment is emptied, and every GIF is re-encoded the same way as when tagging, tagged or not (see [How the files are changed](#how-the-files-are-changed)).
+- **GIFs**: every comment is removed; nothing else in the file changes (see [How the files are changed](#how-the-files-are-changed)).
 - Like tagging, it goes by the image's real format, so a mislabeled file is cleared the way it was tagged. Files that aren't valid images or are in a format img tagger can't tag (e.g. a BMP named `.jpg`) are left unchanged and reported as `Failed to clear <name>: Unreadable image` or `... Unsupported file format: <format>`.
 - Files with corrupted metadata are re-saved with Pillow instead, with the same side effects as [when tagging](#repairing-corrupted-metadata).
 - No model server is needed. `--backend`, `--host`, `--model` and `--timeout` are ignored (`--timeout` must still be valid), and `prompt.txt` isn't read.
@@ -561,7 +564,6 @@ A file whose metadata had to be repaired shows `Repaired and cleared (Pillow) fo
 
 - **Animated images**: only the first frame is sent to the model (with `--max-pixels 0` the whole file is sent, and the servers also only look at the first frame), so an animation whose first frame is blank gets tags like `blank, white`. The animation itself is kept in the file.
 - **Sending original images**: `--max-pixels 0` and a failure to prepare a scaled copy both send the original bytes, including metadata and without applying EXIF orientation. Depending on the server, rotated photos may look sideways to the model. The default scaled copy is turned upright first; see [Choosing a model and performance](#choosing-a-model-and-performance).
-- **GIF re-encoding**: tagging or clearing a GIF re-encodes the whole file with Pillow. Frames, frame durations and the loop setting are kept, but custom application extensions (other than looping) and GIF XMP data are dropped, and the pixels or file size may change slightly.
 - **Repaired images**: images with corrupted metadata are re-saved with Pillow, which can re-encode them and drop other metadata. See [Repairing corrupted metadata](#repairing-corrupted-metadata).
 - **IPTC keywords** are left as they are, and existing XMP keywords are replaced. See [What happens to existing metadata](#what-happens-to-existing-metadata).
 - **No forced re-tagging**: tagged images are always skipped. See [Already tagged images are skipped](#already-tagged-images-are-skipped).

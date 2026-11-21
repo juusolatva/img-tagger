@@ -293,6 +293,21 @@ class TestClientHardening:
         assert [client.closed for client in fake_ollama.instances] == [True]
 
 
+class TestLoggedReply:
+    def test_long_reply_is_cut_in_the_log(self, tmp_path, caplog):
+        client = FakeOllamaClient()
+        client.reply = "x" * (img_tagger.MAX_LOGGED_REPLY_CHARS + 500)
+        with caplog.at_level("DEBUG", logger="img_tagger"):
+            img_tagger.get_tags_ollama(client, "m", make_image(tmp_path / "a.png"), "p")
+        logged = [r.getMessage() for r in caplog.records if "Raw Ollama response" in r.getMessage()]
+        assert logged[0].endswith("x... [500 more characters not logged]")
+        assert len(logged[0]) < img_tagger.MAX_LOGGED_REPLY_CHARS + 200
+
+    def test_short_reply_is_logged_whole(self):
+        assert img_tagger._log_excerpt("a, b") == "a, b"
+        assert img_tagger._log_excerpt(None) is None
+
+
 class TestLmStudioReply:
     def test_no_choices_counts_as_empty_reply(self, tmp_path):
         client = FakeOpenAIClient()
@@ -399,6 +414,14 @@ class TestCheckServer:
         models("b:1b", "", None, "a:1b", "b:1b")
         with pytest.raises(img_tagger._ServerCheckError, match=r"Available models: a:1b, b:1b\."):
             img_tagger._check_server(backend, "http://fake:1", "x")
+
+    def test_server_model_names_cannot_fake_console_lines(self, models, tmp_path, capsys, no_quit_listener):
+        models("evil\nError: fake\x1b[2J")
+        make_image(tmp_path / "a.png")
+        assert img_tagger.main([str(tmp_path), "--host", "http://fake:1"]) == 1
+        out = capsys.readouterr().out
+        assert "evil\\nError: fake\\x1b[2J" in out
+        assert "\x1b" not in out
 
     def test_no_models_listed(self, models):
         models()

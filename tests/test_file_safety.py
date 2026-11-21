@@ -1,6 +1,7 @@
 """Regression tests for image disclosure and redirected temporary-file writes."""
 
 import errno
+import io
 import os
 import stat
 import struct
@@ -11,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from conftest import SAMPLE_TAGS, FakeOllamaClient, FakeOpenAIClient, make_gif, make_image
+from conftest import SAMPLE_TAGS, FakeOllamaClient, FakeOpenAIClient, make_animated, make_gif, make_image
 
 import img_tagger
 
@@ -69,7 +70,7 @@ def test_discovery_ignores_leaf_links_and_rejects_linked_root(tmp_path):
     real.mkdir()
     image = make_image(real / "a.png")
     link_or_skip(real / "linked.png", image)
-    assert img_tagger._find_images(str(real), False) == [image]
+    assert list(img_tagger._find_images(str(real), False)) == [image]
     link_or_skip(tmp_path / "linked-root", real)
     with pytest.raises(OSError):
         img_tagger._find_images(str(tmp_path / "linked-root"), True)
@@ -731,3 +732,128 @@ def test_edit_by_another_program_during_the_write_is_not_overwritten(tmp_path, c
         edit_while_another_program_writes()
     assert image.read_bytes() == newer
     assert [p.name for p in tmp_path.iterdir() if p.suffix == ".tmp"] == []
+
+
+class TestDiscoveredIdentity:
+    """A file swapped in at a discovered path (e.g. by renaming folders above it) is refused (audit finding 4)."""
+
+    @staticmethod
+    def swap_in_other_collection(tmp_path: Path) -> tuple[dict, Path]:
+        collection = tmp_path / "mine"
+        collection.mkdir()
+        image = make_image(collection / "a.png")
+        found = img_tagger._find_images(str(collection), False)
+        other = tmp_path / "other"
+        other.mkdir()
+        make_image(other / "a.png", color=(0, 0, 255))
+        collection.rename(tmp_path / "moved")
+        other.rename(collection)
+        return found, image
+
+    def test_tagging_never_sends_or_edits_the_substitute(self, tmp_path):
+        found, image = self.swap_in_other_collection(tmp_path)
+        client = FakeOllamaClient()
+        status, _, message, _ = img_tagger.process_single_image(
+            image, client, "ollama", "m", "p", threading.Event(), found=found[image]
+        )
+        assert (status, message) == ("FAILED", "Could not read image: File changed since it was found: a.png")
+        assert client.calls == []
+        assert not img_tagger.is_already_processed(image)
+
+    def test_clearing_never_edits_the_substitute(self, tmp_path, capsys):
+        found, image = self.swap_in_other_collection(tmp_path)
+        img_tagger.tag_image(str(image), SAMPLE_TAGS)  # the substitute carries tags
+        before = image.read_bytes()
+        img_tagger.clear_tags(image, found[image])
+        assert "File changed since it was found: a.png" in capsys.readouterr().out
+        assert image.read_bytes() == before
+
+    def test_discovery_records_each_files_own_identity(self, tmp_path):
+        image = make_image(tmp_path / "a.png")
+        assert os.path.samestat(img_tagger._find_images(str(tmp_path), False)[image], image.lstat())
+
+
+class TestSizeLimits:
+    def test_oversized_file_is_refused_before_reading(self, tmp_path, monkeypatch):
+        image = make_image(tmp_path / "a.png")
+        monkeypatch.setattr(img_tagger, "MAX_IMAGE_BYTES", image.stat().st_size - 1)
+        with pytest.raises(OSError, match="Image is larger than"):
+            img_tagger._read_image_snapshot(image)
+        status, _, message, _ = img_tagger.process_single_image(
+            image, FakeOllamaClient(), "ollama", "m", "p", threading.Event()
+        )
+        assert status == "FAILED"
+        assert "Image is larger than" in message
+
+    def test_file_at_the_limit_is_read(self, tmp_path, monkeypatch):
+        image = make_image(tmp_path / "a.png")
+        monkeypatch.setattr(img_tagger, "MAX_IMAGE_BYTES", image.stat().st_size)
+        assert img_tagger._read_image_bytes(image) == image.read_bytes()
+
+    def test_file_growing_during_the_read_is_bounded(self, tmp_path, monkeypatch):
+        image = make_image(tmp_path / "a.png")
+        size = image.stat().st_size
+        monkeypatch.setattr(img_tagger, "MAX_IMAGE_BYTES", size + 10)
+        real_fstat = os.fstat
+
+        def stale_size(fd):  # the size check saw the file before it grew
+            info = real_fstat(fd)
+            fields = list(info)
+            fields[6] = min(info.st_size, size)  # st_size
+            # the dict keeps the fields beyond the tuple, e.g. Windows' st_file_attributes
+            visible = {"st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size"}
+            extra = {name: getattr(info, name) for name in dir(info) if name.startswith("st_") and name not in visible}
+            return os.stat_result(fields, extra)
+
+        with image.open("ab") as grow:
+            grow.write(b"\0" * 100)
+        monkeypatch.setattr(img_tagger.os, "fstat", stale_size)
+        with pytest.raises(OSError, match="Image is larger than"):
+            img_tagger._read_image_snapshot(image)
+
+    def test_huge_animation_is_not_decoded_for_repair(self, tmp_path, monkeypatch):
+        path = make_animated(tmp_path / "anim.webp")
+        monkeypatch.setattr(img_tagger, "MAX_ANIMATION_PIXELS", 10)
+        source, output = path.read_bytes(), io.BytesIO()
+        with pytest.raises(ValueError, match="Animation too large to repair"):
+            img_tagger._sanitize_with_pillow(source, output)
+        assert output.getvalue() == b""  # refused before anything was decoded or written
+
+
+class TestEfsEncryptedImages:
+    """An EFS-encrypted image is never replaced by an unencrypted temporary (audit finding 6)."""
+
+    @staticmethod
+    def encrypted_source_only(monkeypatch, temporary_encrypted: bool):
+        calls = []
+
+        def encrypted(info):  # first call: the source, second: the new temporary
+            calls.append(info)
+            return len(calls) == 1 or temporary_encrypted
+
+        monkeypatch.setattr(img_tagger, "_efs_encrypted", encrypted)
+
+    @pytest.mark.parametrize("clear", [False, True])
+    def test_refused_when_the_temporary_is_not_encrypted(self, tmp_path, monkeypatch, capsys, clear):
+        image = make_image(tmp_path / "secret.png")
+        before = image.read_bytes()
+        self.encrypted_source_only(monkeypatch, temporary_encrypted=False)
+        if clear:
+            img_tagger.clear_tags(image)
+            assert "Encrypted (EFS) image would be replaced by an unencrypted file" in capsys.readouterr().out
+        else:
+            with pytest.raises(RuntimeError, match="Encrypted \\(EFS\\) image"):
+                img_tagger.tag_image(str(image), SAMPLE_TAGS)
+        assert image.read_bytes() == before
+        assert [p.name for p in tmp_path.iterdir()] == ["secret.png"]
+
+    def test_allowed_in_an_encrypted_folder(self, tmp_path, monkeypatch):
+        image = make_image(tmp_path / "secret.png")
+        self.encrypted_source_only(monkeypatch, temporary_encrypted=True)
+        img_tagger.tag_image(str(image), SAMPLE_TAGS)
+        assert img_tagger.is_already_processed(image)
+
+    def test_attribute_check(self):
+        assert img_tagger._efs_encrypted(SimpleNamespace(st_file_attributes=0x4020))
+        assert not img_tagger._efs_encrypted(SimpleNamespace(st_file_attributes=0x20))
+        assert not img_tagger._efs_encrypted(SimpleNamespace())  # POSIX stat has no attributes

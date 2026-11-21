@@ -77,6 +77,13 @@ DEFAULT_HOSTS = {"ollama": "http://localhost:11434", "lm-studio": "http://localh
 # reads small diagram labels, Ollama enlarges anything smaller to ~1,200 tokens anyway, and a 12 MP
 # photo took 6x longer than its 1 MP copy for the same tags.
 DEFAULT_MAX_MEGAPIXELS = 1.0
+# Larger files are refused before they are read into memory (each worker holds a few copies of an image)
+MAX_IMAGE_BYTES = 256 * 1024 * 1024
+# Frames x width x height an animated WebP/APNG may have for the Pillow metadata repair, which decodes them all
+MAX_ANIMATION_PIXELS = 250_000_000
+MAX_LOGGED_REPLY_CHARS = 4000
+# A longer "tag" is a sentence (a refusal or an explanation), not a keyword
+MAX_TAG_LENGTH = 64
 MODEL_JPEG_QUALITY = 90
 
 DEFAULT_PROMPT = (
@@ -110,7 +117,7 @@ def setup_logging(log_path: str | None) -> None:
     path_obj.parent.mkdir(parents=True, exist_ok=True)
 
     handler = _LogHandler(_open_log(path_obj))
-    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(threadName)s %(name)s: %(message)s"))
+    handler.setFormatter(_LogFormatter("%(asctime)s [%(levelname)s] %(threadName)s %(name)s: %(message)s"))
     # Not basicConfig(): it silently ignores the handler (leaking the open log) when the root logger
     # already has one, e.g. pytest's or an embedding application's. Only an earlier log of ours is replaced.
     root = logging.getLogger()
@@ -151,7 +158,9 @@ def _open_log(path: Path) -> TextIO:
     """
 
     if os.name == "nt":
-        fd = _win_open(path, _Win.FILE_APPEND_DATA, _Win.SHARE_ALL, _Win.OPEN_ALWAYS)
+        # A new log gets a private DACL instead of the folder's inherited one (which may let others read it)
+        access = _Win.FILE_APPEND_DATA | _Win.READ_CONTROL
+        fd = _win_open(path, access, _Win.SHARE_ALL, _Win.OPEN_ALWAYS, security=_windows_private_security())
     else:
         # O_NONBLOCK: opening a FIFO fails (ENXIO) instead of waiting for a reader
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
@@ -160,7 +169,7 @@ def _open_log(path: Path) -> TextIO:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & _Win.ATTRIBUTE_REPARSE_POINT:
             raise OSError(errno.EINVAL, "The log file must be a regular file", str(path))
-        if os.name != "nt" and info.st_uid != os.geteuid():
+        if not _owned_by_current_user(fd, info):
             raise OSError(errno.EPERM, "The log file must belong to the current user", str(path))
         if os.name != "nt":
             os.set_blocking(fd, True)
@@ -169,6 +178,11 @@ def _open_log(path: Path) -> TextIO:
     except BaseException:
         os.close(fd)
         raise
+
+
+def _owned_by_current_user(fd: int, info: os.stat_result) -> bool:
+    """Whether the open file belongs to this user (POSIX uid; Windows owner SID, see _windows_owned_by_me())."""
+    return _windows_owned_by_me(fd) if os.name == "nt" else info.st_uid == os.geteuid()
 
 
 def _log_path_error(log_path: str | None) -> str | None:
@@ -195,11 +209,29 @@ def _log_path_error(log_path: str | None) -> str | None:
     return None
 
 
+# Characters that could fake output on a terminal or records in the line-oriented log when they come
+# from a file name or a server: C0/C1 controls (newline, carriage return, escape sequences) and
+# bidirectional overrides, which can make text display in a different order than it is.
+_CONTROL_CHARACTERS = re.compile("[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+
+
+def _shown(text: str) -> str:
+    """text with control characters escaped (a newline becomes \\n); other Unicode is kept as it is."""
+    return _CONTROL_CHARACTERS.sub(lambda match: match.group().encode("unicode_escape").decode("ascii"), text)
+
+
+class _LogFormatter(logging.Formatter):
+    """Escapes control characters in each log message so every record stays one line (tracebacks are appended as is)."""
+
+    def formatMessage(self, record: logging.LogRecord) -> str:
+        return _shown(super().formatMessage(record))
+
+
 def _warn(message: str) -> None:
     """Logs a warning and shows it on the console too, so it is seen with or without --log."""
 
     logger.warning(message)
-    tqdm.write(f"  Warning: {message}")
+    tqdm.write(f"  Warning: {_shown(message)}")
 
 
 def listen_for_quit(stop_event: threading.Event) -> None:
@@ -326,10 +358,17 @@ class _Win:
     OPEN_EXISTING = 3
     OPEN_ALWAYS = 4
     ATTRIBUTE_REPARSE_POINT = 0x400
+    ATTRIBUTE_ENCRYPTED = 0x4000
     FLAG_BACKUP_SEMANTICS = 0x02000000
     FLAG_OPEN_REPARSE_POINT = 0x00200000
     SE_FILE_OBJECT = 1
+    OWNER_SECURITY_INFORMATION = 0x1
     DACL_SECURITY_INFORMATION = 0x4
+    TOKEN_QUERY = 0x8
+    TOKEN_USER = 1
+    TOKEN_OWNER = 4
+    # Protected DACL with one entry: full access for the file's owner (OWNER RIGHTS), nobody else
+    PRIVATE_SDDL = "D:P(A;;FA;;;OW)"
     SE_DACL_PROTECTED = 0x1000
     FILE_PERSISTENT_ACLS = 0x8
     FILE_RENAME_INFO = 3
@@ -377,6 +416,22 @@ if os.name == "nt":
     _advapi32.GetSecurityDescriptorLength.argtypes = [wintypes.LPVOID]
     _advapi32.GetSecurityDescriptorDacl.argtypes = [wintypes.LPVOID, *[wintypes.LPVOID] * 3]
     _advapi32.GetSecurityDescriptorControl.argtypes = [wintypes.LPVOID, wintypes.LPVOID, wintypes.LPVOID]
+    _advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+    ]
+    _advapi32.EqualSid.argtypes = [wintypes.LPVOID, wintypes.LPVOID]
+    _advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID]
+    _advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+    ]
+    _kernel32.GetCurrentProcess.restype = wintypes.HANDLE
 
     class _SecurityAttributes(ctypes.Structure):
         _fields_ = [("length", wintypes.DWORD), ("descriptor", wintypes.LPVOID), ("inherit", wintypes.BOOL)]
@@ -427,10 +482,13 @@ def _pin_windows_directory(path: Path) -> int:
         except PermissionError:
             if not access:
                 raise
-    info = os.fstat(fd)
-    if info.st_file_attributes & _Win.ATTRIBUTE_REPARSE_POINT or not stat.S_ISDIR(info.st_mode):
+    try:
+        info = os.fstat(fd)
+        if info.st_file_attributes & _Win.ATTRIBUTE_REPARSE_POINT or not stat.S_ISDIR(info.st_mode):
+            raise _UnsafeImagePath(f"Image paths must not contain links or reparse points: {path}")
+    except BaseException:
         os.close(fd)
-        raise _UnsafeImagePath(f"Image paths must not contain links or reparse points: {path}")
+        raise
     return fd
 
 
@@ -448,6 +506,61 @@ def _windows_security(fd: int) -> bytes:
         return ctypes.string_at(descriptor, _advapi32.GetSecurityDescriptorLength(descriptor))
     finally:
         _kernel32.LocalFree(descriptor)
+
+
+def _windows_private_security() -> bytes:
+    """A self-relative security descriptor whose protected DACL lets only the file's owner in."""
+    descriptor, size = ctypes.c_void_p(), wintypes.ULONG()
+    if not _advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        _Win.PRIVATE_SDDL, 1, ctypes.byref(descriptor), ctypes.byref(size)
+    ):
+        raise _win_error(ctypes.get_last_error())
+    try:
+        return ctypes.string_at(descriptor, size.value)
+    finally:
+        _kernel32.LocalFree(descriptor)
+
+
+def _windows_owned_by_me(fd: int) -> bool:
+    """
+    Whether the file's owner is this process's user, or the default owner its new files get
+    (an elevated administrator's files may belong to the Administrators group).
+    """
+    owner, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
+    handle = msvcrt.get_osfhandle(fd)
+    info = _Win.OWNER_SECURITY_INFORMATION
+    error = _advapi32.GetSecurityInfo(
+        handle, _Win.SE_FILE_OBJECT, info, ctypes.byref(owner), None, None, None, ctypes.byref(descriptor)
+    )
+    if error:
+        raise _win_error(error)
+    try:
+        return _windows_token_has_sid(owner)
+    finally:
+        _kernel32.LocalFree(descriptor)
+
+
+def _windows_token_has_sid(sid: Any) -> bool:
+    """
+    Whether sid is this process's user SID or its default owner SID (TokenUser, TokenOwner). Compared
+    here, while each token information buffer (which the SID pointer points into) is still alive.
+    """
+    token = wintypes.HANDLE()
+    if not _advapi32.OpenProcessToken(_kernel32.GetCurrentProcess(), _Win.TOKEN_QUERY, ctypes.byref(token)):
+        raise _win_error(ctypes.get_last_error())
+    try:
+        for token_class in (_Win.TOKEN_USER, _Win.TOKEN_OWNER):
+            size = wintypes.DWORD()
+            _advapi32.GetTokenInformation(token, token_class, None, 0, ctypes.byref(size))
+            buffer = ctypes.create_string_buffer(size.value)
+            if not _advapi32.GetTokenInformation(token, token_class, buffer, size, ctypes.byref(size)):
+                raise _win_error(ctypes.get_last_error())
+            # TOKEN_USER and TOKEN_OWNER both start with the SID pointer
+            if _advapi32.EqualSid(sid, ctypes.c_void_p.from_buffer(buffer)):
+                return True
+        return False
+    finally:
+        _kernel32.CloseHandle(token)
 
 
 def _windows_persistent_acls(fd: int) -> bool:
@@ -699,11 +812,13 @@ def _apply_permissions(output: BinaryIO, source: os.stat_result, attributes: dic
 
 
 def _source_bytes(
-    path: Path, parent_fd: int | None, permissions: bool = False
+    path: Path, parent_fd: int | None, permissions: bool = False, found: os.stat_result | None = None
 ) -> tuple[bytes, os.stat_result, dict[str, bytes]]:
     """
     Read only an opened regular file, rejecting leaf links before consuming bytes. With permissions,
-    also capture its extended attributes/ACLs or DACL (only edits need them).
+    also capture its extended attributes/ACLs or DACL (only edits need them). With found (its
+    lstat from _find_images()), refuse a different file now at that path: someone allowed to
+    rename folders above it could otherwise swap in another collection between discovery and here.
     """
     if parent_fd is None:
         fd = _win_open(path, _Win.GENERIC_READ, _Win.SHARE_ALL, _Win.OPEN_EXISTING)
@@ -714,16 +829,23 @@ def _source_bytes(
         info = os.fstat(source.fileno())
         if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & _Win.ATTRIBUTE_REPARSE_POINT:
             raise _UnsafeImagePath("Image input must be a regular file")
-        return source.read(), info, _file_attributes(source.fileno()) if permissions else {}
+        if found is not None and not os.path.samestat(info, found):
+            raise _UnsafeImagePath(f"File changed since it was found: {path.name}")
+        if parent_fd is not None:
+            os.set_blocking(source.fileno(), True)  # O_NONBLOCK was only for refusing FIFOs at open
+        # Checked before and while reading, so a file that grows meanwhile is bounded too
+        if info.st_size > MAX_IMAGE_BYTES or len(data := source.read(MAX_IMAGE_BYTES + 1)) > MAX_IMAGE_BYTES:
+            raise OSError(errno.EFBIG, f"Image is larger than {MAX_IMAGE_BYTES // 2**20} MiB", path.name)
+        return data, info, _file_attributes(source.fileno()) if permissions else {}
 
 
-def _read_image_snapshot(path: Path | str) -> tuple[bytes, os.stat_result]:
+def _read_image_snapshot(path: Path | str, found: os.stat_result | None = None) -> tuple[bytes, os.stat_result]:
     """
     Read a guarded source snapshot instead of delegating pathname reads to libraries, with the
-    stat of the file it came from (see _same_version()).
+    stat of the file it came from (see _same_version()); found as in _source_bytes().
     """
     with _image_parent(Path(path)) as (image, parent_fd):
-        data, info, _ = _source_bytes(image, parent_fd)
+        data, info, _ = _source_bytes(image, parent_fd, found=found)
         return data, info
 
 
@@ -760,21 +882,28 @@ def _check_replacement(
 
 
 @contextlib.contextmanager
-def _image_edit(image_path: Path | str, expected: os.stat_result | None = None) -> Generator[tuple[bytes, BinaryIO]]:
+def _image_edit(
+    image_path: Path | str, expected: os.stat_result | None = None, found: os.stat_result | None = None
+) -> Generator[tuple[bytes, BinaryIO]]:
     """
     Keep source permissions, parent identity and temporary descriptor bound to an edit. With expected
     (the stat of an earlier snapshot, e.g. the one sent to the model), refuse a file that has since
-    been replaced or modified.
+    been replaced or modified; found as in _source_bytes().
     """
     with _image_parent(Path(image_path)) as (path, parent_fd):
-        data, original, attributes = _source_bytes(path, parent_fd, permissions=True)
+        data, original, attributes = _source_bytes(path, parent_fd, permissions=True, found=found)
         if expected is not None and not _same_version(original, expected):
             raise _UnsafeImagePath(f"File changed during processing: {path.name}")
         fd, temporary = _create_image_temp(path.parent, parent_fd, attributes.get(_Win.SECURITY_KEY))
-        temp_stat = os.fstat(fd)
         try:
-            with os.fdopen(fd, "w+b") as output:
+            with _temp_file_object(fd, temporary, parent_fd) as output:
                 try:
+                    temp_stat = os.fstat(output.fileno())
+                    # Before the first byte is written: EFS protects only the file itself, not its replacement
+                    if _efs_encrypted(original) and not _efs_encrypted(temp_stat):
+                        raise _UnsafeImagePath(
+                            f"Encrypted (EFS) image would be replaced by an unencrypted file: {path.name}"
+                        )
                     yield data, output
                     output.flush()
                     _apply_permissions(output, original, attributes, path.name)
@@ -792,6 +921,26 @@ def _image_edit(image_path: Path | str, expected: os.stat_result | None = None) 
             if parent_fd is not None:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(temporary.name, dir_fd=parent_fd)
+
+
+def _temp_file_object(fd: int, temporary: Path, parent_fd: int | None) -> BinaryIO:
+    """The temporary's descriptor as a file object; if even that fails, the descriptor is still closed."""
+    try:
+        return os.fdopen(fd, "w+b")
+    except BaseException:
+        if parent_fd is None:
+            _discard_windows_temp(fd, temporary)
+        os.close(fd)
+        raise
+
+
+def _efs_encrypted(info: os.stat_result) -> bool:
+    """
+    Whether Windows EFS encrypts the file (FILE_ATTRIBUTE_ENCRYPTED). A temporary created in an
+    encrypted folder is encrypted at creation; one in a plain folder is not, and replacing an
+    individually encrypted image with it would leave the image readable without the EFS key.
+    """
+    return bool(getattr(info, "st_file_attributes", 0) & _Win.ATTRIBUTE_ENCRYPTED)
 
 
 def _create_image_temp(directory: Path, parent_fd: int | None, security: bytes | None = None) -> tuple[int, Path]:
@@ -883,6 +1032,11 @@ def _sanitize_with_pillow(src, dst, fmt=None) -> None:
         if not getattr(img, "is_animated", False):
             img.save(dst, format=fmt, quality=95)
             return
+        # Every frame is decoded and Pillow's writers keep them all: bound the total before decoding any
+        if img.n_frames * img.width * img.height > MAX_ANIMATION_PIXELS:
+            raise ValueError(
+                f"Animation too large to repair ({img.n_frames} frames of {img.width}x{img.height} pixels)"
+            )
 
         durations = []
         for frame in ImageSequence.Iterator(img):
@@ -954,50 +1108,32 @@ def write_metadata(image_path: str, tags_list: list[str], expected: os.stat_resu
 
     with _image_edit(image_path, expected) as (source, output):
         output.write(source)
-        with metadata_lock:
-            try:
-                # Primary attempt using pyexiv2 (separated into EXIF and XMP)
+        try:
+            # Primary attempt using pyexiv2 (separated into EXIF and XMP)
+            with metadata_lock:
                 _modify_with_pyexiv2(output, write_tags)
-
-            except RuntimeError as e:
-                # Auto-healing fallback for corrupted EXIF data (IFD buffer errors)
-                if _is_corrupt_metadata_error(e):
-                    _warn(
-                        f"Corrupted metadata in {Path(image_path).name} ({e}); "
-                        "re-saving it with Pillow before tagging (JPEG/WebP are re-encoded)"
-                    )
-
-                    # Re-save the guarded source snapshot into the retained output handle.
-                    output.seek(0)
-                    output.truncate()
-                    _sanitize_with_pillow(source, output)
-
-                    # Retry pyexiv2 on the newly cleaned temporary file
-                    _modify_with_pyexiv2(output, write_tags)
-
-                else:
-                    raise  # Re-raise if it's a different pyexiv2 error
-
-
-def _gif_loop_kwargs(img: Image.Image) -> dict[str, int]:
-    """
-    Returns the save() loop argument that keeps a GIF's loop count.
-
-    A GIF without a loop count plays once; saving it with loop=0 would make it loop forever.
-
-    Args:
-        img: The open source GIF.
-
-    Returns:
-        {"loop": count} if the GIF has a loop count, otherwise {}.
-    """
-
-    return {"loop": img.info["loop"]} if "loop" in img.info else {}
+            return
+        except RuntimeError as e:
+            # Auto-healing fallback for corrupted EXIF data (IFD buffer errors); other pyexiv2 errors propagate
+            if not _is_corrupt_metadata_error(e):
+                raise
+            _warn(
+                f"Corrupted metadata in {Path(image_path).name} ({e}); "
+                "re-saving it with Pillow before tagging (JPEG/WebP are re-encoded)"
+            )
+        # Re-save the guarded source snapshot into the retained output handle. Pillow runs outside the
+        # lock (like _clear_standard()), so other workers' pyexiv2 calls aren't held up by the re-encode.
+        output.seek(0)
+        output.truncate()
+        _sanitize_with_pillow(source, output)
+        # Retry pyexiv2 on the newly cleaned temporary file
+        with metadata_lock:
+            _modify_with_pyexiv2(output, write_tags)
 
 
 def write_gif_tags(image_path: str, tags_list: list[str], expected: os.stat_result | None = None) -> None:
     """
-    Writes tags to GIF images using comments, keeping frames, durations and loop count.
+    Writes tags to a GIF as its comment, leaving everything else in the file byte for byte unchanged.
 
     Args:
         image_path: The path to the GIF file.
@@ -1006,29 +1142,66 @@ def write_gif_tags(image_path: str, tags_list: list[str], expected: os.stat_resu
     """
 
     with _image_edit(image_path, expected) as (source, output):
-        _save_gif(source, output, f"{', '.join(tags_list)} {PROCESSED_MARKER}")
+        output.write(_set_gif_comment(source, f"{', '.join(tags_list)} {PROCESSED_MARKER}"))
 
 
-def _save_gif(source: bytes, output: BinaryIO, comment: str) -> None:
-    """Re-encode a source snapshot, preserving animation timing and loop semantics."""
-    with _open_pillow(source) as img:
-        loop = _gif_loop_kwargs(img)
-        durations = [frame.info.get("duration", 100) for frame in ImageSequence.Iterator(img)]
-        img.seek(0)
-        first = img.copy()
+def _set_gif_comment(source: bytes, comment: str) -> bytes:
+    """
+    The GIF with every comment extension removed and, unless comment is empty, one new comment
+    (UTF-8) right after the global header, where Pillow reads it as info["comment"]. The GIF is
+    edited at the block level, never decoded: frames, palettes, disposal methods, transparency,
+    durations, the loop count and other extensions stay byte for byte, in memory of the file's size.
 
-        def frames():
-            # Pillow collects these frames internally; memory still grows with animation size.
-            for index, frame in enumerate(ImageSequence.Iterator(img)):
-                if index:
-                    yield frame.copy()
+    Raises:
+        ValueError: The data isn't a GIF or ends inside a block.
+    """
 
-        try:
-            first.save(
-                output, format="GIF", save_all=True, append_images=frames(), duration=durations, comment=comment, **loop
-            )
-        finally:
-            first.close()
+    if source[:6] not in {b"GIF87a", b"GIF89a"}:
+        raise ValueError("Not a GIF file")
+    header_end = 13 + _gif_color_table_size(source, 10)
+    _gif_byte(source, header_end - 1)  # the whole header and global color table must be there
+    output = bytearray(source[:header_end])
+    if comment:
+        output[:6] = b"GIF89a"  # comment extensions are a GIF89a feature
+        data = comment.encode("utf-8")
+        output += b"\x21\xfe"
+        for offset in range(0, len(data), 255):
+            chunk = data[offset : offset + 255]
+            output += bytes([len(chunk)]) + chunk
+        output += b"\x00"
+    position = header_end
+    while position < len(source):
+        block = source[position]
+        if block == 0x21:  # extension: label, then data sub-blocks
+            end = _gif_sub_blocks_end(source, position + 2)
+            if _gif_byte(source, position + 1) != 0xFE:
+                output += source[position:end]
+        elif block == 0x2C:  # image: descriptor, local color table, LZW code size, data sub-blocks
+            end = _gif_sub_blocks_end(source, position + 11 + _gif_color_table_size(source, position + 9))
+            output += source[position:end]
+        else:  # the trailer (0x3B), or data after the last image that readers ignore: keep it as it is
+            return bytes(output + source[position:])
+        position = end
+    return bytes(output + b"\x3b")  # a GIF that ended without its trailer gets one
+
+
+def _gif_color_table_size(data: bytes, packed_at: int) -> int:
+    """Size of the color table that the packed-fields byte at packed_at announces (0 without one)."""
+    packed = _gif_byte(data, packed_at)
+    return 3 << ((packed & 0x07) + 1) if packed & 0x80 else 0
+
+
+def _gif_sub_blocks_end(data: bytes, position: int) -> int:
+    """The offset just after the chain of data sub-blocks starting at position (ended by a 0 size)."""
+    while size := _gif_byte(data, position):
+        position += 1 + size
+    return position + 1
+
+
+def _gif_byte(data: bytes, position: int) -> int:
+    if position >= len(data):
+        raise ValueError("Truncated GIF file")
+    return data[position]
 
 
 def tag_image(
@@ -1095,12 +1268,12 @@ def _clear_standard(source: bytes, output: BinaryIO, fmt: str | None = None) -> 
 
 
 def _clear_gif(source: bytes, output: BinaryIO) -> str:
-    """Clear a GIF comment using only the opened source snapshot and output handle."""
-    _save_gif(source, output, "")
+    """Remove a GIF's comments, leaving everything else byte for byte (see _set_gif_comment())."""
+    output.write(_set_gif_comment(source, ""))
     return "Cleared GIF comment"
 
 
-def clear_tags(image_path: Path | str) -> None:
+def clear_tags(image_path: Path | str, found: os.stat_result | None = None) -> None:
     """
     Removes all metadata (EXIF, XMP, IPTC) from standard images and clears
     comments from GIFs to reset images for testing purposes.
@@ -1109,26 +1282,28 @@ def clear_tags(image_path: Path | str) -> None:
 
     Args:
         image_path: The path to the image file.
+        found: The file's lstat from _find_images(); a different file at the path is refused.
     """
 
     p = Path(image_path)
     if p.suffix.lower() not in IMAGE_EXTENSIONS:
         return
     try:
-        with _image_edit(p) as (source, output):
-            fmt = get_image_format(source)
-            if _is_gif(p, fmt):
-                message = _clear_gif(source, output)
-            elif fmt in PYEXIV2_FORMATS:
-                message = _clear_standard(source, output, fmt)
-            else:
-                raise ValueError(f"Unsupported file format: {fmt}" if fmt else "Unreadable image")
+        # Validated on a snapshot first, so an unusable file gets no temporary; the edit then
+        # refuses a file that changed since (like tagging)
+        source, snapshot = _read_image_snapshot(p, found)
+        fmt = get_image_format(source)
+        gif = _is_gif(p, fmt)
+        if not gif and fmt not in PYEXIV2_FORMATS:
+            raise ValueError(f"Unsupported file format: {fmt}" if fmt else "Unreadable image")
+        with _image_edit(p, snapshot) as (source, output):
+            message = _clear_gif(source, output) if gif else _clear_standard(source, output, fmt)
         separator = ": " if fmt == "GIF" else " for: "
         logger.info(f"{message}{separator}{p.name}")
-        print(f"  {message}{separator}{p.name}")
+        print(f"  {message}{separator}{_shown(p.name)}")
     except Exception as e:
         logger.exception(f"Failed to clear {p.name}")
-        print(f"  Failed to clear {p.name}: {e}")
+        print(_shown(f"  Failed to clear {p.name}: {e}"))
 
 
 def _model_image(source: bytes, max_megapixels: float = DEFAULT_MAX_MEGAPIXELS) -> tuple[bytes, str]:
@@ -1226,7 +1401,7 @@ def get_tags_ollama(
         messages=[{"role": "user", "content": prompt, "images": [data]}],
     )
     content = response.message.content
-    logger.debug(f"Raw Ollama response for {img_path}: {content}")
+    logger.debug(f"Raw Ollama response for {img_path}: {_log_excerpt(content)}")
     return content or ""
 
 
@@ -1275,8 +1450,15 @@ def get_tags_lm_studio(
     )
     # An OpenAI-compatible server may answer with no choices at all
     content = response.choices[0].message.content if response.choices else None
-    logger.debug(f"Raw LM Studio response for {img_path}: {content}")
+    logger.debug(f"Raw LM Studio response for {img_path}: {_log_excerpt(content)}")
     return content or ""
+
+
+def _log_excerpt(text: str | None, limit: int = MAX_LOGGED_REPLY_CHARS) -> str | None:
+    """A model reply for the log, cut to limit characters: a runaway reply mustn't fill the disk."""
+    if text is None or len(text) <= limit:
+        return text
+    return f"{text[:limit]}... [{len(text) - limit} more characters not logged]"
 
 
 def _json_list(raw_output: str) -> list | None:
@@ -1383,8 +1565,9 @@ def parse_text_tags(text: str) -> list[str]:
 def normalize_tags(tags: list[str], min_count: int = 6, max_count: int = 12) -> list[str] | None:
     """Normalize tags and enforce count constraints.
 
-    Normalizes each tag (lowercase, strip whitespace), removes duplicates while
-    preserving order, then enforces the 6-12 tag minimum from your prompt.
+    Normalizes each tag (lowercase, strip whitespace), drops tags longer than
+    MAX_TAG_LENGTH, removes duplicates while preserving order, then enforces the
+    6-12 tag minimum from your prompt.
     Returns None if fewer than min_count valid tags remain.
 
     Args:
@@ -1396,12 +1579,12 @@ def normalize_tags(tags: list[str], min_count: int = 6, max_count: int = 12) -> 
         A list of normalized tags, or None if the count is below min_count.
     """
 
-    # Strip, lowercase, remove duplicates while preserving order
+    # Strip, lowercase, drop sentence-length entries, remove duplicates while preserving order
     seen = set()
     normalized = []
     for tag in tags:
         tag = tag.strip().lower()
-        if tag and tag not in seen:
+        if tag and len(tag) <= MAX_TAG_LENGTH and tag not in seen:
             seen.add(tag)
             normalized.append(tag)
 
@@ -1506,6 +1689,7 @@ def process_single_image(
     prompt: str,
     stop_event: threading.Event,
     max_megapixels: float = DEFAULT_MAX_MEGAPIXELS,
+    found: os.stat_result | None = None,
 ) -> tuple[str, str, str, float]:
     """Handles the full pipeline for a single image: validation -> AI -> tagging.
 
@@ -1517,6 +1701,7 @@ def process_single_image(
         prompt: The prompt instructions for tag generation.
         stop_event: A threading.Event to monitor for user cancellation.
         max_megapixels: Pixel budget for the copy sent to the model (0 sends the original).
+        found: The file's lstat from _find_images(); a different file at the path is refused.
 
     Returns:
         A tuple containing (status, filename, message, duration).
@@ -1526,7 +1711,7 @@ def process_single_image(
     # One guarded read serves the format and skip checks and the model; tag_image() then refuses
     # a file that no longer matches it (replaced or modified while the model was working)
     try:
-        data, snapshot = _read_image_snapshot(img_path)
+        data, snapshot = _read_image_snapshot(img_path, found)
     except OSError as e:  # e.g. a folder writable by others, a symlinked folder or no read permission
         logger.warning(f"Failed: could not read {img_path.name}: {e}")
         return "FAILED", img_path.name, f"Could not read image: {e}", 0
@@ -1594,6 +1779,7 @@ class _RunStats:
     def record(self, status: str, name: str, message: str, duration: float) -> None:
         """Prints one process_single_image() result and adds it to the totals."""
 
+        name, message = _shown(name), _shown(message)
         if status == "SUCCESS":
             tqdm.write(f"  [✓] {name} -> {message}")
             self.success += 1
@@ -1629,20 +1815,38 @@ def _without_leading_parent_refs(path: Path) -> Path:
     return base.joinpath(*parts[count:])
 
 
-def _find_images(directory: str, recursive: bool) -> list[Path]:
-    """Lists files in directory (optionally recursive) with a supported image extension."""
+def _find_images(directory: str, recursive: bool) -> dict[Path, os.stat_result]:
+    """
+    Finds the regular files in directory (optionally recursive) with a supported image extension,
+    each with its lstat: readers refuse a different file at that path later (see _source_bytes()).
+    """
 
     base_path = _without_leading_parent_refs(Path(directory))
     with _image_parent(base_path / ".image-directory-check"):
         # Opening it is enough to know it can be listed: rglob() silently finds nothing in a folder it can't list
         try:
-            with os.scandir(base_path):
-                pass
+            os.scandir(base_path).close()
         except OSError as error:
             raise OSError(error.errno, f"Could not list the image folder: {error.strerror}", directory) from error
         files = base_path.rglob("*") if recursive else base_path.iterdir()
         # Reads revalidate ancestors and the opened leaf; this filter only avoids existing links.
-        return [f for f in files if not f.is_symlink() and f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS]
+        found = {}
+        for file in files:
+            if (
+                file.suffix.lower() in IMAGE_EXTENSIONS
+                and (info := _lstat_or_none(file))
+                and stat.S_ISREG(info.st_mode)
+            ):
+                found[file] = info
+        return found
+
+
+def _lstat_or_none(path: Path) -> os.stat_result | None:
+    """The path's own lstat (a link is not followed), or None if it vanished or can't be examined."""
+    try:
+        return path.lstat()
+    except OSError:
+        return None
 
 
 def _load_prompt() -> str:
@@ -1761,7 +1965,7 @@ def _check_server(backend: str, host: str, model: str, timeout: float = DEFAULT_
 
 
 def _run_tasks(
-    image_files: list[Path],
+    image_files: dict[Path, os.stat_result | None],
     client: Any,
     backend: str,
     model: str,
@@ -1770,7 +1974,7 @@ def _run_tasks(
     stop_event: threading.Event,
     max_megapixels: float = DEFAULT_MAX_MEGAPIXELS,
 ) -> _RunStats:
-    """Tags image_files concurrently with a progress bar and returns the totals."""
+    """Tags image_files (path -> lstat from _find_images()) concurrently with a progress bar; returns the totals."""
 
     stats = _RunStats()
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1784,8 +1988,9 @@ def _run_tasks(
                 prompt,
                 stop_event,
                 max_megapixels,
+                found,
             ): img_path
-            for img_path in image_files
+            for img_path, found in image_files.items()
         }
 
         stopped_notified = False
@@ -1804,9 +2009,9 @@ def _run_tasks(
             except Exception as e:  # one bad image must not abort the batch
                 img_path = future_to_image[future]
                 logger.exception(f"Unexpected error for {img_path}")
-                tqdm.write(f"  [!] {img_path} -> Unexpected Error: {e}")
+                tqdm.write(_shown(f"  [!] {img_path} -> Unexpected Error: {e}"))
                 stats.failed += 1
-                stats.failed_log.append((img_path.name, f"Unexpected Error: {e}"))
+                stats.failed_log.append((_shown(img_path.name), _shown(f"Unexpected Error: {e}")))
 
     return stats
 
@@ -1867,10 +2072,10 @@ def clear_directory(
     )
     if max_workers > 1:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            list(executor.map(clear_tags, image_files))
+            list(executor.map(clear_tags, image_files, image_files.values()))
     else:
-        for img_path in image_files:
-            clear_tags(img_path)
+        for img_path, found in image_files.items():
+            clear_tags(img_path, found)
     print("Done.")
     logger.info("Clearing finished")
 
@@ -2077,10 +2282,10 @@ def main(argv: list[str] | None = None) -> int:
     # The folder itself, e.g. _UnsafeImagePath or no permission to list it (per-image problems are reported per image)
     except OSError as e:
         logger.exception("Refused the image folder")
-        print(f"Error: {e}")
+        print(f"Error: {_shown(str(e))}")
         return 1
-    except _ServerCheckError as e:  # already logged by _check_server()
-        print(f"Error: {e}")
+    except _ServerCheckError as e:  # already logged by _check_server(); the model names come from the server
+        print(f"Error: {_shown(str(e))}")
         return 1
     return 0
 

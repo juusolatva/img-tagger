@@ -2,6 +2,7 @@
 
 import pytest
 
+import img_tagger
 from img_tagger import normalize_tags, parse_model_output, parse_text_tags
 
 SIX = ["photo", "sunset", "beach", "ocean", "sky", "clouds"]
@@ -181,7 +182,16 @@ class TestParseModelOutput:
 
     def test_long_digit_run_falls_through_to_text_parsers(self):
         raw = "1" * 5000 + ", photo, sunset, beach, ocean, sky, clouds"
-        assert parse_model_output(raw) == ["1" * 5000] + SIX
+        assert parse_model_output(raw) == SIX  # the digit run itself is too long to be a tag
+
+    def test_sentence_length_entries_are_not_tags(self):
+        refusal = "I am unable to describe this image because it appears to be completely blank"
+        assert parse_model_output(f"{refusal}, photo, sunset, beach, ocean, sky") is None
+        assert parse_model_output(f"{refusal}, photo, sunset, beach, ocean, sky, clouds") == SIX
+
+    def test_tag_of_maximum_length_is_kept(self):
+        tag = "x" * img_tagger.MAX_TAG_LENGTH
+        assert parse_model_output(f"{tag}, photo, sunset, beach, ocean, sky")[0] == tag
 
 
 # --- Previously mis-parsed output styles -----------------------------------
