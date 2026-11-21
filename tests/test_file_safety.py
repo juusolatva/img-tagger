@@ -798,7 +798,12 @@ class TestSizeLimits:
 
         def stale_size(fd):  # the size check saw the file before it grew
             info = real_fstat(fd)
-            return os.stat_result((*info[:6], min(info.st_size, size), *info[7:]))
+            fields = list(info)
+            fields[6] = min(info.st_size, size)  # st_size
+            # the dict keeps the fields beyond the tuple, e.g. Windows' st_file_attributes
+            visible = {"st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size"}
+            extra = {name: getattr(info, name) for name in dir(info) if name.startswith("st_") and name not in visible}
+            return os.stat_result(fields, extra)
 
         with image.open("ab") as grow:
             grow.write(b"\0" * 100)

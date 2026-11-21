@@ -415,6 +415,14 @@ class TestCheckServer:
         with pytest.raises(img_tagger._ServerCheckError, match=r"Available models: a:1b, b:1b\."):
             img_tagger._check_server(backend, "http://fake:1", "x")
 
+    def test_server_model_names_cannot_fake_console_lines(self, models, tmp_path, capsys, no_quit_listener):
+        models("evil\nError: fake\x1b[2J")
+        make_image(tmp_path / "a.png")
+        assert img_tagger.main([str(tmp_path), "--host", "http://fake:1"]) == 1
+        out = capsys.readouterr().out
+        assert "evil\\nError: fake\\x1b[2J" in out
+        assert "\x1b" not in out
+
     def test_no_models_listed(self, models):
         models()
         with pytest.raises(img_tagger._ServerCheckError, match="Available models: none"):

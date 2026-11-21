@@ -368,6 +368,12 @@ class TestGifBlockEditing:
         assert gif_image.read_bytes()[-1:] == b"\x3b"
         assert gif_info(gif_image)["n_frames"] == len(GIF_DURATIONS)
 
+    @pytest.mark.parametrize("data", [b"GIF89a\x08\x00\x08\x00\xf7", b"GIF89a" + b"\x00" * 7 + b"\x21"])
+    def test_cut_off_header_or_block_is_truncated(self, data):
+        # a header announcing a 768-byte color table that isn't there, and a file ending after a block marker
+        with pytest.raises(ValueError, match="Truncated GIF"):
+            img_tagger._set_gif_comment(data, "")
+
     def test_truncated_gif_is_refused_unchanged(self, gif_image):
         truncated = gif_image.read_bytes()[:-10]
         gif_image.write_bytes(truncated)

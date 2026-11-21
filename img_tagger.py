@@ -535,13 +535,16 @@ def _windows_owned_by_me(fd: int) -> bool:
     if error:
         raise _win_error(error)
     try:
-        return any(_advapi32.EqualSid(owner, sid) for sid in _windows_token_sids())
+        return _windows_token_has_sid(owner)
     finally:
         _kernel32.LocalFree(descriptor)
 
 
-def _windows_token_sids() -> Generator[int]:
-    """This process's user SID and default owner SID (TokenUser, TokenOwner), each valid until the next one."""
+def _windows_token_has_sid(sid: Any) -> bool:
+    """
+    Whether sid is this process's user SID or its default owner SID (TokenUser, TokenOwner). Compared
+    here, while each token information buffer (which the SID pointer points into) is still alive.
+    """
     token = wintypes.HANDLE()
     if not _advapi32.OpenProcessToken(_kernel32.GetCurrentProcess(), _Win.TOKEN_QUERY, ctypes.byref(token)):
         raise _win_error(ctypes.get_last_error())
@@ -552,7 +555,10 @@ def _windows_token_sids() -> Generator[int]:
             buffer = ctypes.create_string_buffer(size.value)
             if not _advapi32.GetTokenInformation(token, token_class, buffer, size, ctypes.byref(size)):
                 raise _win_error(ctypes.get_last_error())
-            yield ctypes.c_void_p.from_buffer(buffer).value  # TOKEN_USER and TOKEN_OWNER start with the SID pointer
+            # TOKEN_USER and TOKEN_OWNER both start with the SID pointer
+            if _advapi32.EqualSid(sid, ctypes.c_void_p.from_buffer(buffer)):
+                return True
+        return False
     finally:
         _kernel32.CloseHandle(token)
 
@@ -1153,6 +1159,7 @@ def _set_gif_comment(source: bytes, comment: str) -> bytes:
     if source[:6] not in {b"GIF87a", b"GIF89a"}:
         raise ValueError("Not a GIF file")
     header_end = 13 + _gif_color_table_size(source, 10)
+    _gif_byte(source, header_end - 1)  # the whole header and global color table must be there
     output = bytearray(source[:header_end])
     if comment:
         output[:6] = b"GIF89a"  # comment extensions are a GIF89a feature
@@ -1167,7 +1174,7 @@ def _set_gif_comment(source: bytes, comment: str) -> bytes:
         block = source[position]
         if block == 0x21:  # extension: label, then data sub-blocks
             end = _gif_sub_blocks_end(source, position + 2)
-            if source[position + 1] != 0xFE:
+            if _gif_byte(source, position + 1) != 0xFE:
                 output += source[position:end]
         elif block == 0x2C:  # image: descriptor, local color table, LZW code size, data sub-blocks
             end = _gif_sub_blocks_end(source, position + 11 + _gif_color_table_size(source, position + 9))
@@ -2275,10 +2282,10 @@ def main(argv: list[str] | None = None) -> int:
     # The folder itself, e.g. _UnsafeImagePath or no permission to list it (per-image problems are reported per image)
     except OSError as e:
         logger.exception("Refused the image folder")
-        print(f"Error: {e}")
+        print(f"Error: {_shown(str(e))}")
         return 1
-    except _ServerCheckError as e:  # already logged by _check_server()
-        print(f"Error: {e}")
+    except _ServerCheckError as e:  # already logged by _check_server(); the model names come from the server
+        print(f"Error: {_shown(str(e))}")
         return 1
     return 0
 
