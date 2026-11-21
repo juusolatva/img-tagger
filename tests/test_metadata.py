@@ -178,6 +178,27 @@ class TestWriteMetadata:
         assert img_tagger.get_image_format(static_image) == expected_format
         assert leftover_temp_files(static_image.parent) == []
 
+    def test_pillow_repair_runs_outside_the_metadata_lock(self, static_image, monkeypatch, capsys):
+        real_image, real_sanitize = img_tagger.pyexiv2.ImageData, img_tagger._sanitize_with_pillow
+        attempts, lock_held = [], []
+
+        def flaky_image(*args, **kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("corrupted IFD")
+            return real_image(*args, **kwargs)
+
+        def sanitize(*args, **kwargs):
+            lock_held.append(img_tagger.metadata_lock.locked())
+            real_sanitize(*args, **kwargs)
+
+        monkeypatch.setattr(img_tagger.pyexiv2, "ImageData", flaky_image)
+        monkeypatch.setattr(img_tagger, "_sanitize_with_pillow", sanitize)
+        img_tagger.write_metadata(str(static_image), SAMPLE_TAGS)
+        monkeypatch.setattr(img_tagger.pyexiv2, "ImageData", real_image)
+        assert lock_held == [False]  # other workers' pyexiv2 calls may proceed during the re-encode
+        assert img_tagger.is_already_processed(static_image)
+
     @pytest.mark.parametrize("ext", ["webp", "png"])
     def test_tagging_keeps_animation(self, tmp_path, ext):
         path = make_animated(tmp_path / f"anim.{ext}", durations=[40, 250, 90], loop=3)
@@ -271,6 +292,89 @@ class TestWriteGifTags:
 
     def test_no_temp_files_left_behind(self, gif_image):
         img_tagger.write_gif_tags(str(gif_image), SAMPLE_TAGS)
+        assert leftover_temp_files(gif_image.parent) == []
+
+
+def transparent_disposal_gif(path: Path) -> Path:
+    """Two transparent frames with disposal 2 (restore to background), as in stickers and reaction GIFs."""
+    first = Image.new("RGBA", (2, 2), (0, 0, 0, 0))
+    first.putpixel((0, 0), (255, 0, 0, 255))
+    second = Image.new("RGBA", (2, 2), (0, 0, 0, 0))
+    second.putpixel((1, 1), (0, 0, 255, 255))
+    first.save(path, save_all=True, append_images=[second], disposal=2, duration=100, loop=0)
+    return path
+
+
+def rendered_frames(path: Path) -> list[tuple[int, bytes]]:
+    with Image.open(path) as img:
+        frames = []
+        for index in range(img.n_frames):
+            img.seek(index)
+            frames.append((img.disposal_method, img.convert("RGBA").tobytes()))
+        return frames
+
+
+def gif_comment_block(text: bytes) -> bytes:
+    return b"\x21\xfe" + bytes([len(text)]) + text + b"\x00"
+
+
+class TestGifBlockEditing:
+    """GIF comments are edited at the block level; nothing else in the file changes (review finding 2)."""
+
+    def test_disposal_and_transparency_survive_tagging_and_clearing(self, tmp_path):
+        path = transparent_disposal_gif(tmp_path / "sticker.gif")
+        original, frames = path.read_bytes(), rendered_frames(path)
+        img_tagger.write_gif_tags(str(path), SAMPLE_TAGS)
+        assert rendered_frames(path) == frames
+        assert img_tagger.is_already_processed(path)
+        img_tagger.clear_tags(path)
+        assert path.read_bytes() == original  # byte for byte, frames and all
+
+    def test_only_comment_blocks_change(self, tmp_path):
+        source = make_gif(tmp_path / "a.gif").read_bytes()
+        header_end = 13 + 3 * 2 ** ((source[10] & 7) + 1) * bool(source[10] & 0x80)
+        # a custom application extension and a comment between the first frame's blocks and the rest
+        custom = b"\x21\xff\x0bTESTAPPL1.0\x03abc\x00"
+        edited = source[:header_end] + custom + gif_comment_block(b"old caption") + source[header_end:]
+        path = tmp_path / "b.gif"
+        path.write_bytes(edited)
+        img_tagger.write_gif_tags(str(path), SAMPLE_TAGS)
+        result = path.read_bytes()
+        assert custom in result
+        assert b"old caption" not in result
+        comment = f"{', '.join(SAMPLE_TAGS)} {MARKER}".encode()
+        assert result == source[:header_end] + gif_comment_block(comment) + custom + source[header_end:]
+
+    def test_long_comment_is_split_into_sub_blocks(self, gif_image):
+        tags = [f"tag number {i} " + "x" * 40 for i in range(12)]
+        img_tagger.write_gif_tags(str(gif_image), tags)
+        assert gif_info(gif_image)["comment"] == f"{', '.join(tags)} {MARKER}"
+        assert gif_info(gif_image)["durations"] == GIF_DURATIONS
+
+    def test_gif87a_becomes_gif89a_only_when_given_a_comment(self, tmp_path):
+        path = tmp_path / "old.gif"
+        Image.new("P", (4, 4)).save(path)
+        path.write_bytes(b"GIF87a" + path.read_bytes()[6:])
+        original = path.read_bytes()
+        img_tagger.clear_tags(path)
+        assert path.read_bytes() == original
+        img_tagger.write_gif_tags(str(path), SAMPLE_TAGS)
+        assert path.read_bytes()[:6] == b"GIF89a"
+        assert img_tagger.is_already_processed(path)
+
+    def test_missing_trailer_is_added(self, gif_image):
+        gif_image.write_bytes(gif_image.read_bytes()[:-1])  # drop the 0x3B trailer
+        img_tagger.write_gif_tags(str(gif_image), SAMPLE_TAGS)
+        assert gif_image.read_bytes()[-1:] == b"\x3b"
+        assert gif_info(gif_image)["n_frames"] == len(GIF_DURATIONS)
+
+    def test_truncated_gif_is_refused_unchanged(self, gif_image):
+        truncated = gif_image.read_bytes()[:-10]
+        gif_image.write_bytes(truncated)
+        with pytest.raises(ValueError, match="Truncated GIF"):
+            img_tagger._set_gif_comment(truncated, "x")
+        img_tagger.clear_tags(gif_image)
+        assert gif_image.read_bytes() == truncated
         assert leftover_temp_files(gif_image.parent) == []
 
 

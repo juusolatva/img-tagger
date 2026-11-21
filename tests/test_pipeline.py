@@ -615,6 +615,6 @@ def test_unexpected_task_error_is_listed_in_the_report(tmp_path, monkeypatch, ca
         raise RuntimeError("boom")
 
     monkeypatch.setattr(img_tagger, "process_single_image", explode)
-    stats = img_tagger._run_tasks([image], None, "ollama", "m", "p", 1, threading.Event())
+    stats = img_tagger._run_tasks({image: None}, None, "ollama", "m", "p", 1, threading.Event())
     assert stats.failed == 1
     assert stats.failed_log == [("a.png", "Unexpected Error: boom")]

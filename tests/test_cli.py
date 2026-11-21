@@ -2,6 +2,7 @@
 
 import json
 import os
+import struct
 import subprocess
 import sys
 import threading
@@ -386,6 +387,28 @@ class TestOpenLog:
             img_tagger.setup_logging(str(log))
         assert log.read_text(encoding="utf-8") == "someone else's\n"
 
+    def test_log_not_owned_by_this_user_is_refused_on_any_system(self, tmp_path, monkeypatch):
+        log = tmp_path / "run.log"
+        log.write_text("someone else's\n", encoding="utf-8")
+        monkeypatch.setattr(img_tagger, "_owned_by_current_user", lambda fd, info: False)
+        with pytest.raises(OSError, match="belong"):
+            img_tagger.setup_logging(str(log))
+        assert log.read_text(encoding="utf-8") == "someone else's\n"
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows owner SID and DACL")
+    def test_windows_log_is_private_and_owned(self, tmp_path):
+        log = tmp_path / "run.log"
+        stream = img_tagger._open_log(log)  # a new log: created with the private DACL
+        try:
+            fd = stream.fileno()
+            assert img_tagger._windows_owned_by_me(fd)
+            entries, protected = img_tagger._windows_dacl(img_tagger._windows_security(fd))
+        finally:
+            stream.close()
+        assert protected  # nothing inherited from the folder
+        assert struct.unpack_from("<H", entries, 4)[0] == 1  # one entry: the owner
+        img_tagger._open_log(log).close()  # and it can be appended to again
+
     def test_main_reports_unopenable_log(self, capsys, tmp_path, monkeypatch):
         def refuse(path):
             raise OSError(1, "The log file must belong to the current user", str(path))
@@ -453,3 +476,38 @@ def test_log_keeps_a_more_verbose_root_level_and_filters_other_debug(tmp_path, r
     assert "noise" not in text
     assert "request line" in text
     assert "our detail" in text
+
+
+class TestOutputIntegrity:
+    """File names and server text can't fake console lines or log records (audit finding 13)."""
+
+    def test_control_characters_are_escaped_and_unicode_kept(self):
+        assert img_tagger._shown("a\nb\r\x1b[2Jc\u202egnp.exe café 日本") == "a\\nb\\r\\x1b[2Jc\\u202egnp.exe café 日本"
+
+    def test_report_line_stays_one_line(self, capsys):
+        stats = img_tagger._RunStats()
+        stats.record("FAILED", "x.png\n  [✓] fake.png -> Tags: ok", "Server said:\r\nall good", 0)
+        out = capsys.readouterr().out
+        assert out == "  [!] x.png\\n  [✓] fake.png -> Tags: ok -> Server said:\\r\\nall good\n"
+        assert stats.failed_log == [("x.png\\n  [✓] fake.png -> Tags: ok", "Server said:\\r\\nall good")]
+
+    @pytest.mark.skipif(os.name == "nt", reason="Windows file names can't contain newlines")
+    def test_clear_output_escapes_a_multiline_file_name(self, tmp_path, capsys):
+        image = make_image(tmp_path / "evil\n  Cleared metadata (pyexiv2) for: fake.png")
+        img_tagger.clear_tags(image)
+        out = capsys.readouterr().out
+        assert out.count("\n") == 1
+        assert "evil\\n  Cleared" in out
+
+    def test_log_records_stay_one_line(self, tmp_path, restore_logging):
+        log = tmp_path / "run.log"
+        img_tagger.setup_logging(str(log))
+        img_tagger.logger.info("Processing evil\n2026-01-01 00:00:00 [INFO] fake record")
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            img_tagger.logger.exception("Failed: a\nb.png")
+        lines = log.read_text(encoding="utf-8").splitlines()
+        assert any(line.endswith("Processing evil\\n2026-01-01 00:00:00 [INFO] fake record") for line in lines)
+        assert any(line.endswith("Failed: a\\nb.png") for line in lines)
+        assert "Traceback (most recent call last):" in lines  # tracebacks keep their own lines
