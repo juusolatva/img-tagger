@@ -198,6 +198,9 @@ class TestParseModelOutput:
             "Sorry, but I won't describe this, meme, cat, funny, text, reaction, pet",
             "  As an AI, I see: photo, sunset, beach, ocean, sky, clouds",
             "<think>hmm</think>\nUnfortunately, I could not see it, photo, a, b, c, d, e",
+            "**I'm sorry**, but this image can't be described, photo, a, b, c, d, e",
+            "I apologize, but I can't help with that, photo, cat, dog, sky, tree, grass",
+            "My apologies, the image did not load, photo, cat, dog, sky, tree, grass",
         ],
     )
     def test_refusals_are_not_tags(self, raw):
@@ -210,6 +213,9 @@ class TestParseModelOutput:
             "meme, i can't even, reaction, funny, text, girl",
             "Sorry, photo, sunset, beach, ocean, sky",  # a bare first tag, not "sorry, I ..."
             "icon, ui, cannot, error, dialog, screenshot",
+            '["i can\'t even", "meme", "reaction", "funny", "text", "girl"]',
+            "- i can't even\n- meme\n- reaction\n- funny\n- text\n- girl",
+            "meme, apologies, sorry, text, cat, sad",
         ],
     )
     def test_tag_lists_mentioning_refusal_words_still_parse(self, raw):

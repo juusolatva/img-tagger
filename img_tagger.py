@@ -1464,11 +1464,13 @@ def _log_excerpt(text: str | None, limit: int = MAX_LOGGED_REPLY_CHARS) -> str |
     return f"{text[:limit]}... [{len(text) - limit} more characters not logged]"
 
 
-# English refusal openings ("I'm sorry, I can't...", "As an AI..."). Anchored at the start of the reply, so a
-# tag list that merely contains "sorry" or meme text like "i can't even" is unaffected.
+# English refusal openings ("I'm sorry, I can't...", "As an AI..."). Anchored at the start of the reply, with
+# only whitespace or Markdown emphasis before it: a tag list that merely contains "sorry" or meme text like
+# "i can't even" is unaffected, and so is a JSON list whose first tag is that text (["i can't even", ...]).
 _REFUSAL = re.compile(
-    r"\W*(?:i(?:'|’)?m\s+(?:sorry|unable|not\s+able)|i\s+am\s+(?:sorry|unable|not\s+able)"
-    r"|i\s+(?:cannot|can(?:'|’)?t|can\s+not|won(?:'|’)?t)\b|sorry,\s+(?:but\s+)?i\b|unfortunately,\s+i\b|as\s+an\s+ai\b)",
+    r"[\s*_]*(?:i(?:'|’)?m\s+(?:sorry|unable|not\s+able)|i\s+am\s+(?:sorry|unable|not\s+able)"
+    r"|i\s+(?:cannot|can(?:'|’)?t|can\s+not|won(?:'|’)?t)\b|sorry,\s+(?:but\s+)?i\b|unfortunately,\s+i\b"
+    r"|as\s+an\s+ai\b|i\s+apologi[sz]e\b|my\s+apologies\b)",
     re.IGNORECASE,
 )
 
