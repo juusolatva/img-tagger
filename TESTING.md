@@ -62,7 +62,7 @@ Re-test when the Windows file-safety code changes (`_pin_windows_directory()`, `
 
 ## 4. macOS
 
-Never run on macOS. Re-test after changes to the quit listener, file safety or logging.
+Not yet run on macOS. Re-test after changes to the quit listener, file safety or logging.
 
 - [ ] Install in a virtual environment and run `python3 -m pytest`
 - [ ] Tag a folder with Ollama, then `--clear` it
