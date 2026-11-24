@@ -2,109 +2,42 @@
 
 ## Supported Versions
 
-Only the latest release, or the default branch if there are no releases,
-receives security fixes.
+Only the latest release, or the default branch if there are no releases, receives security fixes.
 
 ## Reporting a Vulnerability
 
-Please do not report security vulnerabilities through public issues,
-pull requests, or discussions.
+Please don't report vulnerabilities through public issues, pull requests or discussions. Use GitHub's private vulnerability reporting instead (the repository's **Security** tab → **Report a vulnerability**). If that's unavailable, contact me at the email address on my GitHub profile.
 
-Report them privately through GitHub's private vulnerability reporting:
+Please include a description and the potential impact, steps to reproduce or a proof of concept, and the affected version, commit or configuration.
 
-1. Go to the repository's Security tab.
-2. Click Report a vulnerability.
+This is a personal project maintained on a best-effort basis. I aim to acknowledge reports within 7 days and will keep you updated. Once a fix is released you'll be credited in the advisory unless you prefer to stay anonymous.
 
-If that option is unavailable, please contact me using the email address
-on my GitHub profile.
+## Scope and Threat Model
 
-Please include:
+img tagger is a local Python CLI. It sends images to an Ollama or LM Studio server chosen by the operator and writes the returned tags into image metadata, or clears metadata without contacting a server. It exposes no inbound service. In scope: `img_tagger.py`, its dependencies and configuration, and the GitHub Actions workflows. Tests and documentation show intended behavior; they don't prove that the controls hold.
 
-- A description of the issue and its potential impact
-- Steps to reproduce, or a proof of concept
-- Affected version, commit, or configuration
+The operator chooses the image folders, server, model, prompt and log path. Images, metadata, file names and model replies may be controlled by an attacker and stay untrusted data. Relevant attackers include image suppliers, other local users who can change filesystem entries the operator can reach, malicious model servers, and contributors submitting pull requests. Assets are image contents, unrelated local files, file permissions, logs and CI credentials.
 
-## What to Expect
-
-This is a personal project maintained on a best-effort basis. I aim to
-acknowledge reports within 7 days and will keep you updated on progress.
-Once a fix is released, you will be credited in the advisory unless you
-prefer to remain anonymous.
-
-## System and Scope
-
-img-tagger is a local Python CLI that sends images to an operator-selected
-Ollama or LM Studio backend and writes generated tags into image metadata.
-It can also clear metadata without contacting a backend. It does not expose
-an inbound application service.
-
-Review scope includes img_tagger.py, dependencies, configuration, and GitHub
-Actions workflows. Tests and documentation provide evidence of intended
-behavior, not proof that security controls hold.
-
-## Threat Model and Trust Boundaries
-
-The operator selects image directories, backend addresses, models, prompts,
-and log destinations. Images, metadata, filenames, and model replies may
-contain attacker-controlled data. Processing an image does not make its
-contents or the model's response trusted.
-
-Assets include image contents, unrelated local files, filesystem permissions,
-logs, and CI credentials. Relevant attackers include image suppliers,
-other local users able to manipulate accessible filesystem entries, malicious
-backend responses, and contributors submitting untrusted pull requests.
-
-The documented local deployment does not provide isolation from root or
-another process running as the operator. This assumption does not exempt
-attacker-controlled images processed with the operator's privileges.
+There is no isolation from root or from other processes running as the operator. That doesn't excuse flaws reachable through attacker-controlled images processed with the operator's privileges.
 
 ## Security Invariants
 
-- Image reads must reject nonregular files and symlink/reparse-point
-  redirection under the documented platform constraints. Backend clients and
-  image libraries must receive guarded snapshots rather than reopen paths.
-- Metadata edits must remain confined to the intended image directory and
-  target. Temporary files must be exclusively created there, retain their
-  handles through writes, and be safely replaced or cleaned up.
-- Temporary and committed images must not grant unintended access through
-  modes, groups, inherited ACLs, or DACLs. Failed permission preservation
-  must fail closed or use the documented narrower-permission fallback.
-- Model replies and image metadata must remain data; they must not authorize
-  commands, additional filesystem operations, or new network destinations.
-- CLI logs must use regular .log files, reject leaf links, and retain the
-  opened stream. POSIX logs must belong to the operator; new logs are private.
-- CI must not expose privileged credentials or write capabilities to
-  untrusted contributions through workflow execution or artifact handling.
+- Image reads reject nonregular files and symlink/reparse-point redirection; backend clients and image libraries get guarded byte snapshots and never reopen paths.
+- Metadata edits stay within the intended image and its folder. Temporary files are created exclusively there, kept open through all writes, and replaced or removed safely.
+- Temporary and replaced images never grant more access than the source (mode, group, ACLs, DACLs, EFS encryption). If permissions can't be preserved, the edit fails or uses the documented narrower fallback.
+- Model replies and metadata are data: they never trigger commands, other file operations or new network destinations. The clients follow no redirects and send no API keys from the environment.
+- Logs must be regular `.log` files owned by the operator, are opened without following a leaf link, and new logs are private.
+- CI must not expose credentials or write access to untrusted contributions.
 
-## Reportable Findings and Severity Context
+## Reportable Findings
 
-Report reachable violations with concrete attacker control, prerequisites,
-and confidentiality, integrity, or availability impact. Relevant examples
-include unintended file reads or writes, permission widening, data disclosure,
-unsafe native parsing, and CI credential exposure.
+Report reachable violations with concrete attacker control, prerequisites and impact on confidentiality, integrity or availability, e.g. unintended file reads or writes, permission widening, data disclosure, unsafe native parsing or CI credential exposure. Assess severity for this local CLI and the user interaction it needs; neither local execution nor a passing test alone makes a finding harmless. No class of finding is excluded outright.
 
-Assess severity using this local CLI deployment and required user interaction.
-Neither local execution nor a passing test alone makes a finding harmless.
-No finding class is categorically excluded by this policy.
+## Known Limitations
 
-## Known Limitations and Unresolved Risk Decisions
+- The copy sent to the model has no metadata, but `--max-pixels 0` and failed copy preparation send the original bytes, metadata included. The chosen server receives the images, so trust in it and in the network path matters. Logs contain paths and raw replies.
+- The `[PROCESSED BY AI]` marker is unauthenticated and causes a skip. `--clear` and metadata repair remove metadata by design, and repair can re-encode pixels.
+- Resource limits are partial: files over 256 MiB and animation repairs over 250 million pixels are refused, and logged replies are cut at 4000 characters, but model replies and image decoding have no general memory budget.
+- Windows FAT32/exFAT and network shares are untested. On Windows, anyone who can write an image's folder can race the final rename (only within that pinned folder), and folders granting neither traverse nor list access can't be pinned and are refused. POSIX protection relies on the image folder's ownership and write restrictions.
 
-Metadata-free model images are not a confidentiality guarantee: --max-pixels
-0 and preparation failures send original bytes, including original metadata.
-The selected backend receives those bytes; logs can contain raw replies and
-paths. Backend transport and deployment trust must be considered.
-
-The processing marker is unauthenticated and can cause a skip. Metadata
-clearing and repair intentionally remove metadata; repair can re-encode
-pixels. These behaviors do not authorize modification of unrelated files.
-
-Input bytes, animation frames, and model replies have no comprehensive
-resource budget. The model pixel limit is not a general memory limit.
-
-Windows FAT32/exFAT and network shares are untested. Windows directory
-writers can race leaf replacement; some ancestor access modes prevent
-pinning. POSIX protection depends on final-directory ownership and write
-restrictions. Evaluate findings against the actual platform and permissions.
-
-These limitations document current behavior, not blanket risk acceptance.
-Any additional exclusions or accepted risks require owner confirmation.
+These document current behavior, not blanket risk acceptance; further exclusions need the owner's confirmation.
