@@ -7,257 +7,145 @@
 [![Python](https://img.shields.io/badge/python-3.13%20%7C%203.14-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/github/license/juusolatva/img_tagger)](LICENSE)
 
-A Python script that tags all the **JPEG**, **WebP**, **PNG** and **GIF** files in a folder (and optionally its subfolders). It sends each image to a vision-language model running in **Ollama** or **LM Studio**, either on your own computer or on another machine in your local network, and writes the tags the model sends back into the image's own metadata.
+A Python script that tags every **JPEG**, **WebP**, **PNG** and **GIF** in a folder (optionally with its subfolders). It sends each image to a vision-language model running in **Ollama** or **LM Studio**, on your own computer or another machine in your network, and writes the returned tags into the image's own metadata (EXIF and XMP, or the comment for GIFs), so they travel with the file.
 
-img tagger itself uses no cloud service: the images only go to the model server you point it at. (Ollama's cloud models, the ones whose names end in `-cloud`, run on ollama.com, so use a local model if your images must stay on your own network.)
+img tagger uses no cloud service: images go only to the model server you choose. (Ollama's `-cloud` models run on ollama.com, so use a local model if your images must stay on your network.)
 
-The tags are standard EXIF and XMP fields (a comment for GIFs), so they stay with the file when you copy or move it. The accuracy of the tags depends on the model.
-
-**Contents:** [Features](#features) · [Requirements](#requirements) · [Installation](#installation) · [Setting up a model backend](#setting-up-a-model-backend) · [Usage](#usage) · [What gets written to your images](#what-gets-written-to-your-images) · [Customising the prompt](#customising-the-prompt) · [Output](#output) · [Stopping early](#stopping-early) · [Clearing tags](#clearing-tags) · [Choosing a model and performance](#choosing-a-model-and-performance) · [Troubleshooting](#troubleshooting) · [Known issues and limitations](#known-issues-and-limitations) · [Running tests](#running-tests) · [Continuous integration](#continuous-integration) · [License](#license)
+**Contents:** [Features](#features) · [Installation](#installation) · [Setting up a model backend](#setting-up-a-model-backend) · [Usage](#usage) · [What gets written to your images](#what-gets-written-to-your-images) · [Customising the prompt](#customising-the-prompt) · [Output](#output) · [Stopping early](#stopping-early) · [Clearing tags](#clearing-tags) · [Choosing a model and performance](#choosing-a-model-and-performance) · [Troubleshooting](#troubleshooting) · [Known limitations](#known-limitations) · [Development](#development)
 
 ## Features
 
-- Tags **JPEGs**, **WebPs**, **PNGs** and **GIFs**, including animated GIFs and WebPs (the animation is kept)
-- Works with **Ollama** (default) or **LM Studio**, locally or on another machine with `--host`
+- Tags JPEGs, WebPs, PNGs and GIFs, including animated ones (the animation is kept)
+- Works with Ollama (default) or LM Studio, locally or on another machine
 - Writes 6 to 12 lowercase tags per image into standard metadata fields
-- Skips files it has already tagged (they carry the marker ***[PROCESSED BY AI]***), so you can safely run it again on the same folder
-- Processes **1 to 4** images at the same time
-- Understands chatty model replies: plain comma-separated lists, JSON lists, bullet and numbered lists, "Here are the tags:" intros, and the reasoning of "thinking" models
-- Writes through a temporary file in the same folder, so an interrupted write doesn't leave a half-written image behind
-- Repairs images with corrupted metadata by re-saving them with Pillow (this re-encodes JPEGs and WebPs, see [Repairing corrupted metadata](#repairing-corrupted-metadata))
-- Handles file and folder names with any characters, also on Windows
+- Skips images it has already tagged, so you can safely run it again on the same folder
+- Processes 1 to 4 images at a time
+- Copes with chatty model replies (JSON, bullet lists, "Here are the tags:" intros, reasoning from thinking models)
+- Writes through a temporary file in the same folder, so an interrupted run never leaves a half-written image
 - Press `Q` to stop early and still get a report
-- Progress bar, a result line for each image and a final report with timings
-- Optional detailed log file for troubleshooting
 - `--clear` strips the metadata back out
 - The prompt lives in an editable [`prompt.txt`](prompt.txt)
 
-
----
-
-
-## Requirements
-
-- [Python](https://www.python.org/downloads/) **3.13 or newer** (tested on 3.13 and 3.14). Check with `python --version` (or `python3 --version`). On macOS, the `python3` that comes with Apple's command line tools may be too old; install a newer one from python.org or Homebrew. `pyexiv2` is built separately for each Python version, so a Python newer than 3.14 works only once `pyexiv2` has a release for it.
-- [Ollama](https://ollama.com/download) or [LM Studio](https://lmstudio.ai/download) with a vision-capable model. A GPU makes a big difference to speed, see [Choosing a model and performance](#choosing-a-model-and-performance).
-- The Python packages in [`requirements.txt`](requirements.txt):
-
-| Package | Used for |
-|---|---|
-| `ollama` | Talking to Ollama |
-| `openai` | Talking to LM Studio through its OpenAI-compatible API |
-| `pillow` | Checking image formats, reading GIF comments, preparing the copy sent to the model, repairing broken metadata |
-| `pyexiv2` | Reading and writing EXIF and XMP metadata, and clearing EXIF, XMP and IPTC with `--clear` |
-| `tqdm` | The progress bar |
-
-`pyexiv2` ships with the exiv2 library built in, so you **don't need exiftool or a separate exiv2 install**. Install all the packages in `requirements.txt`: both backend clients are imported when the script starts, even with `--clear`. Clearing metadata needs no running model server.
-
-It has been run on Windows 11 and is tested on Linux and Windows in CI. It has not been tried on macOS.
-
-
----
-
-
 ## Installation
 
-Clone the repository:
+You need:
+
+- [Python](https://www.python.org/downloads/) **3.13 or newer** (tested on 3.13 and 3.14; check with `python --version`). On macOS, Apple's bundled `python3` may be too old.
+- [Ollama](https://ollama.com/download) or [LM Studio](https://lmstudio.ai/download) with a vision-capable model. A GPU makes a big difference to speed.
+
+It runs on Linux and Windows (tested in CI and on Windows 11). It has not been tried on macOS.
 
 ```bash
 git clone https://github.com/juusolatva/img_tagger.git
 cd img_tagger
-```
-
-Create a virtual environment so the packages don't mix with your system Python. On many Linux distributions, and with Homebrew's Python on macOS, it's needed anyway: there `pip` refuses to install into the system Python with `error: externally-managed-environment`.
-
-Linux / macOS (on Debian and Ubuntu, install the `python3-venv` package first if this fails):
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-Windows (PowerShell):
-
-```powershell
-python -m venv .venv
-.venv\Scripts\activate
-```
-
-If PowerShell says that running scripts is disabled on this system, run `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser` once, or use Command Prompt and `.venv\Scripts\activate.bat`.
-
-Install the dependencies:
-
-```bash
+python3 -m venv .venv              # Windows: python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 python -m pip install -r requirements.txt
 ```
 
-`python -m pip` installs into the same Python you run img tagger with. There's nothing else to install: you run `img_tagger.py` directly from the folder. Activate the virtual environment again in every new terminal before you run it.
+- On Debian and Ubuntu, install `python3-venv` first if creating the virtual environment fails. Without a virtual environment, many Linux distributions refuse `pip install` with `externally-managed-environment`.
+- If PowerShell says running scripts is disabled, run `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser` once, or use Command Prompt and `.venv\Scripts\activate.bat`.
+- Activate the virtual environment again in each new terminal. There's nothing else to install: you run `img_tagger.py` from the folder.
 
-> The examples below use `python`. On Linux and macOS, use `python3` if `python` isn't available (inside an activated virtual environment both work).
+The packages are `ollama` and `openai` (the two backends), `pillow` (image formats, the copy sent to the model), `pyexiv2` (EXIF/XMP, with exiv2 built in, so no exiftool needed) and `tqdm` (progress bar). Install all of them even if you only use one backend or `--clear`.
 
-
----
-
+> The examples use `python`. On Linux and macOS outside a virtual environment, use `python3`.
 
 ## Setting up a model backend
-
-img tagger doesn't run the model itself. It needs a running Ollama or LM Studio server with a vision-capable model.
 
 ### Ollama
 
 1. Install [Ollama](https://ollama.com/download) and make sure it's running.
-2. Download the default model:
+2. Download the default model: `ollama pull qwen3-vl:8b`
+3. Run `python img_tagger.py path/to/images`. The defaults (`--backend ollama`, `--host http://localhost:11434`, `--model qwen3-vl:8b`) already match.
 
-   ```bash
-   ollama pull qwen3-vl:8b
-   ```
-
-3. Run img tagger. The defaults (`--backend ollama`, `--host http://localhost:11434`, `--model qwen3-vl:8b`) already match:
-
-   ```bash
-   python img_tagger.py path/to/images
-   ```
-
-To use another vision model, pull it and pass its Ollama name with `--model`, e.g. `--model qwen3-vl:4b-instruct` for GPUs with little memory (see [Choosing a model and performance](#choosing-a-model-and-performance)).
+For another vision model, pull it and pass its name with `--model`, e.g. `--model qwen3-vl:4b-instruct` for GPUs with little memory.
 
 ### LM Studio
 
-1. Install [LM Studio](https://lmstudio.ai/download).
-2. Download a vision-capable model, for example Qwen3 VL 8B. For a GGUF model, make sure its **vision projector** (the `mmproj-*.gguf` file) is downloaded too. Without it LM Studio doesn't treat the model as vision-capable and rejects every image with `does not support image inputs`.
-3. Start LM Studio's local server. img tagger expects it at `http://localhost:1234`.
-4. Run img tagger with `--backend lm-studio` and **LM Studio's model id**. `--model` defaults to `qwen3-vl:8b` for both backends, but that's Ollama's name for the model, so with LM Studio you always have to set it:
+1. Install [LM Studio](https://lmstudio.ai/download) and download a vision model, e.g. Qwen3 VL 8B. For a GGUF model, also download its **vision projector** (`mmproj-*.gguf`); without it every image fails with `does not support image inputs`.
+2. Start LM Studio's local server (`http://localhost:1234`).
+3. Run with `--backend lm-studio` and **LM Studio's model id**. The `--model` default `qwen3-vl:8b` is Ollama's name, so with LM Studio always pass it:
 
    ```bash
    python img_tagger.py path/to/images --backend lm-studio --model qwen/qwen3-vl-8b
    ```
 
-You can see the model ids LM Studio knows at <http://localhost:1234/v1/models>. LM Studio loads the model when the first request arrives, so the first image takes noticeably longer than the rest.
+The model ids are listed at <http://localhost:1234/v1/models>. LM Studio loads the model on the first request, so the first image is slower.
 
 ### Using a server on another machine
 
-Point `--host` at the other machine. It has to be reachable from the computer running img tagger, and the server has to accept connections from the network:
+Pass `--host`. The server must accept network connections: for Ollama set `OLLAMA_HOST=0.0.0.0` on the server before starting it; in LM Studio turn on **Serve on Local Network**. A firewall may need to allow port 11434 (Ollama) or 1234 (LM Studio). img tagger never reads `OLLAMA_HOST` on your own computer; always pass `--host`.
 
-- **Ollama** listens only on its own computer by default. On the server, set the environment variable `OLLAMA_HOST=0.0.0.0` before starting Ollama.
-- **LM Studio** needs its **Serve on Local Network** server setting turned on.
-- A firewall on the server may also have to allow the port (11434 for Ollama, 1234 for LM Studio).
+- **Ollama** accepts `http://192.168.1.50:11434`, `192.168.1.50:11434` or `192.168.1.50`. Note that `http://192.168.1.50` without a port means port 80.
+- **LM Studio** needs the full address with `http://` and the port, without `/v1`:
 
-img tagger itself doesn't read the `OLLAMA_HOST` variable on the computer it runs on; always pass `--host`. Ollama is fairly forgiving about the address:
+  ```bash
+  python img_tagger.py path/to/images --backend lm-studio --host http://192.168.1.50:1234 --model qwen/qwen3-vl-8b
+  ```
 
-| `--host` value | Connects to |
-|---|---|
-| `http://192.168.1.50:11434` | `http://192.168.1.50:11434` |
-| `192.168.1.50:11434` | `http://192.168.1.50:11434` |
-| `192.168.1.50` | `http://192.168.1.50:11434` |
-| `http://192.168.1.50` | `http://192.168.1.50:80`: **add `:11434`** |
-
-LM Studio needs the full address with `http://` and the port, and **without** `/v1` (img tagger adds it; a trailing slash is fine):
-
-```bash
-python img_tagger.py path/to/images --backend lm-studio --host http://192.168.1.50:1234 --model qwen/qwen3-vl-8b
-```
-
-Without `http://`, the run stops before the first image with `Could not reach the LM Studio server at ...: Connection error.`
-
-For both servers, img tagger talks only to the address you gave: a redirect to another address is not followed (the request fails instead). It also doesn't send credentials from your environment to the server: an `OLLAMA_API_KEY` (meant for ollama.com) or `OPENAI_ORG_ID`/`OPENAI_PROJECT_ID` set for other tools stays on your computer.
-
-
----
-
+img tagger talks only to the address you gave: redirects aren't followed (the request fails instead), and credentials from your environment (`OLLAMA_API_KEY`, `OPENAI_ORG_ID`/`OPENAI_PROJECT_ID`) are not sent.
 
 ## Usage
-
-Give it the folder with your images:
 
 ```bash
 python img_tagger.py path/to/images
 ```
 
 > [!IMPORTANT]
-> img tagger changes your images in place. It overwrites any existing XMP keywords and description (caption) and the EXIF user comment, replaces the comment of every GIF, and re-encodes images with corrupted metadata. See [What gets written to your images](#what-gets-written-to-your-images). Try it on a copy of a few images first, and back up anything you can't replace.
-
-On Windows, quote paths that contain spaces:
-
-```powershell
-python img_tagger.py "C:\Users\you\Pictures\My memes"
-```
+> img tagger changes your images in place. It overwrites existing XMP keywords and description and the EXIF user comment, replaces every GIF comment, and re-encodes images with corrupted metadata (see [What gets written](#what-gets-written-to-your-images)). Try it on copies first, and back up anything you can't replace.
 
 ### Options
 
 | Option | Default | Description |
 |---|---|---|
-| `directory` | (required) | The folder with your images. |
-| `-r`, `--recursive` | off | Go through all subfolders too. Without it only the top folder is processed. |
+| `directory` | (required) | The folder with your images. Quote paths with spaces on Windows. |
+| `-r`, `--recursive` | off | Include all subfolders. |
 | `--backend` | `ollama` | `ollama` or `lm-studio`. |
-| `--host` | `http://localhost:11434` for Ollama, `http://localhost:1234` for LM Studio | Address of the model server. See [Using a server on another machine](#using-a-server-on-another-machine). |
-| `--model` | `qwen3-vl:8b` | The model to use. The default is Ollama's name for it, so with LM Studio pass LM Studio's id (e.g. `qwen/qwen3-vl-8b`). |
-| `--workers` | `1` | How many images to process at the same time, from 1 to 4. |
-| `--timeout` | `600` | Seconds to wait for the model's answer to one image, including loading the model, before that image is marked failed. Must be a positive, finite number (`nan` and `inf` are rejected). Raise it for slow hardware. |
-| `--max-pixels` | `1` | Largest size, in megapixels, of the copy sent to the model; bigger images are scaled down (keeping their shape) before sending. Must be nonnegative and finite; `nan` and `inf` are rejected. `0` sends the original file, as does a failure to prepare the copy. Resizing affects only the outgoing copy; tagging still writes metadata to your files. See [Choosing a model and performance](#choosing-a-model-and-performance). |
-| `--log` | off | Append a detailed log to this file, e.g. `--log logs/run.log`. Missing folders are created; a relative path is relative to the current directory. The name must end in `.log` (any letter case), and an existing path must be a regular file, not a symlink or folder. It must also belong to you, and a new log is readable only by you (on Windows, a new log gets permissions for its owner only instead of the folder's). The file is opened once and kept open, so swapping its name for a link can't redirect the writes. |
-| `--clear` | off | Remove metadata from the images instead of tagging them. See [Clearing tags](#clearing-tags). |
-| `-h`, `--help` | | Show the options and exit. |
-
-### Which files are processed
-
-- Files ending in `.jpg`, `.jpeg`, `.png`, `.webp` or `.gif`, in any letter case (`photo.JPG` counts). Hidden files such as `.hidden.jpg` are included.
-- Everything else (`.jfif`, `.tif`, `.heic`, `.avif`, `.bmp`, ...) is silently ignored and not counted.
-- Files larger than 256 MiB fail with `Image is larger than 256 MiB` without being read into memory. Repairing broken metadata in a very large animated WebP or PNG (more than 250 million pixels across all frames) fails with `Animation too large to repair` instead of decoding it.
-- If a file found at the start is replaced by a different file before its turn comes (e.g. its folder was renamed and another put in its place), it fails with `File changed since it was found` and nothing is sent or written.
-- On Windows, an image encrypted with EFS (the Encrypt option in its properties) fails if the replacement file wouldn't be encrypted too, i.e. unless its folder is encrypted, so the image never ends up stored unencrypted.
-- Image symlinks and symlinked parent directories are refused; choose the real image directory. Passing a symlinked folder stops with `Error: Image paths must not contain links: <folder> is a symlink or not a folder` and exit code 1, and a folder you aren't allowed to list stops with `Error: ... Could not list the image folder: Permission denied`. Shared ancestors such as `/tmp` are allowed because directory handles stay pinned.
-- On Linux and macOS, the folder holding an image must belong to you (or root) and must not be writable by its group or other users. Folders created with `umask 0002` (the default on Ubuntu and some other distributions) are mode `775` and therefore refused; `chmod go-w <folder>` fixes that. If the folder you pass is refused, img tagger prints `Error: Image folder must not be writable by its group or other users (chmod go-w): <folder>` and exits with code 1. With `-r`, images in a refused subfolder fail one by one with that reason, and the rest of the run continues.
-- A path starting with `..` (e.g. `../memes`) works. A `..` later in the path (e.g. `photos/../memes`) is refused with `Error: Image paths must not contain '..'`, because it could lead through a link to a different folder.
-- Each file is opened with Pillow first, and img tagger goes by the image's real format, not its extension (a PNG named `.gif` is tagged like a PNG).
-  - A file with an image extension that isn't a valid image fails with `Unreadable image (unsupported or corrupted file)`.
-  - A valid image in a format img tagger can't tag (e.g. a BMP named `.jpg`, or an MPO, see [Known issues](#known-issues-and-limitations)) fails with `Unsupported file format: <format>`.
-  - Neither is sent to the model.
-- If the folder has no matching files, it prints `No valid images found in '<folder>'.` If your images are in subfolders, add `-r`.
-
-### Exit codes
-
-| Code | When |
-|---|---|
-| `0` | The run finished, even if some images failed. Also after pressing `Q` or when no images were found. |
-| `1` | The folder doesn't exist, `--workers` is outside 1 to 4, `--timeout` is zero, negative, `nan` or `inf`, `--max-pixels` is negative, `nan` or `inf`, `--log` fails validation or can't be opened, the folder itself is refused or can't be listed (see [Which files are processed](#which-files-are-processed)), the model server can't be reached or doesn't have the model (not checked with `--clear`), or `prompt.txt` exists but can't be read or is empty. These print `Error: ...` without a traceback; invalid options are reported before any log file is created. Unhandled exceptions also exit with 1 and a traceback, e.g. a missing required package. |
-| `2` | An invalid option, e.g. an unknown `--backend` or a non-number for `--workers`, `--timeout` or `--max-pixels`. |
+| `--host` | `http://localhost:11434` (Ollama), `http://localhost:1234` (LM Studio) | Address of the model server. |
+| `--model` | `qwen3-vl:8b` | Model to use. With LM Studio, pass its id, e.g. `qwen/qwen3-vl-8b`. |
+| `--workers` | `1` | Images processed at the same time, 1 to 4. |
+| `--timeout` | `600` | Seconds to wait for one image's answer, including model loading. Raise it for slow hardware. |
+| `--max-pixels` | `1` | Largest size in megapixels of the copy sent to the model; bigger images are scaled down. `0` sends the original file. |
+| `--log` | off | Append a detailed log to this file (must end in `.log`). |
+| `--clear` | off | Remove metadata instead of tagging. See [Clearing tags](#clearing-tags). |
 
 ### Examples
 
-The examples use Linux/macOS paths. On Windows, write the full path instead, e.g. `"C:\Users\you\Pictures\memes"`: Command Prompt and Windows PowerShell 5.1 don't expand `~`, so img tagger would report that the folder could not be located.
-
-Tag a folder and all of its subfolders with Ollama:
-
 ```bash
+# A folder and all its subfolders, with Ollama
 python img_tagger.py ~/Pictures/memes -r
-```
 
-Use LM Studio with 4 workers and save a log:
-
-```bash
+# LM Studio, 4 workers, with a log
 python img_tagger.py ~/Pictures/memes --backend lm-studio --model qwen/qwen3-vl-8b --workers 4 --log run.log
-```
 
-Use Ollama on another machine with a smaller model, and give slow hardware more time per image:
-
-```bash
+# Ollama on another machine, a smaller model, more time per image
 python img_tagger.py ~/Pictures/memes --host http://192.168.1.50:11434 --model qwen3-vl:4b-instruct --timeout 1200
 ```
 
-Clear EXIF, XMP and IPTC metadata, or GIF comments, from a folder and its subfolders (read [Clearing tags](#clearing-tags) first):
+On Windows, write full paths (`"C:\Users\you\Pictures\memes"`): Command Prompt and PowerShell 5.1 don't expand `~`.
 
-```bash
-python img_tagger.py ~/Pictures/memes -r --clear
-```
+### Which files are processed
 
+- Files ending in `.jpg`, `.jpeg`, `.png`, `.webp` or `.gif` (any letter case, hidden files included). Other files are ignored.
+- img tagger goes by the image's real format, not its extension: a PNG named `.gif` is tagged as a PNG. Files that aren't valid images fail with `Unreadable image`, and images in other formats (BMP, MPO, ...) fail with `Unsupported file format`. Neither is sent to the model.
+- Files over 256 MiB fail without being read.
+- **Folder rules** (they stop other users from swapping files under img tagger):
+  - Symlinked images and folders are refused; pass the real folder.
+  - A `..` is allowed only at the start of the path (`../memes` works, `photos/../memes` doesn't).
+  - On Linux and macOS, an image's folder must belong to you (or root) and must not be writable by its group or others. Folders created with `umask 0002` (common on Ubuntu) are mode `775` and refused; fix them with `chmod go-w <folder>`. With `-r`, images in a refused subfolder fail one by one and the rest continue.
 
----
+### Exit codes
 
+- `0`: the run finished, even if some images failed (also after `Q` or when no images were found).
+- `1`: an `Error: ...` before any image, e.g. the folder is missing or refused, an option value is out of range, the log can't be opened, `prompt.txt` exists but is unreadable or empty, or the model server can't be reached or doesn't have the model.
+- `2`: an invalid option (unknown `--backend`, a non-number for `--workers`, ...).
 
 ## What gets written to your images
 
 ### Where the tags go
 
-**JPEG, WebP and PNG** get the tags in three places:
+**JPEG, WebP and PNG:**
 
 | Field | Content |
 |---|---|
@@ -265,125 +153,66 @@ python img_tagger.py ~/Pictures/memes -r --clear
 | XMP `Xmp.dc.subject` | The tags as a list: `meme`, `cat`, `funny`, ... |
 | XMP `Xmp.dc.description` | `Tags: meme, cat, funny, reaction, text, digital_art \| [PROCESSED BY AI]` |
 
-**GIF** has no EXIF or XMP support, so the tags go into the GIF comment, **replacing any comment the GIF already had**: `meme, cat, funny, reaction, text, digital_art [PROCESSED BY AI]`.
+**GIF** has no EXIF or XMP, so the tags **replace the GIF's comment**: `meme, cat, funny, ... [PROCESSED BY AI]`.
 
-Which apps display which of these fields hasn't been checked. The tags are also shown on screen while the script runs and written to the log file. To read them back from a file, use a metadata tool such as [ExifTool](https://exiftool.org/) (`exiftool -XMP:Subject -UserComment photo.jpg`, or `exiftool -Comment party.gif`).
+To read them back, use e.g. [ExifTool](https://exiftool.org/): `exiftool -XMP:Subject -UserComment photo.jpg` or `exiftool -Comment party.gif`. Which photo apps display these fields hasn't been checked yet.
 
 ### How the tags are cleaned up
 
-- Each tag is trimmed and lowercased, and duplicates are removed. The model's order is kept.
-- At most **12** tags are kept (the first 12).
-- If fewer than **6** usable tags are left, the image fails with `Invalid or insufficient tags returned from model` and nothing is written.
-- Underscores and spaces inside a tag are kept as they are (`digital_art`, `pixel art`). Some models use underscores, so `digital_art` and `digital art` can both appear across a folder.
-- Tags aren't checked for language, so you can [change the prompt](#customising-the-prompt) to get tags in another language. The flip side: Qwen models occasionally reply with a Chinese tag even though the default prompt asks for English only, and such a tag is written as it is.
-- With the default prompt the first tag is usually the type of image, such as `meme`, `screenshot`, `artwork` or `photo`.
+- Trimmed, lowercased and deduplicated, in the model's order; at most 12 are kept.
+- Fewer than 6 usable tags → the image fails with `Invalid or insufficient tags returned from model` and nothing is written.
+- Underscores and language are left alone, so `digital_art` and `digital art` can both appear, and Qwen models occasionally slip in a Chinese tag.
 
 ### Already tagged images are skipped
 
-The `[PROCESSED BY AI]` marker is the signal for treating an image as already tagged. For JPEG, WebP and PNG it looks for the marker in every EXIF and XMP value and in any text metadata Pillow can read (such as PNG text chunks); for GIFs, in the comment. Readable images in supported formats that have it are skipped without contacting the model. A marker added by another tool also causes a skip; the existing tags are not validated.
+An image whose metadata contains `[PROCESSED BY AI]` anywhere (any EXIF or XMP value or PNG text chunk; for GIFs, the comment) is skipped without contacting the model, even if another tool added the marker. Failed images get no marker, so running the same command again retries only those.
 
-A failed tagging attempt adds no marker, so running the same command again retries unmarked images and quickly skips marked ones.
-
-There is no option to force re-tagging. To tag images again, remove the marker from every metadata value in which it appears. For tags written by img tagger, that means both `Exif.Photo.UserComment` and `Xmp.dc.description` (for a GIF, its comment). Alternatively, move the images into a folder of their own and run [`--clear`](#clearing-tags) there; it works on whole folders only and removes unrelated EXIF, XMP and IPTC metadata too. A marker in a preserved PNG text chunk survives `--clear` and needs to be removed with a metadata editor.
+There's no option to force re-tagging. Remove the marker from both `Exif.Photo.UserComment` and `Xmp.dc.description` (or the GIF comment), or run [`--clear`](#clearing-tags) on a folder of copies.
 
 ### What happens to existing metadata
 
-Tagging a JPEG, WebP or PNG replaces only the three fields above and leaves everything else alone, unless the image first has to be [repaired](#repairing-corrupted-metadata):
-
-| Kept | Replaced |
-|---|---|
-| All other EXIF, e.g. orientation, camera settings, author | `Exif.Photo.UserComment` |
-| All other XMP, e.g. the creator | `Xmp.dc.subject`: **existing XMP keywords are lost** and replaced by the new tags |
-| All IPTC, including IPTC keywords | `Xmp.dc.description` |
-| The JPEG comment | |
-| PNG text chunks (e.g. Stable Diffusion's `parameters`) and DPI | |
-
-IPTC keywords are not updated, so apps that read IPTC keywords may still show the old ones.
+Tagging replaces only the three fields above. Everything else (other EXIF such as orientation and camera data, other XMP, all IPTC, the JPEG comment, PNG text chunks such as Stable Diffusion's `parameters`, DPI) is kept. Existing **XMP keywords are lost**, and **IPTC keywords are not updated**, so apps that read IPTC may still show old keywords.
 
 ### How the files are changed
 
-- **JPEG, WebP and PNG**: only the metadata is edited; the image data is not re-encoded. Animated WebPs keep their frames, frame durations and loop count.
-- **GIF**: only the comment is changed. img tagger edits the file's blocks directly without decoding the image, so frames, colours, transparency, frame timing, the loop setting and any other extensions stay byte for byte as they were. An old `GIF87a` file is marked `GIF89a` when it gets a comment, since comments need that version. A GIF cut off in the middle fails with `Truncated GIF file` and is left unchanged.
-- Each image is read through guarded file access. Output is written to an open temporary `tmpXXXX.tmp` file **in the same folder**, edited through that file handle and then moved over the original. If the original is locked (e.g. open in another program), the move is retried up to 10 times, half a second apart. The temporary file is removed afterwards.
-- File mode permissions and, on Linux and macOS, the file's group are kept. If the group can't be preserved (because of your permissions or a filesystem restriction), its group permissions are removed instead, with a warning, and everyone else keeps at most what the group had (a `604` file becomes `600`, a `644` file `604`), so nobody gains access. On Linux the POSIX ACL and `user.*` extended attributes are preserved through the opened file handles, and inherited temporary-file ACL grants are removed. The SELinux label is kept when your account may set it; otherwise the image gets its folder's default label, as a newly saved file would. Other kernel-managed attributes (`security.capability`, `security.ima`, `trusted.*`) are not copied. On Windows the image's NTFS permissions (its DACL, including whether it inherits from the folder) are given to the temporary file when it is created, before anything is written to it, and the read-only attribute is kept. Timestamps are not copied, and on Windows the file's owner becomes your account.
-- On POSIX, parent directories are opened without following symlinks, and replacement uses pinned directory descriptors. This protects against other-user directory substitution subject to the directory ownership/write restrictions above; it does not isolate another process running as your own account or root.
-- On Windows, folders above an image are held open while the image is read or written, so they can't be renamed or swapped for junctions meanwhile (renaming those folders fails with "in use"). A folder that grants neither traverse nor list access can't be held open this way, so images below it fail with `Image folder grants neither traverse nor list access, so it can't be held open: <folder>`. Symlinks, junctions and other reparse points are refused. Nobody else can open the temporary file, and it replaces the original through its open handle. Tested on local NTFS drives only; see [Known issues](#known-issues-and-limitations) for USB sticks and network folders.
+- JPEG, WebP and PNG: only the metadata is edited; the image data isn't re-encoded, and animated WebPs keep their frames and timing.
+- GIF: only the comment blocks change; frames, colours, transparency and timing stay byte for byte the same. A `GIF87a` file becomes `GIF89a` when it gets a comment.
+- The new version is written to a temporary `tmpXXXX.tmp` file in the same folder and then replaces the original. If the original is locked by another program, replacing is retried for 5 seconds.
+- If the image changed while the model was working on it, nothing is written (`File changed during processing`).
+- Permissions are kept: the file mode and group (or, if the group can't be kept, permissions are narrowed with a warning), Linux ACLs and `user.*` attributes, and on Windows the NTFS permissions and read-only flag. Timestamps are not kept, and on Windows the owner becomes your account. An EFS-encrypted image on Windows is only replaced if the new file is encrypted too (i.e. its folder is encrypted).
 
 ### Repairing corrupted metadata
 
-If pyexiv2 reports broken metadata (an error mentioning "IFD" or "corrupt"), img tagger shows a warning like:
+If pyexiv2 reports broken metadata, img tagger prints `Warning: Corrupted metadata in <name> ...; re-saving it with Pillow`, re-saves the image with Pillow and tags the repaired copy. The repair has side effects:
 
-```
-  Warning: Corrupted metadata in photo.jpg (<error>); re-saving it with Pillow before tagging (JPEG/WebP are re-encoded)
-```
-
-It then re-saves the image with Pillow (quality 95 for JPEG and WebP) and tags the repaired copy. This rescues the image, but the re-save has side effects:
-
-| Format | Effect of the repair |
+| Format | Effect |
 |---|---|
-| JPEG | Re-encoded. EXIF (including orientation, camera and GPS data), ICC colour profile, XMP and DPI are dropped, so a photo that relied on its orientation may show up rotated. |
-| WebP | Re-encoded as **lossy**, even if the original was lossless. ICC profile, EXIF and XMP are dropped. |
-| PNG | Stays lossless and keeps its ICC profile, but other text chunks, DPI and EXIF are lost. |
-| Animated WebP / PNG (APNG) | Keep their frames, frame durations and loop count. |
-
-
----
-
+| JPEG | Re-encoded (quality 95). EXIF (incl. orientation and GPS), XMP, IPTC, ICC profile and DPI are dropped, so a photo may show up rotated. |
+| WebP | Re-encoded as **lossy** (quality 95), even if it was lossless. EXIF, XMP, IPTC and ICC profile are dropped. |
+| PNG | Stays lossless with its ICC profile, but loses text chunks, DPI, EXIF, XMP and IPTC. |
+| Animated WebP / APNG | Keep frames, timing and loop count. Very large animations (over 250 million pixels in total) fail with `Animation too large to repair`. |
 
 ## Customising the prompt
 
-The instructions sent to the model are in [`prompt.txt`](prompt.txt). Edit it to change what kind of tags you get.
+Edit [`prompt.txt`](prompt.txt) to change what kind of tags you get. It's read (as UTF-8) from the folder of `img_tagger.py`, not the current folder. If it's missing, a built-in copy of the default prompt is used with a warning; if it exists but is unreadable or empty, the run stops.
 
-- img tagger reads `prompt.txt` from the **same folder as `img_tagger.py`**, not from the folder you run it in. It's read as UTF-8.
-- If the file is missing, it prints `Warning: Could not read prompt.txt from <path>. Falling back to default.` and uses a built-in copy of the same prompt.
-- If the file exists but can't be read (no permission, invalid UTF-8) or is empty, it prints an error and exits with code 1.
-- Whatever you change, the model still has to reply with **at least 6** tags, or the image fails; only the first 12 are kept. A comma-separated list is the simplest. The reply can also be a JSON list (`["a", "b", ...]`), a bullet or numbered list with at least 6 items, or a list after an intro like `Here are the tags:`. Entries longer than 64 characters are sentences, not tags, and are dropped, and a reply that starts with an English refusal (`I'm sorry, I can't…`, `As an AI…`) fails as a whole. Anything a thinking model writes before its last `</think>` is ignored; a reply whose `<think>` never closes (the model was cut off while reasoning) fails. Markdown code fence lines (```` ``` ````) around the list are ignored.
+The model must reply with **at least 6** tags. A comma-separated list is simplest; JSON lists, bullet or numbered lists and lists after an intro like `Here are the tags:` work too. Entries over 64 characters are dropped as sentences, a reply starting with an English refusal (`I'm sorry, I can't…`) fails, and anything before a thinking model's last `</think>` is ignored.
 
-The default prompt asks for 6 to 12 English tags with the image type first, and has extra instructions for memes (the template, subjects, mood and a few words from the text) and screenshots (the main topic or software shown).
-
-
----
-
+The default prompt asks for 6 to 12 English tags with the image type first (`meme`, `screenshot`, `photo`, ...), plus specific guidance for memes and screenshots.
 
 ## Output
 
-### While it runs
+Before the first image, img tagger checks that the server is reachable and lists your model (waiting at most 10 seconds). If not, it prints `Error: ...` with the available models and exits with 1, even if every image is already tagged.
 
-```
-Initialized backend: ollama | Target: http://localhost:11434
-Found 5 images to process. Starting...
-
-Starting concurrent processing (max_workers=1).
-Press 'q' at any time to stop and see the current report.
-```
-
-Before the first image, img tagger asks the server for its model list (waiting at most 10 seconds, or `--timeout` if that is shorter). If the server can't be reached, or it doesn't list the model you chose, nothing is processed: it prints `Error: ...` with the reason and the available models, and exits with code 1. This happens even if every image is already tagged and none would need the model. See [Troubleshooting](#troubleshooting).
-
-The "Found" count includes images that are already tagged. A progress bar labelled `Processing images` follows, and a line is printed for each image as it finishes:
+Then a progress bar runs and each image prints a line as it finishes (with several workers, not in folder order):
 
 ```
   [✓] cat.jpg -> Generated Tags: ['meme', 'cat', 'funny', 'digital_art', 'reaction', 'text']
   [-] dog.png -> Skipped: Already Tagged
   [!] notimage.jpg -> Unreadable image (unsupported or corrupted file)
-  [!] blurry.webp -> Invalid or insufficient tags returned from model
-  [!] party.gif -> <error message>
 ```
 
-- `[✓]` tagged, `[-]` skipped, `[!]` failed.
-- The result lines start with just the file name (an error from writing the file may include its path). With `-r`, files with the same name in different folders look alike.
-- Lines appear in the order the images finish, which with several workers isn't the order they were found.
-- When the output goes to a file or another program and can't show a character (e.g. on Windows, `✓` or a name like `日本.jpg`), a `?` is printed instead.
-
-Some problems are always shown on screen as `  Warning: ...` lines, with or without `--log`:
-
-- `Could not read the EXIF metadata of <name> (...)` (or `XMP`)
-- `pyexiv2 could not read the metadata of <name> (...); checking it with Pillow instead`
-- `Could not read the metadata of <name> (...); treating it as not yet tagged`
-- `Could not read the GIF comment of <name> (...); treating it as not yet tagged`
-- the [corrupted metadata](#repairing-corrupted-metadata) warning
-- `Could not keep group <group> on <name> (...); removed its group permissions instead`
-
-### The final report
+Metadata problems are shown as `  Warning: ...` lines. At the end comes a report:
 
 ```
 ==================================================
@@ -392,59 +221,29 @@ Some problems are always shown on screen as `  Warning: ...` lines, with or with
  Processed images: 4
  Skipped images: 0
  Failed images: 1
- Total time elapsed: <h>h <m>m <s>s
- Average processing time: <seconds> seconds
+ Total time elapsed: 0h 1m 11.24s
+ Average processing time: 17.81 seconds
 
 --- Failed files details ---
  * notimage.jpg -> Unreadable image (unsupported or corrupted file)
 ==================================================
 ```
 
-- **Processed images** counts images successfully **tagged during this run**. Skipped images are counted separately, even though they carry the processing marker.
-- **Average processing time** is shown only when at least one image was tagged. It covers the successful images only, from sending the request to the model until the tags are written.
-- **Total time elapsed** starts once the prompt is loaded, the server is checked and the backend client is set up.
-- **Failed files details** lists each failed image with the reason.
+"Processed" counts images tagged in this run; the average covers only those.
 
 ### Log file
 
-`--log FILE` appends a detailed UTF-8 log, which is the first place to look when something goes wrong. Each line has a timestamp, level and thread name. It contains:
+`--log FILE` appends a detailed UTF-8 log, the first place to look when something goes wrong: run settings, the prompt, the server check, each image's request, **raw model reply** (cut at 4000 characters), tags, timing and full tracebacks, and HTTP requests. Missing folders are created. When the screen shows only `Connection error.`, the log usually has the real cause.
 
-- the Python version and operating system
-- the run settings: folder, recursion, backend, host, model, workers, timeout and image pixel budget
-- which prompt file was used, and the full prompt
-- the result of the server check (with a traceback if the server couldn't be reached)
-- for each image: when it started, the request to the model, **the model's raw reply**, and the tags and time taken, or the error with a full traceback
-- the HTTP requests made to the backend
-- a summary at the end: how many were tagged, skipped and failed, and the total time
-
-The log contains file paths (as you typed the folder, plus the full path of `prompt.txt`) and the model's replies, so check it before sharing it. Very long replies are cut to their first 4000 characters. Line breaks and other control characters in file names and replies are written as escapes such as `\n`, so each log entry stays on one line; the screen output does the same. When the screen shows only a short message such as `Connection error.`, the log usually has the real cause, e.g. `Request URL is missing an 'http://' or 'https://' protocol.`
-
-
----
-
+The log contains file paths and model replies, so check it before sharing. For safety the name must end in `.log`, an existing log must be a regular file you own (not a symlink), and a new log is readable only by you.
 
 ## Stopping early
 
-Press `Q` (or `q`, no Enter needed) while images are being tagged:
+Press `Q` (no Enter) while images are being tagged. Images in progress finish (or time out), queued images are cancelled without being counted, and the report is printed. The stop message appears when the next image finishes.
 
-- Images that are already being processed finish normally (or fail once `--timeout` runs out).
-- Queued images are **cancelled** before they are even read, so a large batch stops promptly. They are not sent to the model, shown in the output or counted in the report (also those that were already tagged or would have failed).
-- The report is printed and the script exits normally.
-
-The message `[!] Stop signal received (Q pressed). Finishing currently running tasks...` appears when the next image finishes, which on slow hardware can take a while.
-
-Good to know:
-
-- Keys you type during a run are used by the quit listener: on Windows they're consumed, and on Linux and macOS they're not echoed until the run ends.
-- `Q` is not available with `--clear`.
-- On Linux and macOS, when input isn't a terminal (e.g. it's piped in), a `q` in the input stops the run. If the input is empty (`</dev/null`) or there is none at all, `Q` isn't available.
-- On Windows, arrow keys, Page Up/Down and function keys don't stop the run (Page Down arrives as the same byte as `Q`).
-- On Windows, `Q` is only tested against a simulated console. If it doesn't react, closing the terminal window stops the run; an image being written at that moment may leave a `tmpXXXX.tmp` file in its folder, which you can delete.
-- **Ctrl+C does not stop a run cleanly.** The images already queued keep being tagged, and you end up with a traceback and no report. Use `Q` instead.
-
-
----
-
+- Keys typed during a run go to the quit listener (on Linux and macOS they aren't echoed until the run ends).
+- `Q` isn't available with `--clear`. On Linux and macOS it also isn't available when input is empty (`</dev/null`), and with piped input a `q` in the input stops the run.
+- **Ctrl+C doesn't stop cleanly**: queued images keep going and you get a traceback with no report. Use `Q`. If you have to close the terminal, an image being written may leave a `tmpXXXX.tmp` file, which you can delete.
 
 ## Clearing tags
 
@@ -453,208 +252,68 @@ python img_tagger.py path/to/images --clear
 ```
 
 > [!WARNING]
-> `--clear` removes **all** EXIF, XMP and IPTC metadata from every JPEG, WebP and PNG in the folder (and, with `-r`, in all subfolders), not just the tags img tagger wrote. That includes camera settings, dates, GPS location, author and copyright fields, orientation and keywords from other apps. It starts right away without asking for confirmation, it works only on whole folders (not single files), and there is no undo, so make a backup first if you care about that metadata. Photos that rely on the EXIF orientation may show up rotated afterwards.
+> `--clear` removes **all** EXIF, XMP and IPTC metadata from every JPEG, WebP and PNG in the folder (and subfolders with `-r`), not just the tags: camera settings, dates, GPS, author, copyright, orientation and other apps' keywords. It starts without confirmation and can't be undone. It's meant for resetting test images.
 
-- It was made for resetting images so they can be tagged again, e.g. when testing models or prompts.
-- **Kept**: the JPEG comment, and PNG text chunks and DPI.
-- A processing marker in a preserved PNG text chunk still causes the image to be skipped on the next tagging run; remove that marker with a metadata editor to tag the image again.
-- **GIFs**: every comment is removed; nothing else in the file changes (see [How the files are changed](#how-the-files-are-changed)).
-- Like tagging, it goes by the image's real format, so a mislabeled file is cleared the way it was tagged. Files that aren't valid images or are in a format img tagger can't tag (e.g. a BMP named `.jpg`) are left unchanged and reported as `Failed to clear <name>: Unreadable image` or `... Unsupported file format: <format>`.
-- Files with corrupted metadata are re-saved with Pillow instead, with the same side effects as [when tagging](#repairing-corrupted-metadata).
-- No model server is needed. `--backend`, `--host`, `--model` and `--timeout` are ignored (`--timeout` must still be valid), and `prompt.txt` isn't read.
-- `-r`, `--workers` and `--log` work as usual.
-- There's no progress bar, no report and no `Q` to stop.
-
-The output looks like this:
-
-```
-Resetting tags for 3 images...
-  Cleared metadata (pyexiv2) for: cat.jpg
-  Cleared GIF comment: party.gif
-  Failed to clear broken.png: <error message>
-Done.
-```
-
-A file whose metadata had to be repaired shows `Repaired and cleared (Pillow) for: <name>`. The exit code is 0 even if some files failed.
-
-
----
-
+- Kept: the JPEG comment, PNG text chunks and DPI. A marker in a PNG text chunk still causes a skip afterwards; remove it with a metadata editor.
+- GIFs: every comment is removed; nothing else changes.
+- Invalid or unsupported files are left unchanged and reported as failed. Corrupted metadata is [repaired](#repairing-corrupted-metadata) by re-saving with Pillow.
+- No model server or `prompt.txt` is needed. `-r`, `--workers` and `--log` work as usual; there's no progress bar, report or `Q`. The exit code is 0 even if some files failed.
 
 ## Choosing a model and performance
 
-- The default model is **Qwen3 VL 8B**. The default `--model qwen3-vl:8b` is Ollama's name for it; with LM Studio pass its id, e.g. `--model qwen/qwen3-vl-8b`. Any model that accepts image inputs should work, and tag quality depends on the model.
-- "Thinking" models work too; their reasoning is dropped before the tags are read. Thinking and CPU-only generation can be slow, so you may need a longer `--timeout`.
-- **Speed depends mostly on your GPU and the model.** A modern GPU with 16 GB of memory is far faster than older 6 GB cards, and on the same GPU one model can be many times faster than another. If tagging is very slow, try another model.
-- **The model should fit in GPU memory.** A vision model's image part takes memory on top of the language model, and anything that doesn't fit runs on the CPU, which is much slower. With Ollama, `ollama ps` shows the split (e.g. `4%/96% CPU/GPU`). If part of the model runs on the CPU, use a smaller model (e.g. `qwen3-vl:4b-instruct` instead of `qwen3-vl:8b` on 6 GB cards) or a shorter context length (Ollama's `OLLAMA_CONTEXT_LENGTH` setting on the server): tagging one image needs far less context than chat.
-- The **first image** is slower because the server loads the model then.
-- `--timeout` (600 seconds by default) is how long to wait for **one** image's complete answer, including loading the model. An image that runs out of time is marked failed and retried on the next run. With LM Studio, a request that timed out is not resent.
-- `--workers` sends up to 4 images at once, which matches the default number of parallel requests in both Ollama and LM Studio. If the server handles fewer requests at a time, the extra ones wait their turn on the server, and that wait may count towards `--timeout`.
-- **Images are scaled down before sending** to at most 1 megapixel by default (`--max-pixels`); smaller images are sent at their own size, never enlarged. Measured with Qwen3 VL 4B, a 12-megapixel photo took 29 s as is and 5 s at 1 megapixel with the same tags, and small text in diagrams was still read at 1 megapixel but not at 0.5. Ollama enlarges anything below about 1 megapixel anyway, so going lower saves nothing there; LM Studio keeps getting faster. Raise it (e.g. `--max-pixels 2`) for screenshots or scans with very small text.
-- **What is sent** is normally a new copy: the first frame, turned upright by its EXIF orientation, as PNG (for PNG and GIF files and anything with transparency) or JPEG (quality 90), with **no metadata** (no EXIF, XMP, comments or colour profile). With `--max-pixels 0`, or if the copy can't be prepared (e.g. a truncated image Pillow identifies but can't decode), the original file is sent whole instead, **including any metadata such as camera details and GPS location**. The fallback is recorded only in the log. Both backends base64-encode the outgoing bytes, making the request data about a third larger.
-
-
----
-
+- Any model that accepts images should work; the default is Qwen3 VL 8B (`qwen3-vl:8b` in Ollama, `qwen/qwen3-vl-8b` in LM Studio). Thinking models work too but are slower.
+- **Speed depends mostly on the GPU and the model.** The model should fit in GPU memory; anything that spills to the CPU is much slower. `ollama ps` shows the split. If it doesn't fit, use a smaller model (`qwen3-vl:4b-instruct` on 6 GB cards) or a shorter context (`OLLAMA_CONTEXT_LENGTH` on the server; tagging needs little context).
+- `--timeout` applies per image. A timed-out image fails and is retried on the next run.
+- `--workers` up to 4 matches both servers' default parallel requests. Extra requests wait on the server, and that wait counts towards `--timeout`.
+- **Images are scaled down** to 1 megapixel by default (never up). With Qwen3 VL 4B a 12-megapixel photo took 29 s as is and 5 s at 1 MP with the same tags; small diagram text was still read at 1 MP but not at 0.5. Ollama enlarges smaller images anyway, so going lower saves nothing there. Raise it (`--max-pixels 2`) for screenshots with tiny text.
+- The copy sent is the first frame, turned upright, as PNG or JPEG **without metadata**. With `--max-pixels 0`, or if the copy can't be made (e.g. a truncated image), the **original file is sent, including metadata such as GPS location**; only the log records that fallback.
 
 ## Troubleshooting
 
-**`ModuleNotFoundError: No module named 'pyexiv2'`** (or `'PIL'`, `'tqdm'`, `'ollama'` or `'openai'`)
-- The dependencies aren't installed in the Python you ran. Activate your virtual environment if you made one, and run `python -m pip install -r requirements.txt`.
+| Message | What to do |
+|---|---|
+| `ModuleNotFoundError: No module named 'pyexiv2'` (or another package) | Activate your virtual environment and run `python -m pip install -r requirements.txt`. |
+| `Could not reach the Ollama server ...` | Start Ollama or check `--host` (`http://<ip>` without a port means port 80). For another machine see [above](#using-a-server-on-another-machine). |
+| `Could not reach the LM Studio server ...: Connection error.` | Check the server is running. `--host` must start with `http://` and not end in `/v1`. Run with `--log` for the real cause. |
+| `Error code: 307` (or another 3xx) | The server redirected the request, which isn't followed. Pass the address it redirects to. |
+| `Could not reach ...: timed out` | No answer within 10 seconds: the machine is off, the address is wrong, or a firewall blocks it. |
+| `The ... server at ... has no model '<name>'` | Use one of the listed models. Ollama: `ollama pull <name>`. LM Studio: use its id, not `qwen3-vl:8b`. |
+| `... does not support image inputs` (LM Studio) | Download the model's vision projector (`mmproj-*.gguf`) or use another vision model. |
+| HTML `Internal Server Error` on the first images (LM Studio) | Requests arrived while the model was loading (with `--workers` above 1). Run again, or load the model first. |
+| `timed out` / `Request timed out.` after a long wait | Raise `--timeout`, use fewer `--workers` or a faster model. |
+| Every image fails with a model error | The server check only confirms the model is listed. Run with `--log` to see the server's error. |
+| `Invalid or insufficient tags returned from model` | Fewer than 6 usable tags. Check the raw reply with `--log`, try another model, or review your `prompt.txt`. |
+| `Image folder must not be writable by its group or other users (chmod go-w)` | Run `chmod go-w <folder>` if nobody else should change files in it. |
+| `File changed during processing` | The image was edited while being tagged. Nothing was written; run again. |
+| `Unsupported file format: MPO` (or `BMP`, ...) | The file's real format isn't supported. Convert it. |
+| `Access is denied: '...\tmpXXXX.tmp'` or `Failed to replace ...` (Windows) | Another program held the image locked. Close it and run again. On FAT32/exFAT or network drives, clear the read-only attribute first. |
+| `The folder '<folder>' could not be located.` | Check the path; on Windows quote spaces and don't use `~`. |
+| `No valid images found in '<folder>'.` | No supported files there. Add `-r` if they're in subfolders. |
 
-**`Error: Could not reach the Ollama server at ...: Failed to connect to Ollama. ...`**
-- Start Ollama, or check the address you passed with `--host` (and remember that `http://<ip>` without a port means port 80). For a server on another machine, see [Using a server on another machine](#using-a-server-on-another-machine).
+## Known limitations
 
-**`Error: Could not reach the LM Studio server at ...: Connection error.`**
-- Make sure LM Studio's server is running and the port is right.
-- `--host` must start with `http://`, e.g. `http://localhost:1234`, and must not end in `/v1`.
-- `Error code: 307` (or another 3xx code) means the server redirected the request, which img tagger doesn't follow. Pass the address it redirects to.
-- Run with `--log` to see the real cause.
+- **Animated images**: the model sees only the first frame, so an animation with a blank first frame gets tags like `blank, white`.
+- **Original-file sends** (`--max-pixels 0` or a failed copy) include metadata and aren't rotated upright.
+- **Repairs** of corrupted metadata re-encode JPEG/WebP and drop other metadata.
+- **Keywords**: IPTC keywords aren't updated, and existing XMP keywords are replaced.
+- **No forced re-tagging**: tagged images are always skipped.
+- **MPO JPEGs** (several images in one file, from some cameras and phones) aren't supported.
+- **Windows USB sticks (FAT32/exFAT) and network folders are untested**. If something goes wrong there, every image may fail with a permissions or replace error, so try a few copies first.
+- **macOS** hasn't been tried.
+- **Ctrl+C** doesn't stop a run cleanly; use `Q`.
 
-**`Error: Could not reach the ... server at ...: timed out`** (or `Request timed out.`)
-- The server didn't answer within 10 seconds (or `--timeout`, if that is shorter). Usually the address points at a machine that is off or behind a firewall.
-
-**`Error: The ... server at ... has no model '<name>'. Available models: ...`**
-- Check `--model` against the listed models. With Ollama the model must be pulled (`ollama pull <name>`); a name without a tag means `:latest`. With LM Studio use LM Studio's model id (e.g. `qwen/qwen3-vl-8b`), not the Ollama name `qwen3-vl:8b` that is the default. If LM Studio lists no models, download one, or load it if just-in-time model loading is turned off.
-
-**Every image fails with an error about the model**
-- The server check only confirms that the model is listed. Run with `--log` to see the server's error; for a model without vision support see the next entry.
-
-**`... does not support image inputs`** (LM Studio)
-- The model's vision projector (`mmproj-*.gguf`) isn't downloaded. Download it in LM Studio, or use another vision model.
-
-**The first images fail with an HTML `Internal Server Error` page** (LM Studio)
-- This can happen when several requests arrive while LM Studio is still loading the model (with `--workers` above 1). Run the same command again: the images that were tagged are skipped and the failed ones are retried. Loading the model in LM Studio before you start avoids it.
-
-**`timed out`** (Ollama) or **`Request timed out.`** (LM Studio) after a long wait
-- The image ran out of `--timeout`. Raise it (e.g. `--timeout 1200`), use fewer `--workers`, or try a faster model (see [Choosing a model and performance](#choosing-a-model-and-performance)).
-
-**`Invalid or insufficient tags returned from model`**
-- The reply didn't contain at least 6 usable tags. Run with `--log` to see the raw reply. Try another model, or check your changes to `prompt.txt`.
-
-**`Unreadable image (unsupported or corrupted file)`**
-- The file has an image extension but Pillow can't open it as an image.
-
-**`Could not read image: Image folder must not be writable by its group or other users (chmod go-w): <folder>`**
-- The image's folder is writable by its group or by everyone, e.g. because it was created with `umask 0002`. Run `chmod go-w <folder>` if nobody else should be able to change files in it. Other reasons after `Could not read image:` include a symlinked folder, a folder owned by another user, or missing read permission.
-
-**`Tagging failed for ...: File changed during processing: <name>`**
-- The image was replaced or edited while the model was working on it, so the tags would describe the old picture. Nothing was written; run again to tag the new version.
-
-**`Unsupported file format: MPO`** (or another format, e.g. `BMP` or `TIFF`)
-- The file has a `.jpg`, `.jpeg`, `.png`, `.webp` or `.gif` extension, but its real format is something else. For MPO see [Known issues](#known-issues-and-limitations); otherwise convert the file to a supported format.
-
-**`[WinError 5] Access is denied: '...\tmpXXXX.tmp'`** or **`Failed to replace ... after retries: <reason>`** on Windows
-- Another program kept the image locked for the 5 seconds img tagger waited. Close the other program and run again. Read-only images are replaced (and stay read-only) on NTFS; on other drives (FAT32/exFAT, some network shares) a read-only image can fail this way, so clear its read-only attribute first.
-
-**`Error: The folder '<folder>' could not be located.`**
-- Check the path. On Windows, quote paths that contain spaces and don't use `~` (see [Examples](#examples)).
-
-**`No valid images found in '<folder>'.`**
-- No `.jpg`, `.jpeg`, `.png`, `.webp` or `.gif` files in that folder. If they're in subfolders, add `-r`.
-
-**`Warning: Could not read prompt.txt from <path>. Falling back to default.`**
-- `prompt.txt` isn't next to `img_tagger.py`. The built-in default prompt is used instead, so tagging still works.
-
-
----
-
-
-## Known issues and limitations
-
-- **Animated images**: only the first frame is sent to the model (with `--max-pixels 0` the whole file is sent, and the servers also only look at the first frame), so an animation whose first frame is blank gets tags like `blank, white`. The animation itself is kept in the file.
-- **Sending original images**: `--max-pixels 0` and a failure to prepare a scaled copy both send the original bytes, including metadata and without applying EXIF orientation. Depending on the server, rotated photos may look sideways to the model. The default scaled copy is turned upright first; see [Choosing a model and performance](#choosing-a-model-and-performance).
-- **Repaired images**: images with corrupted metadata are re-saved with Pillow, which can re-encode them and drop other metadata. See [Repairing corrupted metadata](#repairing-corrupted-metadata).
-- **IPTC keywords** are left as they are, and existing XMP keywords are replaced. See [What happens to existing metadata](#what-happens-to-existing-metadata).
-- **No forced re-tagging**: tagged images are always skipped. See [Already tagged images are skipped](#already-tagged-images-are-skipped).
-- **MPO JPEGs are not supported**: JPEGs that hold several embedded images (some cameras and phones save these) are reported by Pillow as `MPO` and fail with `Unsupported file format: MPO`, without contacting the model.
-- **Windows USB sticks and network folders are untested**: the Windows file handling (copying the image's permissions, replacing it through the open file handle) has only been tried on local NTFS drives. FAT32/exFAT drives and network shares handle permissions and renames differently; if they behave unexpectedly, every image there may fail with a permissions or replace error, so try a few copies first.
-- **Ctrl+C** doesn't stop a run cleanly. Use `Q`.
-
-
----
-
-
-## Running tests
-
-Install the development dependencies (pytest, pytest-cov and the pinned Ruff version) and run the tests:
+## Development
 
 ```bash
 python -m pip install -r requirements-dev.txt
-python -m pytest
+python -m pytest            # offline: generated images, fake model servers
+python -m pytest --cov      # with coverage, like CI
+ruff check . && ruff format --check .
 ```
 
-The default tests run offline: they generate their own images and use fake model backends, so no model server is needed. For a coverage report like CI's, run `python -m pytest --cov`.
-
-Lint and format checks (line length 120):
-
-```bash
-ruff check .
-ruff format --check .
-```
-
-On Windows, the tests for the Linux/macOS quit listener and file permissions are skipped; the Windows file-safety tests (folder pins, junctions, NTFS permissions, read-only files) run instead, and the Windows quit listener is tested with a simulated console.
-
-### Integration tests
-
-To check tagging quality against real images, put them in a `test_images/` folder (git-ignored, subfolders included) and run with Ollama or LM Studio running:
-
-```bash
-python -m pytest -m integration --run-integration -s
-```
-
-| Option | Default | Description |
-|---|---|---|
-| `--tagger-backend` | `ollama` | `ollama` or `lm-studio` |
-| `--tagger-host` | the backend's localhost address | Address of the model server |
-| `--tagger-model` | `qwen3-vl:8b` | Model to use; for LM Studio pass e.g. `qwen/qwen3-vl-8b` |
-| `--images-dir` | `test_images/` in the repository | Folder with the test images (`~` works) |
-
-For example, against LM Studio:
-
-```bash
-python -m pytest -m integration --run-integration -s --tagger-backend lm-studio --tagger-model qwen/qwen3-vl-8b
-```
-
-Each image is its own test. It is copied to a temporary folder first, so the originals are not modified, and cleared there if it was already tagged. Each test prints a line like `[SUCCESS] cat.jpg (12.3s) -> Generated Tags: [...]` so you can review the tags by eye, and fails if the image wasn't tagged. The tests use the same client settings as a real run: the default 600-second timeout, and with LM Studio a timed-out request is not resent.
-
-### Repository guidance
-
-[AGENTS.md](AGENTS.md) holds the repository's development commands, architecture, file-safety rules and maintenance notes. [CLAUDE.md](CLAUDE.md) imports that same guidance. Keep it and this README up to date when changing behavior or workflows; no additional agent tooling or memory files are required.
-
-
----
-
-
-## Continuous integration
-
-Every push to `main` and every pull request runs [GitHub Actions](.github/workflows/ci.yml), and you can also start it by hand:
-
-- **Ruff** lint and format checks, using the Ruff version pinned in `requirements-dev.txt`
-- a **lockfile** check that `requirements-dev.lock` matches `requirements*.txt` (regenerated with uv and compared)
-- the offline **tests** with coverage on Python 3.13 and 3.14 on Linux, plus Python 3.14 on Windows
-- a **SonarQube Cloud** scan, which combines the Linux and Windows coverage reports from the Python 3.14 jobs (needs `SONAR_TOKEN` as a repository secret and as a Dependabot secret; pull requests from forks get no secrets, so there the scan is skipped with a warning)
-- an [**OSV-Scanner**](.github/workflows/osv-scanner.yml) dependency vulnerability scan (`requirements-dev.lock` and `requirements*.txt`), which also runs on a weekly schedule and manual dispatch; on pull requests and merge groups it checks only for newly introduced vulnerabilities and skips the SARIF upload on fork PRs
-
-To run the same checks locally, use `ruff check .`, `ruff format --check .` and `python -m pytest --cov`.
-
-CI installs the exact package versions in `requirements-dev.lock` (with `--require-hashes --only-binary :all:`). If you change `requirements.txt` or `requirements-dev.txt`, regenerate the lock with [uv](https://docs.astral.sh/uv/):
-
-```bash
-uv pip compile requirements-dev.txt --universal --python-version 3.13 --generate-hashes --no-header -o requirements-dev.lock
-```
-
-This keeps the versions already in the lock where they still fit. To update the locked versions, add `--upgrade` (or `-P <package>` for a single package).
-
-All GitHub Actions and reusable workflows are pinned to full commit SHAs, with version comments kept alongside them.
-
-[Dependabot](.github/dependabot.yml) opens pull requests to update the GitHub Actions used in CI and the Python packages; the schedule, grouping and cooldown are set in that file. For Python it only edits `requirements*.txt`, not the lock, so the lockfile check fails on its pull requests until you regenerate the lock (command above) and push it to the PR branch.
-
-The minimum versions in `requirements.txt` have not been tested as minimums; CI only tests the locked versions.
-
-
----
-
+- [AGENTS.md](AGENTS.md): architecture, design rules, CI and maintenance notes (also imported by [CLAUDE.md](CLAUDE.md))
+- [TESTING.md](TESTING.md): manual test checklist, including tagging-quality runs against real models
+- [SECURITY.md](SECURITY.md): how to report vulnerabilities, and the threat model
 
 ## License
 
